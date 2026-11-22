@@ -2,7 +2,7 @@
 
 ## What this is
 
-Bairelay bridges Reolink battery cameras (Argus-class) to standard protocols. It exposes RTSP for video and uses MQTT for camera state, control, and Home Assistant discovery. Battery cameras wake on demand and sleep again after the RTSP session ends, so HA cards and automations work without keeping the camera awake all the time.
+Bairelay bridges Reolink Baichuan cameras to standard protocols. It exposes RTSP for video and uses MQTT for camera state, control, and Home Assistant discovery. Battery cameras (Argus-class) wake on demand and sleep again after the RTSP session ends, so HA cards and automations work without keeping the camera awake all the time. Mains-powered cameras (PoE, wired) stay connected and get low-latency defaults; bairelay reads the power source from the camera, or you can set `power` in the TOML file.
 
 ## Installation
 
@@ -30,7 +30,7 @@ Each camera entry:
 | `uid` | one of address/uid | Reolink P2P UID (16 alphanumeric characters, e.g. `9527000ABCDEF123`). Used for discovery when `address` is blank or fails. |
 | `username` | no | Camera account username. Defaults to `admin` (Reolink's stock account). |
 | `password` | yes | The camera account password. |
-| `idle_disconnect` | no | Drop the camera connection when no clients are streaming, letting battery cameras sleep. Defaults to `true`. Turn off for always-on cameras you want kept warm. |
+| `idle_disconnect` | no | Drop the camera connection when no clients are streaming, letting battery cameras sleep. Unset follows the power source the camera reports: on for battery, off for mains. Set it to override. |
 
 Fill in `address`, `uid`, or both. With both, bairelay connects to `address` first and falls back to UID discovery when that fails, including when a hostname fails to resolve.
 

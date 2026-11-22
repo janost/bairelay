@@ -207,7 +207,7 @@ TalkConfig ◀── [cameras.talk_config] │ TalkAbility (5 s) │ Reolink def
 
 ### Watchdog
 
-A tokio task that runs every 30 seconds. For each camera with `idle_disconnect` enabled:
+A tokio task that runs every 30 seconds. For each camera whose effective `idle_disconnect` is on (see [Power source](#power-source)):
 
 1. If connected with zero wake locks held, call `request_disconnect()` to cancel the session.
 2. If there are stream sources with no subscribers older than `stream_prune_grace_secs` (default 30), drop them. The default is intentionally ≤ each camera's `idle_disconnect_timeout_secs` (default 45) so a cached `StreamSource` can never outlive the Baichuan session that feeds it. Sources whose reader has exited are dropped on the same sweep. The sweep holds the per-camera create lock until each dropped reader has finished its `stop_video`, so a new SETUP can't overlap it with `start_video`.
@@ -215,6 +215,23 @@ A tokio task that runs every 30 seconds. For each camera with `idle_disconnect` 
 A source whose reader exits (`start_video` failed or timed out, the stream ended, the translator panicked) is marked dead. `CameraHandle::stream_source` replaces a dead entry instead of returning it, and because `StreamSource` keeps only a weak broadcast sender, the channel closes with the reader and its RTSP sessions end instead of hanging.
 
 The watchdog is a safety net, not the primary lifecycle mechanism.
+
+### Power source
+
+Each camera has an effective power source: the per-camera `power` setting (`battery` / `mains`), else what the camera reported, else `Unknown`. `run_connected_session` fetches `<Support>` before it sets `Connected` and reads the channel item's `battery` field: `> 0` is battery, `0` is mains, and a missing field falls back to any login ability name containing "battery" (`src/power.rs`). A failed request detects nothing. The result lives on `CameraHandle` for the process lifetime; a later session that detects nothing keeps it. The `Connected` log line carries `power`, `power_from` (`configured` / `detected`), the Support `battery` value or why detection found nothing, the login device type and the session path (TCP or the UDP discovery method).
+
+Defaults for unset fields follow it, resolved through `CameraConfig::effective_*` / `CameraHandle::power`:
+
+| | battery | mains | unknown |
+|---|---|---|---|
+| `idle_disconnect` | true | false | false |
+| `stream_latency_ms` | 1500 | 200 | 1500 |
+| `[cameras.pause] bridge_gaps` | true | false | true |
+| `start_video` / wait for `Connected` / SDP ready | 30 / 30 / 15 s | 10 / 10 / 5 s | 30 / 30 / 15 s |
+| battery poller and HA battery entity | yes | no (entity retracted) | yes |
+| UID discovery fallback with `address` set | yes | no (TCP only) | yes |
+
+Unknown leaves `idle_disconnect` off, so a battery camera connects once (the startup wake), is detected in that session, and parks from the next one. Before the first detection only an explicit `power = "mains"` makes the connect TCP-only.
 
 ### RTSP session lifecycle (battery camera)
 
@@ -252,6 +269,8 @@ Cleared on service restart; repopulated by the startup-wake cycle. Never persist
 ### Placeholder streams during gaps
 
 Per-`StreamSource` `GapState { Live, Bridging }`. A 200 ms ticker compares `last_live_frame_at` against `gap_threshold_secs` (default 3.0). On exceedance, the source flips to `Bridging` and re-broadcasts cached `VideoBurst::iframe_nals` with synthesised PTS so RTSP clients see continuous RTP. Audio packets are dropped on the wire while bridging but per-codec PTS counters advance via the camera's audio cadence so A/V stays aligned on Live resume.
+
+With `bridge_gaps` off (mains by default) there are no replay frames, so the same ticker ends a reader that has had no video frame for 30 s (`MEDIA_STALL_TIMEOUT`). The source turns dead, subscribers see the channel close and reconnect, and the next SETUP starts a fresh `start_video`. A per-camera `StallBudget` allows 3 such restarts in any 60 s; a stall past the cap holds the reader until the oldest restart leaves the window.
 
 Per-camera `PreviewState { Live, Connecting, Sleeping }` published via `watch::Sender`. The MQTT preview publisher composites a caption (e.g. `SLEEPING`) on stale JPEGs so HA dashboards distinguish live from stale.
 

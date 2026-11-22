@@ -2,7 +2,7 @@
 
 [![codecov](https://codecov.io/github/mgc8/bairelay/graph/badge.svg?token=BUUBTI4K5E)](https://codecov.io/github/mgc8/bairelay)
 
-A pure-Rust bridge between Reolink **battery** cameras (proprietary "Baichuan" protocol on TCP/9000) and standard RTSP / MQTT, with a local replacement for Reolink's wake-up cloud and motion-push channel.
+A pure-Rust bridge between Reolink cameras, **battery** first, mains-powered too (proprietary "Baichuan" protocol on TCP/9000) and standard RTSP / MQTT, with a local replacement for Reolink's wake-up cloud and motion-push channel.
 
 ## Acknowledgements
 
@@ -35,22 +35,20 @@ Bairelay's primary design target is **Reolink battery cameras** — the Argus 3 
 
 **Battery-powered doorbells** (Reolink battery Video Doorbell class) are in scope for their event surface (doorbell press, AI objects: person, vehicle, animal, face, package), published to MQTT and Home Assistant. Presses and AI objects arrive on the camera's alarm push, which bairelay sees only while it holds a connected session: a press during a session publishes and extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay through its [webhook](#battery-doorbell-webhook), or through the [push listener](#push-listener-tcp443), as a motion edge.
 
-Non-battery Reolink cameras (the wired RLC line, wired doorbells, NVR-attached models) almost universally support **native RTSP** out of the box — there is no need for a translation layer, so they are explicitly out of scope.
-
-Always-on Argus models should work incidentally — the wake-lock machinery is harmless when the camera never sleeps.
+**Mains-powered cameras** (PoE, wired, or WiFi on a power adapter) work too. Many of them also offer native RTSP, but bairelay gives them the same MQTT / Home Assistant surface and one config for a mixed fleet. Bairelay reads the power source from the camera's Support XML at connect (`battery` field) and picks defaults to match; set `power = "battery"` or `power = "mains"` per camera to skip detection. A mains camera stays connected (no idle disconnect), uses a 200 ms stream buffer, skips gap bridging in favour of a stall restart, has shorter stream-start timeouts, gets no battery poller or battery entity, and with an `address` set connects over TCP only, so a PoE camera that is down never falls back to the Reolink relay. See [Key recommended defaults](#from-scratch-config) for the table.
 
 ---
 
 ## Why bairelay exists
 
-Bairelay is best thought of as a **continuation of Neolink** rather than a fork. Neolink's use case and bairelay's overlap, but bairelay's tighter scope (battery cameras only) lets it commit to a few decisions Neolink can't:
+Bairelay is best thought of as a **continuation of Neolink** rather than a fork. Neolink's use case and bairelay's overlap, but bairelay's tighter scope (battery cameras first) lets it commit to a few decisions Neolink can't:
 
 - **Pure Rust, no GStreamer.** Neolink shells out to GStreamer for RTSP serving and codec handling. Bairelay implements the RTSP server, the H.264 / H.265 / AAC / G.711 RTP packetisers, the SDP generator, and the ADPCM → G.711 transcoder in-process. There is no native dependency to install — `cargo build` produces a single static binary.
-- **Stable, jitter-free streaming.** The camera delivers video in bursty GOPs (a ~900 ms burst, then ~1.1 s of silence). Bairelay's video pacer holds a 1.5 s pre-buffer (per-camera `stream_latency_ms`) and emits at the codec's natural cadence, so receivers never see underruns. The audio pacer does the same for AAC / G.711, eliminating the periodic A-V hitches you'd otherwise see every few seconds.
+- **Stable, jitter-free streaming.** The camera delivers video in bursty GOPs (a ~900 ms burst, then ~1.1 s of silence). Bairelay's video pacer holds a 1.5 s pre-buffer for battery cameras (per-camera `stream_latency_ms`; 200 ms for mains) and emits at the codec's natural cadence, so receivers never see underruns. The audio pacer does the same for AAC / G.711, eliminating the periodic A-V hitches you'd otherwise see every few seconds.
 - **First-class Home Assistant integration.** Retained MQTT discovery payloads for camera, motion, floodlight, LED, IR, PTZ, battery, and siren entities; preview JPEGs with state overlays (`SLEEPING`, `CONNECTING`); the HA-specific quirks (HEVC parameter-set stripping for go2rtc compatibility, ffmpeg DTS handling) are baked in.
 - **Fully local operation.** Bairelay ships its own UDP wake server and its own TCP push listener that — with a small DNS redirect on the operator's LAN — completely replace Reolink's `p2p*.reolink.com` and `pushx.reolink.com` cloud surfaces. Cameras can be firewalled off the public internet and still work end-to-end.
 
-If you are running wired Reolink cameras with native RTSP, bairelay has nothing to offer you. If you are running Argus battery cameras and tired of fighting GStreamer, sleeping cameras, and Reolink's cloud, this is the tool.
+If you are running only wired Reolink cameras and their native RTSP and HA integration already cover you, bairelay adds little. If you are running Argus battery cameras, or a mix of battery and PoE cameras, and tired of fighting GStreamer, sleeping cameras, and Reolink's cloud, this is the tool.
 
 ---
 
@@ -161,13 +159,13 @@ Bairelay's config is **a deliberate near-superset of Neolink's** so existing con
 
    You can also rename it to anything else later — `[A-Za-z0-9_-]+`.
 
-2. **Battery cameras only.** Bairelay drops support for non-battery models. Remove any `[[cameras]]` blocks for wired cameras and use Reolink's native RTSP for those.
+2. **Power source decides the defaults.** Bairelay detects battery vs mains per camera (or takes `power = "battery" | "mains"`) and sets `idle_disconnect`, `stream_latency_ms` and `[cameras.pause] bridge_gaps` from it when they are unset. Wired cameras can stay in the config; an explicit value always wins.
 
 3. **`[cameras.pause]` semantics simplified.** Neolink had `on_motion`, `on_client`, `on_disconnect`, `motion_timeout`, and `mode` knobs. Bairelay treats the battery lifecycle as a single concern: the camera is woken on demand (RTSP client connect, MQTT command, motion push) and sleeps after a grace period when nothing holds a wake lock. The old fields are still **accepted with a startup warning** so you don't have to edit configs urgently — they simply have no effect. The replacement knobs are:
 
    ```toml
    [[cameras]]
-   idle_disconnect = true                   # opt-in for battery cams
+   idle_disconnect = true                   # default for detected battery cams
    idle_disconnect_timeout_secs = 45        # grace before sleep (default 45 s)
    ```
 
@@ -224,16 +222,28 @@ name = "driveway"
 username = "admin"
 password = "camera-password"
 uid = "ABCDEF0123456789"
-idle_disconnect = true
+# power = "auto"   # auto | battery | mains; auto reads the camera's Support XML
 ```
 
-Key recommended defaults and why:
+Key recommended defaults and why. Several follow the camera's power source when unset (`power`, detected or configured); an explicit value always wins:
+
+| Unset field | battery | mains | unknown (not yet detected) |
+|---|---|---|---|
+| `idle_disconnect` | `true` | `false` | `false` |
+| `stream_latency_ms` | `1500` | `200` | `1500` |
+| `[cameras.pause] bridge_gaps` | `true` | `false` | `true` |
+| `start_video` / SETUP wait for connect / first SDP | 30 / 30 / 15 s | 10 / 10 / 5 s | 30 / 30 / 15 s |
+| battery poller + HA battery entity | yes | no (entity retracted) | yes |
+| UID discovery when `address` is set | fallback | off (TCP only) | fallback |
+
 
 - **`bind = "0.0.0.0"`** — listen on all interfaces. The advertise IP for the wake server is computed per peer at runtime, so you don't have to nail the LAN address.
 - **`bind_port = 8554`** — RTSP standard. Plain RTSP. If you set `certificate`, TLS RTSP gets a parallel listener on `tls_bind_port = 8555`.
-- **`idle_disconnect = true`** — required for battery cams to sleep. Without it, bairelay holds the Baichuan session open forever and the camera will never enter low-power state.
+- **`power = "auto"`** — detect battery vs mains from the camera's Support XML at connect; the `Connected` log line shows the result (`power`, `power_from`, `support_battery`). Set `battery` or `mains` when detection reports `unknown`. Before the first detection a camera counts as unknown, so a battery camera is connected once (the startup wake), detected, and parks from the next session on.
+- **`idle_disconnect`** — on for battery cams, so they sleep; off for mains. With it off, bairelay holds the Baichuan session open and a battery camera never enters its low-power state.
 - **`idle_disconnect_timeout_secs = 45`** — grace period after the last RTSP client disconnects before the camera is allowed to sleep. Lower means faster sleep but more wake-up latency on the next connect; higher is the opposite. 30–60 s is the practical band.
-- **`stream_latency_ms = 1500`** — how long the pacers buffer before a stream starts playing, and so the latency bairelay adds. Battery cams send video in bursts with ~1.1 s gaps and need the default. Wired cams that stream steadily can use 100–300; `0` turns pacing off. Audio uses the same value capped at 500 ms.
+- **`stream_latency_ms`** — how long the pacers buffer before a stream starts playing, and so the latency bairelay adds. Battery cams send video in bursts with ~1.1 s gaps and need 1500; mains cams stream steadily and default to 200. `0` turns pacing off; at most 5000. Audio uses the same value capped at 500 ms.
+- **`[cameras.pause] bridge_gaps`** — on for battery cams: a silent camera is covered with the last frame. Off for mains: instead, a stream with no video for 30 s is ended so clients reconnect to a fresh one, at most 3 times a minute per camera.
 - **`gap_threshold_secs = 1.0`** (per-camera, in `[cameras.pause]`) — the placeholder/bridging trigger when the upstream stalls. Sub streams with a naturally low fps may need this raised. Default is fine for main streams.
 - **MQTT discovery `features`** — the listed features cover every entity HA understands (the `ai` and `doorbell` entries add the AI object sensors and the doorbell press event). Drop `pt` for non-PTZ cameras, drop `floodlight` / `siren` for models without that hardware. Bairelay omits the entities for hardware it detects as absent (PTZ, status LED, IR, AI, doorbell) and keeps them when detection is inconclusive; the list is an opt-in cap.
 

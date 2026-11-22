@@ -107,7 +107,7 @@ Captures real-camera `BcMedia` streams into files the test harness can replay la
 
 ### Prerequisites
 
-- A real Reolink camera. The project targets **battery cameras only** (Argus series, Duo Battery, Go PT). Always-on Reolinks already expose RTSP natively and don't need bairelay.
+- A real Reolink camera. Battery cameras (Argus series, Duo Battery, Go PT) are the primary target and the ones the existing captures and live checks come from. Mains-powered (PoE, wired) cameras are supported with their own defaults (`power`), with less live coverage.
 - A working `config.toml`.
 - Disk space: ~10 MB per minute of 4K HEVC main-stream capture, less for sub or extern.
 

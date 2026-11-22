@@ -18,7 +18,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `login_with_maxenc(MaxEncryption)`    | MD5 challenge-response auth.                              |
 | `logout()`                            | Concrete-only (not on `CameraDriver`); call with 5 s timeout. |
 | `get_linktype()`                      | Used for keepalive (see "Keepalive").                     |
-| `get_support()`                       | Capability probe (PTZ, talk, etc.). Cache result.         |
+| `get_support()`                       | Capability probe (PTZ, talk, etc.) and power-source detection (`battery`). Runs before the session turns `Connected`; cache result. |
 | `battery_info()`                      | Returns `BatteryInfo`. **`voltage` is i32 millivolts**, not volts. |
 | `listen_on_motion()`                  | Returns `MotionData`. `next_motion()` coalesces to the latest `MotionStatus`; `next_alarm_update()` yields every `AlarmUpdate` (motion, AI objects, doorbell press) in order. cmd 33 classification is `classify_alarm` in `bc_protocol/alarm.rs`. |
 | `listen_on_floodlight()`             | Returns `mpsc::Receiver<FloodlightStatusList>`.           |
@@ -46,6 +46,9 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 | Keepalive         | 5 s      |
 | Pollers           | 10 s     |
 | Session setup     | 10 s per request (`get_support`, `get_ptz_preset`, PIR read), abandoned on session cancel |
+| `start_video`     | 30 s; 10 s for mains (`Power::timeouts`) |
+| SETUP waits       | `Connected`: 30 s, 10 s for mains. First SDP: 15 s, 5 s for mains |
+| Media stall       | 30 s without video ends the reader when gap bridging is off |
 | Control commands  | 30 s     |
 | Talk `TalkAbility` query | 5 s (falls back to defaults) |
 | Talk WAV load     | 10 s     |
@@ -58,7 +61,7 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 
 **Shutdown sequence (per session, inside `CameraHandle::teardown_session_tasks`):**
 
-`run_connected_session` is the per-session lifecycle coordinator: it installs a session token (a child of the camera token, cancelled by `request_disconnect`), sets up via `spawn_session_tasks`, runs the keepalive loop, then on connection loss / shutdown clears the token, leaves `Connected`, cancels the session and hands off to `teardown_session_tasks`, which performs:
+`run_connected_session` is the per-session lifecycle coordinator: it installs a session token (a child of the camera token, cancelled by `request_disconnect`), fetches `<Support>` and detects the power source before setting `Connected`, sets up via `spawn_session_tasks`, runs the keepalive loop, then on connection loss / shutdown clears the token, leaves `Connected`, cancels the session and hands off to `teardown_session_tasks`, which performs:
 
 1. Wait up to **2 seconds** for `JoinSet` tasks (motion / battery / floodlight / PIR / preview-aggregator) to exit gracefully.
 2. After the deadline, call `abort_all()` on the `JoinSet`.
@@ -300,7 +303,7 @@ In addition to the whitelist, outbound `Frame::Video` strips VPS / SPS / PPS (H.
 
 ## Audio + video pacers
 
-`bairelay::stream_source::media_pacer_task(rx, broadcast, cancel, max_lead, initial_latency, snap_on_past)` is the generic pacer; `audio_pacer_task` and `video_pacer_task` are thin wrappers taking a `PacerTiming`. Each per-source `StreamSource` spawns one of each, timed by the camera's `stream_latency_ms` (`PacerTiming::for_stream_latency`): video's initial latency is the value itself, audio's is capped at 500 ms, and `max_lead` is the initial latency plus 1.5 s. `stream_latency_ms = 0` spawns no pacers; the handlers then broadcast frames directly.
+`bairelay::stream_source::media_pacer_task(rx, broadcast, cancel, max_lead, initial_latency, snap_on_past)` is the generic pacer; `audio_pacer_task` and `video_pacer_task` are thin wrappers taking a `PacerTiming`. Each per-source `StreamSource` spawns one of each, timed by the camera's effective `stream_latency_ms` (1500 ms, or 200 ms for mains when unset; `PacerTiming::for_stream_latency`): video's initial latency is the value itself, audio's is capped at 500 ms, and `max_lead` is the initial latency plus 1.5 s. `stream_latency_ms = 0` spawns no pacers; the handlers then broadcast frames directly.
 
 Pacer contract:
 
@@ -320,10 +323,11 @@ Video: `max_lead = 3 s`, `initial_latency = 1.5 s`, `snap_on_past = false`. Argu
 
 ### Pacer vs gap-bridging — division of labour
 
-Two mechanisms cooperate to keep the wire stream usable, addressing different scales of upstream irregularity:
+Three mechanisms keep the wire stream usable, addressing different scales of upstream irregularity:
 
 - **Audio + video pacers (above)** absorb sub-second bursty delivery (Argus's normal "GOP burst then 1.1 s idle" pattern). The video pacer's 1.5 s pre-buffer means a typical idle period is invisible to the receiver.
 - **Gap-bridging** (`GapState::Bridging`, `emit_replay_frame_if_bridging`, the 200 ms ticker in the translator loop) handles **multi-second upstream silences** — camera reconnects, wifi hiccups, motion-pause flapping. When `last_live_frame_at` exceeds `gap_threshold_secs` (default 3 s) the source flips to `Bridging` and re-broadcasts the cached `VideoBurst::iframe_nals` with a synthesised PTS, plus drops live audio so A-V stays correlated on resume. Bridging writes to `broadcast::Sender` directly, bypassing the pacer.
+- **Stall restart** (`StallGuard`, same ticker) replaces bridging when `bridge_gaps` is off, the mains default: 30 s without a video frame ends the reader, so the source turns dead and clients reconnect to a fresh `start_video`. `StallBudget` caps it at 3 per camera in any 60 s; a stall past the cap is held until a restart leaves the window. The clock starts when the translator loop does, not at source creation, so a slow `start_video` doesn't count.
 
 The 3 s threshold sits above the pacer's 1.5 s buffer — a normal inter-burst gap drains the pacer before bridging fires, but the pacer covers it; only a true camera-side silence reaches bridging. With the pacer in place, bridging rarely fires day-to-day; it's still load-bearing for the "show the last frame instead of a buffering spinner" experience during real silences.
 
@@ -365,7 +369,8 @@ Transient connect failures and lost sessions use the connect ladder (initial 2 s
 - Password: required (`None` rejected).
 - `bind_port = 0` rejected.
 - Update intervals (`battery_update`, `preview_update`, `floodlight_update`): ≥ 500 ms.
-- `idle_disconnect`: defaults `false`. Must be explicitly enabled for battery cameras.
+- `idle_disconnect`, `stream_latency_ms`, `[cameras.pause] bridge_gaps`: unset follows the effective power source (architecture.md, "Power source"). `stream_latency_ms` at most 5000.
+- `power`: `auto` (default), `battery` or `mains`.
 - `gap_threshold_secs`: must be finite + positive.
 - `idle_disconnect_timeout_secs`: must be finite + positive.
 - `talk_dir`: absolute path to an existing directory.

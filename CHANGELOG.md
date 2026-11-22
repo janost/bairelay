@@ -10,6 +10,11 @@ Two-way audio (talk), ported from the neolink talk client:
 
 ### Changes
 
+- camera: detect the power source from the Support XML before `Connected`; power-based defaults for `idle_disconnect`, `stream_latency_ms`, `bridge_gaps` and stream timeouts
+- stream: media-stall restart for sources without gap bridging
+- mqtt: battery entity gated on power source; retracted for mains
+- hassio: `idle_disconnect` in the options form defaults to unset (was `true`), so the power source decides; a TOML `idle_disconnect = false` now overrides a form `true` (the merge treated `false` as "not set")
+
 - talk: `talk` one-shot and `control/talk` topic
 - talk: three-tier `TalkConfig` resolver (config table, camera `TalkAbility`, Reolink defaults)
 - talk: WAV reader and linear resampler; DVI4 IMA ADPCM encoder in `bairelay-rtsp` next to the decoder
@@ -18,7 +23,16 @@ Two-way audio (talk), ported from the neolink talk client:
 - core: pad serialized ADPCM frames on `(data.len() + 4) % 8` like the camera; talk sent 4 stray bytes after every block, and `--dump-bcmedia` captures with ADPCM desynced on replay
 - core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
 
-Per-camera `stream_latency_ms` (default 1500): the pacer startup buffer, previously fixed at 1.5 s. Steady wired cameras can lower it to cut stream latency; `0` disables pacing.
+Per-camera `stream_latency_ms`: the pacer startup buffer, previously fixed at 1.5 s. Unset, it is 1500 ms, or 200 ms on mains power (below); `0` disables pacing.
+
+Per-camera power source. Bairelay was built for battery cameras and ran battery behaviour on every camera; it now reads the power source from the Support XML at connect (`battery > 0` battery, `0` mains, else a "battery" login ability) or takes `power = "battery" | "mains"`. Unset knobs follow it:
+- `idle_disconnect` (now unset by default): on for battery, off for mains and unknown. A battery camera is detected in its startup-wake session and parks from the next one.
+- `stream_latency_ms`: 200 for mains, else 1500. `[cameras.pause] bridge_gaps`: off for mains, else on.
+- mains: `start_video` timeout 10 s (was 30), SETUP wait for `Connected` 10 s (was 30), first SDP 5 s (was 15).
+- mains: no battery poller; the HA battery entity is not published, and one published earlier is retracted.
+- mains with an `address`: TCP only, no UID discovery fallback, so a down PoE camera never lands on the Reolink relay. Before the first detection only an explicit `power = "mains"` counts.
+- without gap bridging, a stream with no video for 30 s is ended so clients reconnect, at most 3 times a minute per camera.
+- the `Connected` log line carries `power`, `power_from`, the Support `battery` value or why detection found nothing, `device_type` and the session `path`.
 
 ### Toolchain and dependencies
 

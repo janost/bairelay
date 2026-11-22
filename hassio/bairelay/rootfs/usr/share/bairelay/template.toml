@@ -100,10 +100,12 @@ bind = "0.0.0.0"
 # stream = "all"                     # none | all | main | sub | extern
 # discovery = "local"                # local | remote | map | relay | cellular
 # max_encryption = "aes"             # none | aes | bcencrypt
+# power = "auto"                     # auto | battery | mains; auto reads the camera
+# idle_disconnect = true             # default by power: battery true, else false
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
 #                                    # every *_secs setting: at most 86400 (1 day)
 # motion_wake_hold_secs = 30         # wake-lock hold after motion stops
-# stream_latency_ms = 1500           # stream startup buffer; 0..5000, lower for steady wired cams
+# stream_latency_ms = 1500           # stream startup buffer, 0..5000; default by power: mains 200, else 1500
 # permitted_users = ["me"]
 # webhook = false                    # report wake reasons via [webhook]; needs [webhook] enable
 #
@@ -119,6 +121,6 @@ bind = "0.0.0.0"
 # enable_pir        = false
 #
 # [cameras.pause]
-# bridge_gaps = true                 # fill gaps with last frame
+# bridge_gaps = true                 # fill gaps with last frame; default by power: mains false, else true
 # gap_threshold_secs = 1.0           # raise for low-fps sub streams
 # preview_overlay = true             # CONNECTING/SLEEPING caption on preview JPEG

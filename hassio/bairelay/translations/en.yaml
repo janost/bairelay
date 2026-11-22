@@ -26,7 +26,7 @@ configuration:
         description: Camera account password.
       idle_disconnect:
         name: Idle Disconnect
-        description: Drop the camera connection when no RTSP clients are streaming, letting battery cameras sleep. Turn off for always-on cameras you want kept warm.
+        description: Drop the camera connection when no RTSP clients are streaming, letting battery cameras sleep. Leave unset to follow the power source the camera reports (on for battery, off for mains).
 
 network:
   8554/tcp: Plain RTSP port (always on).
