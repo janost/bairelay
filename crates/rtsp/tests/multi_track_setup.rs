@@ -428,10 +428,9 @@ async fn play_dispatches_video_and_audio_to_separate_channels() {
 	// Give the session task a beat to pick up the audio track. The session
 	// task was spawned on the first (video) SETUP and entered its loop with
 	// a video-only runtime; the audio SETUP that just completed appended the
-	// track and fired tracks_changed.notify_one(). The session loop's
-	// tracks_notified arm wakes, rebuilds the RuntimeTrack list, and
-	// continues — audio frames dispatch on channel 2 from there. See
-	// `notify_wakes_parked_session_to_pick_up_appended_audio_track` for the
+	// track, and the audio dispatch loop resolves it lazily on its next
+	// audio frame — audio frames dispatch on channel 2 from there. See
+	// `late_audio_setup_is_picked_up_by_running_session` for the
 	// isolated regression test.
 	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -554,30 +553,21 @@ async fn read_channel_first_packet(
 	None
 }
 
-/// Isolates B3's `tracks_changed.notify_one()` arm cleanly.
+/// A track appended after PLAY is picked up by the already-running
+/// session task.
 ///
 /// The sibling test `play_dispatches_video_and_audio_to_separate_channels`
-/// also exercises the notify path — the session task is spawned on the
-/// first SETUP (video-only), and the audio SETUP arrives against the
-/// already-running task; the notify arm picks it up before PLAY completes.
-/// But that test uses a 2-second deadline and sends both video and audio
-/// frames, so in principle a future refactor could let the defensive
-/// threshold path (4 consecutive no-track drops → forced rebuild) rescue
-/// it silently.
-///
-/// This test pins the behaviour down: ONE audio frame, 50 ms deadline.
-/// The threshold path needs 4 drops to trigger, which cannot happen with
-/// a single frame, and no other mechanism exists to dispatch audio on a
-/// runtime that still has only the video track. A pass is therefore
-/// definitive evidence that the notify arm fired.
+/// appends audio before PLAY. This one pins the late-append case: ONE
+/// audio frame, sent after the audio SETUP, must reach channel 2 via the
+/// audio loop's lazy track lookup.
 ///
 /// Parked-proof: before the audio SETUP, we SETUP video → PLAY → drive
 /// video frames through the loop so the session task is demonstrably
 /// parked on `frames.recv()` with a video-only runtime. Only then do we
-/// issue the audio SETUP (which calls `SessionEntry::append_track` and
-/// fires `tracks_changed.notify_one()`) and emit the single audio frame.
+/// issue the audio SETUP (which calls `SessionEntry::append_track`) and
+/// emit the single audio frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn notify_wakes_parked_session_to_pick_up_appended_audio_track() {
+async fn late_audio_setup_is_picked_up_by_running_session() {
 	let (addr, cancel, provider) = spawn_server_with_emitting_provider().await;
 
 	let mut client = TcpStream::connect(addr).await.unwrap();
@@ -607,8 +597,8 @@ async fn notify_wakes_parked_session_to_pick_up_appended_audio_track() {
 		.expect("Session header")
 		.to_string();
 
-	// PLAY — session task enters its loop; `rebuild_runtime` fires once
-	// before the loop with video-only in `session_tracks`.
+	// PLAY — session task enters its loop with video-only in
+	// `session_tracks`.
 	let req =
 		format!("PLAY rtsp://{addr}/cam RTSP/1.0\r\nCSeq: 3\r\nSession: {session_id}\r\n\r\n");
 	client.write_all(req.as_bytes()).await.unwrap();
@@ -632,8 +622,8 @@ async fn notify_wakes_parked_session_to_pick_up_appended_audio_track() {
 	assert!(video_pkt.len() >= 12, "video RTP header too short");
 
 	// Now the session task is provably parked on `frames.recv()` with a
-	// video-only runtime. A second SETUP for audio fires
-	// `tracks_changed.notify_one()` via `SessionEntry::append_track`.
+	// video-only runtime. A second SETUP for audio appends the track via
+	// `SessionEntry::append_track`.
 	let req = format!(
 		"SETUP rtsp://{addr}/cam/trackID=1 RTSP/1.0\r\nCSeq: 4\r\nSession: {session_id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
 	);

@@ -1790,8 +1790,7 @@ fn handle_iframe(
 	let reordered: Vec<&[u8]> = non_slice;
 
 	// Extract parameter sets + IDR NALs per codec.
-	let (parameter_sets, iframe_nals, sps_bytes, pps_bytes, vps_bytes) =
-		extract_iframe_parts(codec, &reordered);
+	let (_, iframe_nals, sps_bytes, pps_bytes, vps_bytes) = extract_iframe_parts(codec, &reordered);
 
 	// Update SDP params (briefly hold write lock). Only do this if we
 	// have both SPS and PPS; otherwise wait for a future I-frame.
@@ -1822,10 +1821,7 @@ fn handle_iframe(
 	let burst_pts = micros_to_90khz(iframe.microseconds);
 	let burst = VideoBurst {
 		codec,
-		parameter_sets: parameter_sets.clone(),
 		iframe_nals: iframe_nals.clone(),
-		pframe_nals: Vec::new(),
-		captured_at: Instant::now(),
 		captured_pts_90khz: burst_pts,
 	};
 	last_frame.replace_video(burst);
@@ -2019,7 +2015,7 @@ fn handle_pframe(
 	pframe: &BcMediaPframe,
 	tx: &broadcast::Sender<Frame>,
 	video_pace_tx: Option<&mpsc::Sender<PacedFrame>>,
-	last_frame: &Arc<LastFrameBuffer>,
+	_last_frame: &Arc<LastFrameBuffer>,
 	state: &mut StreamTranslatorState,
 ) -> Option<u32> {
 	let codec = match state.detected_codec {
@@ -2053,13 +2049,6 @@ fn handle_pframe(
 		nals.iter().partition(|n| !is_slice_nal(n, codec));
 	non_slice.append(&mut slice);
 	let reordered: Vec<&[u8]> = non_slice;
-
-	// Append to last-frame buffer so reconnecting clients can replay the
-	// recent burst (I-frame + trailing P-frames) while waiting for the
-	// next keyframe. Store the reordered sequence so burst replay keeps
-	// the marker-bit placement guarantee.
-	let nals_owned: Vec<Vec<u8>> = reordered.iter().map(|n| (*n).to_vec()).collect();
-	last_frame.append_pframe(nals_owned);
 
 	let nals_bytes: Vec<Bytes> = reordered
 		.iter()
@@ -2750,10 +2739,7 @@ mod tests {
 	fn fake_burst_with_pts_90khz(pts: u32) -> VideoBurst {
 		VideoBurst {
 			codec: VideoCodec::H265,
-			parameter_sets: vec![vec![0x40, 0x01], vec![0x42, 0x01], vec![0x44, 0x01]],
 			iframe_nals: vec![vec![0x26, 0x01, 0xaf, 0x08, 0x46]],
-			pframe_nals: Vec::new(),
-			captured_at: Instant::now(),
 			captured_pts_90khz: pts,
 		}
 	}
@@ -2899,10 +2885,7 @@ mod tests {
 		// nothing to replay.
 		last_frame.replace_video(VideoBurst {
 			codec: VideoCodec::H265,
-			parameter_sets: vec![],
 			iframe_nals: Vec::new(),
-			pframe_nals: Vec::new(),
-			captured_at: Instant::now(),
 			captured_pts_90khz: 0,
 		});
 		let mut rx = src.subscribe_for_test();

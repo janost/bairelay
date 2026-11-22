@@ -1,7 +1,7 @@
 //! Transport abstraction: TCP-interleaved vs UDP-unicast.
 //!
 //! `Transport` is the RTSP server's write-side interface for sending RTP
-//! and RTCP packets to a subscribed client. Two concrete implementations:
+//! packets to a subscribed client. The server never emits RTCP. Two concrete implementations:
 //! - `TcpInterleavedTransport` — writes framed packets on the RTSP TCP
 //!   connection (RFC 7826 §14).
 //! - `UdpUnicastTransport` — sends to a client-supplied address.
@@ -24,12 +24,6 @@ use crate::server::udp_pool::{UdpPortLease, UdpPortPool};
 pub trait Transport: Send + Sync {
 	/// Send an RTP packet.
 	async fn send_rtp(&self, packet: &[u8]) -> io::Result<()>;
-
-	/// Send an RTCP packet.
-	async fn send_rtcp(&self, packet: &[u8]) -> io::Result<()>;
-
-	/// Shut down the transport, freeing any allocated resources. Best-effort.
-	async fn close(&self);
 }
 
 /// TCP-interleaved transport. Packets are prefixed with `$ ch len` and
@@ -37,7 +31,6 @@ pub trait Transport: Send + Sync {
 pub struct TcpInterleavedTransport {
 	writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>,
 	channel_rtp: u8,
-	channel_rtcp: u8,
 }
 
 impl TcpInterleavedTransport {
@@ -46,12 +39,10 @@ impl TcpInterleavedTransport {
 	pub fn new(
 		writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>,
 		channel_rtp: u8,
-		channel_rtcp: u8,
 	) -> Self {
 		Self {
 			writer,
 			channel_rtp,
-			channel_rtcp,
 		}
 	}
 
@@ -84,28 +75,20 @@ impl Transport for TcpInterleavedTransport {
 	async fn send_rtp(&self, packet: &[u8]) -> io::Result<()> {
 		self.write_framed(self.channel_rtp, packet).await
 	}
-
-	async fn send_rtcp(&self, packet: &[u8]) -> io::Result<()> {
-		self.write_framed(self.channel_rtcp, packet).await
-	}
-
-	async fn close(&self) {
-		// TCP connection is shared and owned by the connection task;
-		// it will be closed there. Nothing to do here.
-	}
 }
 
-/// UDP-unicast transport. Sends RTP to `client_rtp_addr`, RTCP to
-/// `client_rtcp_addr`, from server-side sockets held in `UdpPortLease`.
+/// UDP-unicast transport. Sends RTP to `client_rtp_addr` from a
+/// server-side socket on a port held in `UdpPortLease`.
 ///
 /// The [`UdpPortLease`] is held as a private field so the port pair is
 /// guaranteed to stay reserved for the transport's lifetime; dropping the
 /// transport drops the lease and returns the ports to the pool.
 pub struct UdpUnicastTransport {
-	pub(crate) rtp_sock: Arc<UdpSocket>,
-	pub(crate) rtcp_sock: Arc<UdpSocket>,
-	pub(crate) client_rtp_addr: SocketAddr,
-	pub(crate) client_rtcp_addr: SocketAddr,
+	rtp_sock: UdpSocket,
+	/// Bound but never read or written: holding the advertised RTCP port
+	/// keeps client receiver reports from drawing ICMP port-unreachable.
+	_rtcp_sock: UdpSocket,
+	client_rtp_addr: SocketAddr,
 	/// Keeps the reserved UDP port pair held for this transport's lifetime.
 	/// Also the source of truth for `server_rtp_port` / `server_rtcp_port`
 	/// (both accessors read directly from the lease rather than calling
@@ -120,22 +103,11 @@ impl Transport for UdpUnicastTransport {
 		self.rtp_sock.send_to(packet, self.client_rtp_addr).await?;
 		Ok(())
 	}
-
-	async fn send_rtcp(&self, packet: &[u8]) -> io::Result<()> {
-		self.rtcp_sock
-			.send_to(packet, self.client_rtcp_addr)
-			.await?;
-		Ok(())
-	}
-
-	async fn close(&self) {
-		// Sockets are dropped with the transport; no explicit close needed.
-	}
 }
 
 impl UdpUnicastTransport {
-	/// Bind UDP sockets on the server's pooled ports and send RTP/RTCP to
-	/// the client addresses.
+	/// Bind UDP sockets on the server's pooled ports and send RTP to
+	/// `client_rtp_addr`.
 	///
 	/// Returns the transport which holds the port lease until dropped; when
 	/// the transport is dropped the lease is released and the port pair is
@@ -144,7 +116,6 @@ impl UdpUnicastTransport {
 		server_bind_ip: IpAddr,
 		pool: Arc<UdpPortPool>,
 		client_rtp_addr: SocketAddr,
-		client_rtcp_addr: SocketAddr,
 	) -> io::Result<Self> {
 		// A leased port can still be occupied at the OS level — a
 		// TIME_WAIT socket from a prior session, or an unrelated process
@@ -160,9 +131,8 @@ impl UdpUnicastTransport {
 				Ok((rtp_sock, rtcp_sock)) => {
 					return Ok(Self {
 						rtp_sock,
-						rtcp_sock,
+						_rtcp_sock: rtcp_sock,
 						client_rtp_addr,
-						client_rtcp_addr,
 						lease,
 					});
 				}
@@ -184,11 +154,9 @@ impl UdpUnicastTransport {
 	async fn try_bind_pair(
 		server_bind_ip: IpAddr,
 		lease: &UdpPortLease,
-	) -> io::Result<(Arc<UdpSocket>, Arc<UdpSocket>)> {
-		let rtp_sock =
-			Arc::new(UdpSocket::bind(SocketAddr::new(server_bind_ip, lease.rtp_port)).await?);
-		let rtcp_sock =
-			Arc::new(UdpSocket::bind(SocketAddr::new(server_bind_ip, lease.rtcp_port)).await?);
+	) -> io::Result<(UdpSocket, UdpSocket)> {
+		let rtp_sock = UdpSocket::bind(SocketAddr::new(server_bind_ip, lease.rtp_port)).await?;
+		let rtcp_sock = UdpSocket::bind(SocketAddr::new(server_bind_ip, lease.rtcp_port)).await?;
 		Ok((rtp_sock, rtcp_sock))
 	}
 
@@ -206,8 +174,8 @@ impl UdpUnicastTransport {
 }
 
 /// No-op [`Transport`] for unit tests that need a concrete `Arc<dyn
-/// Transport>` but don't care about the wire side. `send_rtp` / `send_rtcp`
-/// return `Ok(())` without touching any socket; `close` does nothing.
+/// Transport>` but don't care about the wire side. `send_rtp` returns
+/// `Ok(())` without touching any socket.
 #[cfg(test)]
 pub(crate) fn noop_transport_for_tests() -> std::sync::Arc<dyn Transport> {
 	struct Noop;
@@ -216,10 +184,6 @@ pub(crate) fn noop_transport_for_tests() -> std::sync::Arc<dyn Transport> {
 		async fn send_rtp(&self, _packet: &[u8]) -> io::Result<()> {
 			Ok(())
 		}
-		async fn send_rtcp(&self, _packet: &[u8]) -> io::Result<()> {
-			Ok(())
-		}
-		async fn close(&self) {}
 	}
 	std::sync::Arc::new(Noop)
 }
@@ -236,7 +200,7 @@ mod tests {
 		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 			Arc::new(Mutex::new(Box::new(server)));
 
-		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 0, 1);
+		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 0);
 		let payload = b"\x80\x60\x00\x01rtp-payload";
 		transport.send_rtp(payload).await.unwrap();
 
@@ -253,26 +217,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn tcp_interleaved_uses_rtcp_channel_for_rtcp() {
-		let (client, server) = tokio::io::duplex(4096);
-		let (mut client_read, _client_write) = tokio::io::split(client);
-		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
-			Arc::new(Mutex::new(Box::new(server)));
-
-		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 2, 3);
-		transport.send_rtcp(b"rtcp-packet").await.unwrap();
-
-		let mut header = [0u8; 4];
-		client_read.read_exact(&mut header).await.unwrap();
-		assert_eq!(header[1], 3); // channel_rtcp
-	}
-
-	#[tokio::test]
 	async fn tcp_interleaved_rejects_oversize_packet() {
 		let (_client, server) = tokio::io::duplex(4096);
 		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 			Arc::new(Mutex::new(Box::new(server)));
-		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 0, 1);
+		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 0);
 		// One byte over u16::MAX - framing header has 2-byte length field.
 		let too_big = vec![0u8; u16::MAX as usize + 1];
 		let err = transport.send_rtp(&too_big).await.unwrap_err();
@@ -283,37 +232,28 @@ mod tests {
 	async fn noop_transport_returns_ok() {
 		let t = noop_transport_for_tests();
 		t.send_rtp(b"ignored").await.unwrap();
-		t.send_rtcp(b"ignored").await.unwrap();
-		t.close().await;
 	}
 
 	#[tokio::test]
 	async fn udp_transport_sends_to_client_addr() {
 		use std::net::Ipv4Addr;
-		// Bind a loopback receiver for both RTP and RTCP.
 		let client_rtp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		let client_rtcp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let client_rtp_addr = client_rtp_sock.local_addr().unwrap();
-		let client_rtcp_addr = client_rtcp_sock.local_addr().unwrap();
 
 		let pool = Arc::new(UdpPortPool::new());
 		let transport = UdpUnicastTransport::bind(
 			IpAddr::V4(Ipv4Addr::LOCALHOST),
 			Arc::clone(&pool),
 			client_rtp_addr,
-			client_rtcp_addr,
 		)
 		.await
 		.unwrap();
 
 		transport.send_rtp(b"rtp-data").await.unwrap();
-		transport.send_rtcp(b"rtcp-data").await.unwrap();
 
 		let mut buf = [0u8; 64];
 		let (n, _) = client_rtp_sock.recv_from(&mut buf).await.unwrap();
 		assert_eq!(&buf[..n], b"rtp-data");
-		let (n, _) = client_rtcp_sock.recv_from(&mut buf).await.unwrap();
-		assert_eq!(&buf[..n], b"rtcp-data");
 	}
 
 	/// `bind` must step past a leased pair whose ports are already
@@ -339,7 +279,7 @@ mod tests {
 		let caddr = client.local_addr().unwrap();
 
 		let pool = Arc::new(UdpPortPool::new());
-		let transport = UdpUnicastTransport::bind(ip, Arc::clone(&pool), caddr, caddr)
+		let transport = UdpUnicastTransport::bind(ip, Arc::clone(&pool), caddr)
 			.await
 			.expect("bind must retry past the occupied first pair");
 

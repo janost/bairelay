@@ -1,4 +1,4 @@
-//! RTSP protocol layer: message handling, auth, transport, and session state.
+//! RTSP protocol layer: message handling, auth, transport, and session IDs.
 
 pub mod auth;
 pub mod message;

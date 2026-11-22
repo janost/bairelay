@@ -17,9 +17,6 @@ pub const H264_PAYLOAD_TYPE: u8 = 96;
 /// RTP clock rate for H.264 (always 90 kHz).
 pub const H264_CLOCK_HZ: u32 = 90_000;
 
-/// Maximum MTU we target for RTP payloads over UDP/TCP-interleaved.
-pub const DEFAULT_MTU: usize = 1400;
-
 /// Packetize a single NAL unit smaller than the MTU into one RTP packet.
 ///
 /// Returns the serialized RTP packet.

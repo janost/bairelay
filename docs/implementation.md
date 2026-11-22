@@ -312,7 +312,7 @@ The 3 s threshold sits above the pacer's 1.5 s buffer — a normal inter-burst g
 
 ## Per-kind session dispatch
 
-`crates/rtsp/src/server/session_task.rs::run` is a small coordinator. After the PLAY gate it spawns two child tasks — `video_dispatch_loop` and `audio_dispatch_loop` — each holding its own `broadcast::Receiver` (via `resubscribe()`). Each child loops on `frames.recv()`, skips frames of the wrong kind, lazily resolves its `RuntimeTrack` from `session_tracks` on track-miss, and writes RTP packets via the track's transport. The coordinator then awaits cancel + the JoinSet's first completion; either path cascades cancel to the surviving child, awaits both joins, closes transports, and removes the session.
+`crates/rtsp/src/server/session_task.rs::run` is a small coordinator. After the PLAY gate it spawns two child tasks — `video_dispatch_loop` and `audio_dispatch_loop` — each holding its own `broadcast::Receiver` (via `resubscribe()`). Each child loops on `frames.recv()`, skips frames of the wrong kind, lazily resolves its `RuntimeTrack` from `session_tracks` on track-miss, and writes RTP packets via the track's transport. The coordinator then awaits cancel + the JoinSet's first completion; either path cascades cancel to the surviving child, awaits both joins, and removes the session.
 
 Why split: the unified loop the per-kind dispatchers replaced consumed `Frame::Video` and `Frame::Audio` from a single `tokio::select!` arm. A 4 K HEVC IDR (~150–370 RTP packets after FU fragmentation) monopolised the dispatch task's TCP-write loop while audio frames piled up in the broadcast queue; receivers saw audio drain in a burst once the video write completed. Splitting into two parallel consumers means the audio loop's `frames.recv()` is always free to fire, and the per-packet TCP-interleaved write mutex (held only for one `$-framed` packet at a time, ≤ MTU) lets audio FU fragments interleave between video FU fragments at packet granularity.
 
@@ -320,13 +320,13 @@ Audio bursting on the wire ALSO needed the audio pacer's `snap_on_past` fix abov
 
 Asymmetry: the video child takes ownership of the original `frames` receiver passed into `run()` (preserving its read position so any pre-PLAY buffered frames + lag detection both flow through it), while the audio child gets a fresh `resubscribe()`. Audio losing a few buffered frames at session start is benign — receivers expect to start at "now" anyway.
 
-`tracks_changed` is plumbed through `run`'s signature for ABI compat but the children don't subscribe to it. Late-SETUP append picks up the new track via the per-child lazy resolution on the next matching-kind frame; using `notify_one` for two waiters would race (only one wakes per call).
+There is no track-append notification. Late-SETUP append picks up the new track via the per-child lazy resolution on the next matching-kind frame.
 
 ## RTCP
 
 The session task does not emit periodic Sender Reports. The receiver falls back to RTP-arrival-time A-V sync, which is what live camera feeds actually need at our latency targets — the audio + video pacers hold the wire cadence at `clock_rate` and the receiver derives slope from successive RTP packets directly.
 
-`build_sender_report`, `ntp_now`, and `ntp_minus` are kept in `crates/rtsp/src/server/rtcp.rs` so any future SR-emitting context (e.g. a recording sink that needs precise NTP↔RTP) is one wire-up away. The SR ticker arm has been removed from `run` (per-kind dispatch coordinator no longer hosts a `select!`); an SR-emitting future would spawn its own ticker task.
+The SR builder was deleted along with the rest of the unused RTCP plumbing; git history has it if a future sink needs precise NTP↔RTP. The server also never sends RTCP over UDP, but it keeps the advertised RTCP port bound so client receiver reports do not draw ICMP port-unreachable.
 
 ---
 

@@ -37,17 +37,11 @@ pub enum TrackKind {
 pub struct TrackEntry {
 	/// Which media kind this track carries.
 	pub kind: TrackKind,
-	/// Write-side transport for this track's RTP/RTCP packets.
+	/// Write-side transport for this track's RTP packets.
 	pub transport: Arc<dyn Transport>,
 	/// SSRC echoed in the SETUP Transport response and used by the session
 	/// send loop when framing RTP packets for this track.
 	pub ssrc: u32,
-	/// RTP clock rate in Hz. Video uses 90000 (RTP convention for H.264
-	/// / H.265). Audio uses the codec sample rate (16000 for AAC-LC on
-	/// Argus, 8000 for G.711 µ-law). Used by the session send loop to
-	/// extrapolate RTP timestamps at RTCP SR fire time so the SR's
-	/// (NTP, RTP) pair refers to the same instant per RFC 3550 §6.4.1.
-	pub clock_rate: u32,
 }
 
 /// Per-session state tracked by the registry.
@@ -78,13 +72,6 @@ pub struct SessionEntry {
 	/// before that (rare — the send loop starts at SETUP), the header is
 	/// omitted; most clients tolerate the absence.
 	pub first_video_rtp: FirstVideoRtpSlot,
-	/// Notifies the session send loop whenever a track is appended to
-	/// `tracks` after the session was created. Fired by
-	/// [`append_track`](Self::append_track) and its [`SessionRegistry`]
-	/// wrapper. Listened for by the session loop's `select!` (B3), which
-	/// then rebuilds its `RuntimeTrack` snapshot — no per-frame poll
-	/// needed.
-	pub tracks_changed: Arc<tokio::sync::Notify>,
 	/// Gate that releases the session send loop on PLAY, per RFC 2326
 	/// §10.4/§10.5: a server MUST NOT send media data until PLAY.
 	/// Without this gate the send loop replays the cached burst +
@@ -119,7 +106,6 @@ impl SessionEntry {
 			last_activity: Mutex::new(Instant::now()),
 			tracks: Arc::new(Mutex::new(tracks)),
 			first_video_rtp: Arc::new(Mutex::new(None)),
-			tracks_changed: Arc::new(Notify::new()),
 			play_signal: Arc::new(Notify::new()),
 			play_fired: Arc::new(AtomicBool::new(false)),
 		}
@@ -127,15 +113,13 @@ impl SessionEntry {
 
 	/// Append a track to this session's track list. Called by the SETUP
 	/// handler when a client issues a second SETUP against an existing
-	/// session ID to attach its audio track.
+	/// session ID to attach its audio track. The per-kind dispatch loops
+	/// look the track up lazily on their next frame of that kind.
 	pub fn append_track(&self, track: TrackEntry) {
 		self.tracks
 			.lock()
 			.expect("tracks lock poisoned")
 			.push(track);
-		// Order matters: notify AFTER push so a waiter woken by the
-		// notify sees the new track on its next snapshot rebuild.
-		self.tracks_changed.notify_one();
 	}
 
 	/// Mark the session as playing and release the session send loop.
@@ -241,14 +225,6 @@ impl SessionRegistry {
 		entries.get(id).map(|e| Arc::clone(&e.tracks))
 	}
 
-	/// Clone the `Arc<Notify>` fired on track append for the given session.
-	/// Returned so the session send-loop spawn can await appends without
-	/// per-iteration polling.
-	pub fn tracks_changed_arc(&self, id: &str) -> Option<Arc<tokio::sync::Notify>> {
-		let entries = self.entries.lock().expect("registry lock poisoned");
-		entries.get(id).map(|e| Arc::clone(&e.tracks_changed))
-	}
-
 	/// Clone the `(Arc<Notify>, Arc<AtomicBool>)` pair that gates the
 	/// session send loop on PLAY. Returned so the spawn can park until
 	/// the PLAY handler fires `mark_playing`.
@@ -265,23 +241,6 @@ impl SessionRegistry {
 		if let Some(e) = entries.get(id) {
 			e.mark_playing();
 		}
-	}
-
-	/// Look up the audio sample rate advertised in the session's SDP, if
-	/// audio was present in the subscription. Returns `None` if the
-	/// session is not registered or the subscription's SDP had no audio
-	/// track. Used by the SETUP append path to stamp the right clock
-	/// rate on late-attached audio [`TrackEntry`]s for RTCP SR
-	/// extrapolation.
-	pub fn audio_sample_rate(&self, id: &str) -> Option<u32> {
-		let entries = self.entries.lock().expect("registry lock poisoned");
-		entries.get(id).and_then(|e| {
-			e.subscription
-				.sdp_params
-				.audio
-				.as_ref()
-				.map(|a| a.sample_rate)
-		})
 	}
 
 	/// Append a track to an existing session. No-op if the session ID is
@@ -397,7 +356,6 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0x1234_5678,
-			clock_rate: 90_000,
 		};
 		let entry = SessionEntry::new(cancel, stub_subscription(), vec![track]);
 		assert_eq!(entry.tracks.lock().expect("tracks lock").len(), 1);
@@ -414,13 +372,11 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xAAAA,
-			clock_rate: 90_000,
 		};
 		let audio = TrackEntry {
 			kind: TrackKind::Audio,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xBBBB,
-			clock_rate: 16_000,
 		};
 		let entry = SessionEntry::new(cancel, stub_subscription(), vec![video]);
 		entry.append_track(audio);
@@ -430,50 +386,6 @@ mod tests {
 		assert_eq!(tracks[1].kind, TrackKind::Audio);
 	}
 
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn append_track_fires_tracks_changed_notify() {
-		use std::time::Duration;
-		use tokio::time::timeout;
-
-		let cancel = CancellationToken::new();
-		let video = TrackEntry {
-			kind: TrackKind::Video,
-			transport: crate::server::transport::noop_transport_for_tests(),
-			ssrc: 0xAAAA,
-			clock_rate: 90_000,
-		};
-		let audio = TrackEntry {
-			kind: TrackKind::Audio,
-			transport: crate::server::transport::noop_transport_for_tests(),
-			ssrc: 0xBBBB,
-			clock_rate: 16_000,
-		};
-		let entry = SessionEntry::new(cancel, stub_subscription(), vec![video]);
-		let tracks = Arc::clone(&entry.tracks);
-		let notify = Arc::clone(&entry.tracks_changed);
-
-		// Park a listener. notify_one before notified() is fine —
-		// Notify latches one permit.
-		let listener = tokio::spawn(async move {
-			notify.notified().await;
-			// Ordering invariant: when the notify fires, the push MUST
-			// already have landed in the Vec. Otherwise B3's session loop
-			// could wake, rebuild against a stale list, and miss the
-			// appended track.
-			let len = tracks.lock().expect("tracks lock poisoned").len();
-			assert!(len >= 2, "expected len >= 2 after append; got {len}");
-		});
-
-		// Append a track — notify should fire.
-		entry.append_track(audio);
-
-		// Listener must complete within a short deadline.
-		timeout(Duration::from_millis(500), listener)
-			.await
-			.expect("append_track must fire tracks_changed notify")
-			.expect("spawned task joined ok");
-	}
-
 	// ── Registry: insert / sweep / default ───────────────────────────
 
 	fn track() -> TrackEntry {
@@ -481,7 +393,6 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xABCDEF01,
-			clock_rate: 90_000,
 		}
 	}
 

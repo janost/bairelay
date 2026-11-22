@@ -733,26 +733,10 @@ async fn handle_setup(
 		// ffmpeg, HA's stream) issue all SETUPs before PLAY, which this
 		// path handles cleanly. If tightening is ever needed, add a
 		// deliverable for it to `docs/architecture.md` Phased Build Order.
-		// Derive clock rate per RFC 3550 for RTCP SR extrapolation.
-		// Video always uses 90000; audio uses the sample rate the session
-		// already advertised in its SDP (pulled from the existing
-		// subscription). If audio SDP wasn't populated (e.g. camera emits
-		// video only), fall back to 16000 — a neutral default for Argus
-		// AAC-LC. The fallback path shouldn't fire in practice: a client
-		// wouldn't SETUP audio without seeing an `m=audio` line in the
-		// DESCRIBE response.
-		let track_clock_rate = match track_kind {
-			TrackKind::Video => 90_000u32,
-			TrackKind::Audio => state
-				.sessions
-				.audio_sample_rate(&session_id)
-				.unwrap_or(16_000),
-		};
 		let track = TrackEntry {
 			kind: track_kind,
 			transport: Arc::clone(&transport_impl),
 			ssrc: track_ssrc,
-			clock_rate: track_clock_rate,
 		};
 		state.sessions.append_track(&session_id, track);
 		let resp = crate::rtsp::message::build_response(
@@ -823,22 +807,10 @@ async fn handle_setup(
 	let sessions_for_task = Arc::clone(&state.sessions);
 	let session_id_for_task = session_id.clone();
 
-	// Derive clock rate per RFC 3550 for RTCP SR extrapolation. See the
-	// matching comment in the append path above.
-	let first_track_clock_rate = match track_kind {
-		TrackKind::Video => 90_000u32,
-		TrackKind::Audio => subscription
-			.sdp_params
-			.audio
-			.as_ref()
-			.map(|a| a.sample_rate)
-			.unwrap_or(16_000),
-	};
 	let first_track = TrackEntry {
 		kind: track_kind,
 		transport: Arc::clone(&transport_impl),
 		ssrc: track_ssrc,
-		clock_rate: first_track_clock_rate,
 	};
 	state.sessions.insert(
 		session_id.clone(),
@@ -848,10 +820,6 @@ async fn handle_setup(
 		.sessions
 		.tracks_arc(&session_id)
 		.expect("tracks arc missing immediately after insert");
-	let tracks_changed_for_task = state
-		.sessions
-		.tracks_changed_arc(&session_id)
-		.expect("tracks_changed notify missing immediately after insert");
 	// Shared slot populated by the session task on its first video packet
 	// and read by the PLAY handler to emit `RTP-Info:` (RFC 2326 §12.33).
 	let first_video_rtp_for_task = state
@@ -874,7 +842,6 @@ async fn handle_setup(
 			session_id_for_task,
 			first_video_rtp_for_task,
 			cancel_for_task,
-			tracks_changed_for_task,
 			play_signal_for_task,
 			play_fired_for_task,
 		)
@@ -915,7 +882,6 @@ async fn build_transport(
 			let t = crate::server::transport::TcpInterleavedTransport::new(
 				Arc::clone(&state.writer),
 				channel_rtp,
-				channel_rtcp,
 			);
 			let response = transport_mod::build_tcp_response(channel_rtp, channel_rtcp, track_ssrc);
 			Ok((Arc::new(t), response))
@@ -928,7 +894,6 @@ async fn build_transport(
 			// the connection was accepted (see `handle_connection`).
 			use std::net::SocketAddr;
 			let client_rtp_addr = SocketAddr::new(state.peer_ip, client_rtp_port);
-			let client_rtcp_addr = SocketAddr::new(state.peer_ip, client_rtcp_port);
 			// If the server's listener is bound to wildcard, bind the UDP
 			// sockets to the TCP connection's local IP so RTP source-IP
 			// matches the RTSP 5-tuple on multi-homed hosts. Otherwise use
@@ -942,7 +907,6 @@ async fn build_transport(
 				udp_bind_ip,
 				Arc::clone(&state.udp_pool),
 				client_rtp_addr,
-				client_rtcp_addr,
 			)
 			.await
 			.map_err(|_| rtsp_types::StatusCode::InternalServerError)?;

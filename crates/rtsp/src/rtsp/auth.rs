@@ -277,14 +277,9 @@ where
 					cnonce,
 					qop,
 				),
-				None => digest_response_no_qop(
-					&user.name,
-					realm,
-					&user.password,
-					method,
-					uri,
-					nonce,
-				),
+				None => {
+					digest_response_no_qop(&user.name, realm, &user.password, method, uri, nonce)
+				}
 			};
 			if ct_eq(&expected, &response) {
 				return Ok(&user.name);
@@ -398,9 +393,8 @@ mod digest_tests {
 			password: "wonderland".into(),
 		}];
 		let uri = "rtsp://host/cam1/main";
-		let resp =
-			digest_response_no_qop("alice", "bairelay", "wonderland", "DESCRIBE", uri, "n1")
-				.to_ascii_uppercase();
+		let resp = digest_response_no_qop("alice", "bairelay", "wonderland", "DESCRIBE", uri, "n1")
+			.to_ascii_uppercase();
 		let authz = format!(
 			r#"Digest username="alice", realm="bairelay", nonce="n1", uri="{uri}", response="{resp}""#
 		);

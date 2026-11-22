@@ -6,6 +6,10 @@ pub mod h264;
 pub mod h265;
 pub mod nal;
 
+/// Maximum RTP packet size (header + payload) the packetizers emit over
+/// UDP or TCP-interleaved; conservative for typical Ethernet links.
+pub const DEFAULT_MTU: usize = 1400;
+
 /// Video codec identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {

@@ -472,7 +472,6 @@ mod tests {
 		use bairelay_rtsp::codec::VideoCodec;
 		use bairelay_rtsp::url::StreamKind;
 		use std::collections::HashMap;
-		use std::time::Instant as StdInstant;
 
 		let jpeg_bytes: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x12, 0x34];
 		let expected_jpeg = jpeg_bytes.clone();
@@ -484,10 +483,7 @@ mod tests {
 			StreamSource::start_inert_for_test_with_gap_and_last_frame(Duration::from_secs(1));
 		last_frame.replace_video(VideoBurst {
 			codec: VideoCodec::H264,
-			parameter_sets: vec![vec![0x67, 0x42, 0x00, 0x1f]],
 			iframe_nals: vec![vec![0x65, 0xaa]],
-			pframe_nals: vec![],
-			captured_at: StdInstant::now(),
 			captured_pts_90khz: 0,
 		});
 
