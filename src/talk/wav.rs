@@ -131,8 +131,10 @@ pub fn parse_wav(bytes: &[u8]) -> Result<MonoPcm> {
 		.chunks_exact(frame)
 		.map(|f| {
 			let sum: i32 = f
-				.chunks_exact(2)
-				.map(|s| i32::from(i16::from_le_bytes([s[0], s[1]])))
+				.as_chunks::<2>()
+				.0
+				.iter()
+				.map(|s| i32::from(i16::from_le_bytes(*s)))
 				.sum();
 			(sum / ch as i32) as i16
 		})

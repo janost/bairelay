@@ -122,9 +122,9 @@ pub fn encode_dvi4(pcm: &[i16], block_align: usize) -> Vec<u8> {
 			predictor: i32::from(first),
 			step_index,
 		};
-		for pair in block[1..].chunks_exact(2) {
-			let lo = state.encode(pair[0]);
-			let hi = state.encode(pair[1]);
+		for [a, b] in block[1..].as_chunks::<2>().0 {
+			let lo = state.encode(*a);
+			let hi = state.encode(*b);
 			out.push(lo | (hi << 4));
 		}
 		step_index = state.step_index;
