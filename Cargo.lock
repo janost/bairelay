@@ -241,6 +241,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "bairelay",
  "bairelay-mqtt",
  "bairelay-neolink-core",
  "bairelay-rtsp",

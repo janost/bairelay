@@ -160,19 +160,6 @@ pub struct StreamSource {
 	// Shared with the reader task so SDP updates land in one place and
 	// are observable by every `sdp_params()` caller.
 	sdp_params: Arc<RwLock<SdpParams>>,
-	/// Shared translator state. Held by `reader_task` via a clone of this
-	/// `Arc` — if `reader_task` is re-spawned across a Baichuan reconnect,
-	/// the PTS counters do not reset, so downstream RTP timestamps stay
-	/// monotonic across the reconnect boundary. Fixes the 4K-Terrace tail-
-	/// drain DTS warning observed during live-verify (see
-	/// `docs/implementation.md`, "Residual finding on 4K
-	/// Terrace").
-	///
-	/// Only read by `reader_task` (via a cloned `Arc`); the copy on
-	/// `StreamSource` exists to keep the state alive across any future
-	/// reader re-spawn, hence the `dead_code` allow.
-	#[allow(dead_code)]
-	translator_state: Arc<Mutex<StreamTranslatorState>>,
 	cancel: CancellationToken,
 	// Reader task handle, taken out by `stop_and_wait` for synchronous
 	// teardown so callers can ensure the task observed cancel + ran
@@ -200,49 +187,6 @@ pub struct StreamSource {
 	/// lock-and-release, never held across `.await`, so `std::sync::Mutex`
 	/// is the right primitive here.
 	gap_state: Arc<Mutex<GapState>>,
-	/// Last time a real live `Frame::Video` was forwarded. Compared
-	/// against `gap_threshold` by the gap-detection ticker. Seeded with
-	/// `tokio::time::Instant::now()` at source construction so the
-	/// initial state is `Live` (no spurious `Bridging` at startup).
-	///
-	/// Uses `tokio::time::Instant` rather than `std::time::Instant` so
-	/// the gap-detection unit tests can drive transitions under
-	/// `tokio::test(start_paused = true)` + `tokio::time::advance`.
-	/// Outside paused tests `tokio::time::Instant::now()` is backed by
-	/// the same monotonic clock as `std::time::Instant`.
-	///
-	/// Only read by `reader_task` (via a cloned `Arc`); the copy on
-	/// `StreamSource` exists to keep the state alive across any future
-	/// reader re-spawn, matching the same pattern as `translator_state`.
-	#[allow(dead_code)]
-	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
-	/// 90 kHz RTP timestamp of the last [`Frame::Video`] broadcast on
-	/// this source, regardless of whether it was a live frame or a
-	/// Bridging replay. `None` until the first emit. Updated by
-	/// `reader_task` (and its test stand-in) on every successful video
-	/// broadcast. Used by the replay-frame synth to advance PTS
-	/// monotonically across the `Live → Bridging → Live` boundary.
-	///
-	/// `Option<u32>` rather than `0` sentinel: the previous "rebind only
-	/// when *guard == 0" rule both (a) failed to rebind on a legitimate
-	/// 32-bit-wraparound zero and (b) coupled with a `now`-initialised
-	/// `last_emit_wallclock_at` to produce an unbounded first-replay PTS
-	/// jump (process-uptime × 90 kHz).
-	///
-	/// Held in an `Arc<Mutex<_>>` so a mid-stream reader re-spawn re-
-	/// binds the same state — synth PTS stays monotonic across the
-	/// reconnect, mirroring the `translator_state` pattern.
-	#[allow(dead_code)]
-	last_emitted_pts_90khz: Arc<Mutex<Option<u32>>>,
-	/// Wall-clock instant of the last [`Frame::Video`] broadcast (live
-	/// or replay). Paired with `last_emitted_pts_90khz` to derive the
-	/// next replay PTS as `last_pts + Δwall × 90_000`. `None` until the
-	/// first emit so the first replay's wall-clock delta is 0 (the
-	/// burst's `captured_pts_90khz` anchor stands alone). Uses
-	/// `tokio::time::Instant` so the replay tests can drive transitions
-	/// under `tokio::test(start_paused = true)`.
-	#[allow(dead_code)]
-	last_emit_wallclock_at: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 /// Shared parts of a [`StreamSource`] that are independent of the
@@ -253,6 +197,17 @@ pub struct StreamSource {
 /// Extracting this struct lets `start` and `start_inert_for_test_*`
 /// share the same construction code, so the per-field initialization
 /// at this one call site is exercised by both paths.
+///
+/// The reader-only fields:
+/// - `last_live_frame_at`: last time a live `Frame::Video` arrived,
+///   compared against `gap_threshold` by the gap ticker; seeded with
+///   now so the source starts `Live`. A `tokio::time::Instant` so
+///   paused-time tests drive it.
+/// - `last_emitted_pts_90khz`: 90 kHz timestamp of the last video
+///   broadcast, live or replay; `None` until the first. The replay
+///   synth advances from it across `Live → Bridging → Live`.
+/// - `last_emit_wallclock_at`: when that broadcast happened; `None`
+///   until the first, so the first replay's wall-clock delta is 0.
 struct StreamSourceParts {
 	tx: broadcast::Sender<Frame>,
 	last_frame: Arc<LastFrameBuffer>,
@@ -300,15 +255,11 @@ impl StreamSourceParts {
 			tx: self.tx.downgrade(),
 			last_frame: self.last_frame,
 			sdp_params: self.sdp_params,
-			translator_state: self.translator_state,
 			cancel: self.cancel,
 			task: Mutex::new(Some(task)),
 			last_idle_since: Mutex::new(None),
 			gap_threshold: self.gap_threshold,
 			gap_state: self.gap_state,
-			last_live_frame_at: self.last_live_frame_at,
-			last_emitted_pts_90khz: self.last_emitted_pts_90khz,
-			last_emit_wallclock_at: self.last_emit_wallclock_at,
 		})
 	}
 }
@@ -362,12 +313,6 @@ struct ReaderTaskArgs {
 /// - `aac_aot` — last observed ADTS AudioObjectType. Gates the one-shot
 ///   "unsupported AOT" warn in `handle_aac` so a latched-on-bad-AOT
 ///   stream doesn't log per packet.
-///
-/// Held by `StreamSource` in an `Arc<Mutex<_>>` so a mid-probe Baichuan
-/// reconnect that re-spawns `reader_task` re-binds the same state — PTS
-/// counters survive, so the next audio RTP packet after reconnect is not
-/// a backward DTS jump (the 4K-Terrace tail-drain symptom from 2D.1
-/// live-verify, see `docs/implementation.md`).
 #[derive(Debug, Default)]
 pub struct StreamTranslatorState {
 	pub detected_codec: Option<VideoCodec>,
@@ -493,10 +438,10 @@ impl StreamSource {
 	/// `BcCamera::stop_video`, so tests exercise the same translator
 	/// plumbing production uses without any real camera.
 	///
-	/// Gated on the `test-util` feature + `#[cfg(test)]` so release builds
-	/// do not carry it. Returns the `Arc<StreamSource>` only — the caller
-	/// drops its own `CancellationToken` or the source to terminate.
-	#[allow(dead_code, private_bounds)]
+	/// Returns the `Arc<StreamSource>` only — the caller drops its own
+	/// `CancellationToken` or the source to terminate.
+	#[cfg(test)]
+	#[allow(private_bounds)]
 	pub(crate) fn start_with_packet_source<S>(
 		camera_name: String,
 		kind: RtspStreamKind,
@@ -691,12 +636,8 @@ impl Drop for StreamSource {
 	}
 }
 
-// When compiled with only `feature = "test-util"` (i.e. from an
-// integration test's self-dep, not `cargo test` on this crate), the
-// `pub(crate)` helpers below appear unused — their callers live in
-// `#[cfg(test)]` unit-test modules that aren't compiled in that mode.
-// The `allow(dead_code)` silences the resulting warning.
-#[allow(dead_code)]
+/// Unit-test constructors and pokes.
+#[cfg(test)]
 impl StreamSource {
 	/// Build a `StreamSource` that owns only its broadcast channel and
 	/// translator state — no reader task, no `BcCamera`. Used by the
@@ -754,6 +695,27 @@ impl StreamSource {
 		(src, last_frame)
 	}
 
+	/// Test-only subscribe that returns a fresh broadcast receiver, so
+	/// unit tests can drive `receiver_count()` transitions without pulling
+	/// in the full RTSP provider subscription machinery.
+	pub(crate) fn subscribe_for_test(&self) -> broadcast::Receiver<Frame> {
+		self.subscribe()
+	}
+
+	/// Test-only: force this source's [`GapState`] without waiting for
+	/// the reader task's 200 ms ticker. Used by camera-side aggregator
+	/// tests that need to observe "source is bridging" transitions in
+	/// sub-millisecond time.
+	pub(crate) fn set_gap_state_for_test(&self, state: GapState) {
+		*lock_recover(&self.gap_state) = state;
+	}
+}
+
+/// Test constructors shared with the integration tests in `tests/`
+/// (through the `test-util` feature, which only the dev-dependency
+/// self-reference enables).
+#[cfg(any(test, feature = "test-util"))]
+impl StreamSource {
 	/// Shared core of the inert-for-test constructors: also accepts a
 	/// caller-provided [`LastFrameBuffer`] so the replay-frame tests can
 	/// preload a burst before the ticker fires.
@@ -761,9 +723,7 @@ impl StreamSource {
 	/// `pub` (not `pub(crate)`) so the Task 11 integration test
 	/// in `tests/fixture_replay.rs` can wire a real `StreamSource` behind
 	/// a `StreamProvider` shim and exercise production's gap-detection
-	/// ticker + `emit_replay_frame_if_bridging` end-to-end. The
-	/// `#[cfg(test)]` gate on the enclosing `impl` block keeps this out
-	/// of release builds.
+	/// ticker + `emit_replay_frame_if_bridging` end-to-end.
 	pub fn start_inert_for_test_with_gap_and_last_frame_and_injector(
 		gap_threshold: Duration,
 		last_frame: Arc<LastFrameBuffer>,
@@ -815,21 +775,6 @@ impl StreamSource {
 		(parts.into_source(task), injector)
 	}
 
-	/// Test-only subscribe that returns a fresh broadcast receiver, so
-	/// unit tests can drive `receiver_count()` transitions without pulling
-	/// in the full RTSP provider subscription machinery.
-	pub(crate) fn subscribe_for_test(&self) -> broadcast::Receiver<Frame> {
-		self.subscribe()
-	}
-
-	/// Test-only: force this source's [`GapState`] without waiting for
-	/// the reader task's 200 ms ticker. Used by camera-side aggregator
-	/// tests that need to observe "source is bridging" transitions in
-	/// sub-millisecond time.
-	pub(crate) fn set_gap_state_for_test(&self, state: GapState) {
-		*lock_recover(&self.gap_state) = state;
-	}
-
 	/// Test-only: overwrite the SDP parameters on this source. The inert
 	/// constructors leave `SdpParams.video`/`audio` as `None` because
 	/// there's no reader task to populate them from a real IDR; the
@@ -851,12 +796,14 @@ impl StreamSource {
 /// `#[cfg(any(test, feature = "test-util"))]` gate on the struct + impl
 /// keeps this out of release builds; the `test-util` feature is only
 /// pulled in by `bairelay`'s own `[dev-dependencies]` self-reference.
+#[cfg(any(test, feature = "test-util"))]
 pub struct FakeFrameInjector {
 	gap_state: Arc<Mutex<GapState>>,
 	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
 	tx: broadcast::Sender<Frame>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl FakeFrameInjector {
 	/// Mark the source as having just received a real live video frame.
 	/// Mirrors a SUBSET of the state updates that `reader_task` performs
@@ -1222,6 +1169,11 @@ fn emit_replay_frame_if_bridging(
 	if *lock_recover(gap_state) != GapState::Bridging {
 		return;
 	}
+	// The snapshot deep-copies the burst (up to 8 MiB), every tick:
+	// skip it when nobody would receive the replay.
+	if tx.receiver_count() == 0 {
+		return;
+	}
 	let Some(burst) = last_frame.video_snapshot() else {
 		// No burst ever captured for this source — nothing to replay.
 		// Leave state as `Bridging`; the watchdog/reader will surface
@@ -1288,12 +1240,6 @@ fn emit_replay_frame_if_bridging(
 }
 
 /// Reader loop driving one `(camera, stream_kind)` source.
-///
-/// `translator_state` is an `Arc<Mutex<StreamTranslatorState>>` shared with
-/// the owning [`StreamSource`]. Holding it here (rather than keeping a
-/// stack-local copy) means a mid-stream re-spawn of this task across a
-/// Baichuan reconnect reuses the same PTS counters, so audio RTP
-/// timestamps stay monotonic across the reconnect boundary.
 async fn reader_task(args: ReaderTaskArgs) {
 	let ReaderTaskArgs {
 		camera,
@@ -2841,6 +2787,29 @@ mod tests {
 			}
 			other => panic!("expected Frame::Video, got {other:?}"),
 		}
+	}
+
+	/// With no subscriber a bridging tick does nothing: no burst copy, no
+	/// synth state advanced. A subscriber gets the replay.
+	#[tokio::test]
+	async fn bridging_replay_skips_without_subscribers() {
+		let (tx, _) = broadcast::channel::<Frame>(4);
+		let last_frame = Arc::new(LastFrameBuffer::new());
+		last_frame.replace_video(fake_burst_with_pts_90khz(90_000));
+		let gap_state = Mutex::new(GapState::Bridging);
+		let last_pts = Mutex::new(None);
+		let last_at = Mutex::new(None);
+		let tick =
+			|| emit_replay_frame_if_bridging(&tx, &last_frame, &gap_state, &last_pts, &last_at);
+
+		tick();
+		assert_eq!(*last_pts.lock().unwrap(), None);
+		assert!(last_at.lock().unwrap().is_none());
+
+		let mut rx = tx.subscribe();
+		tick();
+		assert!(matches!(rx.try_recv(), Ok(Frame::Video { .. })));
+		assert_eq!(*last_pts.lock().unwrap(), Some(90_000));
 	}
 
 	/// once `Bridging`, every ticker fire must push a
