@@ -207,7 +207,7 @@ pub mod fuzz_api {
 					p += take;
 				}
 				_ => {
-					let _ = s.drain_contiguous();
+					let _ = s.drain_contiguous(now);
 					let _ = s.build_send_ack();
 				}
 			}
