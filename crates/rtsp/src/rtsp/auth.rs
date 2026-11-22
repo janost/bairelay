@@ -4,6 +4,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use thiserror::Error;
 
+use super::strip_prefix_ignore_case;
+
 /// Errors produced while validating an `Authorization` header.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
@@ -38,9 +40,7 @@ pub struct UserCred {
 /// Expects value formatted as `Basic <base64>`. Returns the username on
 /// success.
 pub fn verify_basic<'a>(authz: &str, users: &'a [UserCred]) -> Result<&'a str, AuthError> {
-	let rest = authz
-		.strip_prefix_ignore_case("Basic ")
-		.ok_or(AuthError::UnknownScheme)?;
+	let rest = strip_prefix_ignore_case(authz, "Basic ").ok_or(AuthError::UnknownScheme)?;
 	let decoded = BASE64
 		.decode(rest.trim())
 		.map_err(|_| AuthError::Malformed)?;
@@ -52,20 +52,6 @@ pub fn verify_basic<'a>(authz: &str, users: &'a [UserCred]) -> Result<&'a str, A
 		}
 	}
 	Err(AuthError::BadCredentials)
-}
-
-trait StrExt {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str>;
-}
-
-impl StrExt for str {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str> {
-		if self.len() >= prefix.len() && self[..prefix.len()].eq_ignore_ascii_case(prefix) {
-			Some(&self[prefix.len()..])
-		} else {
-			None
-		}
-	}
 }
 
 /// Build a Basic challenge header value for a `WWW-Authenticate:` response.
@@ -140,9 +126,7 @@ pub fn build_digest_challenge(realm: &str, nonce: &Nonce, stale: bool) -> String
 pub fn parse_digest_params(
 	value: &str,
 ) -> Result<std::collections::HashMap<String, String>, AuthError> {
-	let rest = value
-		.strip_prefix_ignore_case("Digest ")
-		.ok_or(AuthError::UnknownScheme)?;
+	let rest = strip_prefix_ignore_case(value, "Digest ").ok_or(AuthError::UnknownScheme)?;
 	let mut map = std::collections::HashMap::new();
 	for part in split_digest_params(rest) {
 		let (k, v) = part.split_once('=').ok_or(AuthError::Malformed)?;
