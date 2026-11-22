@@ -72,6 +72,8 @@ Reolink firmware routinely adds and removes XML fields between model generations
 
 Camera XML is decoded with `parse_lossy_utf8` (`crates/core/src/bc/xml.rs`): invalid UTF-8 bytes become U+FFFD before parsing, because quick-xml rejects a whole document on one bad byte and firmware can carry legacy-encoded text in fields bairelay never reads. Nesting depth is capped at quick-xml's default recursion limit of 128, on top of the `bc::de::MAX_BC_BODY_LEN` byte cap.
 
+An XML parse failure does not end the connection. `bc::de` consumes the frame, logs a warning, drops an unparseable `<Extension>` and passes an unparseable payload on as `BcPayloads::Binary`, so only the request waiting for that reply fails.
+
 Inbound deserialisation tolerates absent fields; outbound serialisation still writes the field with its current value, so there's no wire-level regression for messages we send.
 
 ### Error variants of note

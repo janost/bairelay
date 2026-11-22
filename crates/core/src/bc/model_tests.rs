@@ -648,9 +648,9 @@ fn bc_constructors_set_extension_and_payload_correctly() {
 fn bc_context_binary_mode_toggles() {
 	use crate::bc::model::BcContext;
 	let mut ctx = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
-	ctx.binary_on(42);
-	ctx.binary_on(43);
-	ctx.binary_off(42);
+	ctx.binary_on(3, 42);
+	ctx.binary_on(3, 43);
+	ctx.binary_off(3, 42);
 	// Public API on BcContext is `pub(crate)` only; we just exercise
 	// that the calls don't panic and the encryption getter mirrors what
 	// we set.
