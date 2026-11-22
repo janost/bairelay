@@ -68,15 +68,8 @@ impl TalkConfigSource {
 ///
 /// A failed `TalkAbility` query is passed as `TalkAbility::default()`
 /// (empty lists). `channel_id` is left at 0; the caller sets it.
+/// Returns the config and the tier that produced it.
 pub fn resolve_talk_config(
-	ability: &TalkAbility,
-	override_cfg: Option<&TalkConfigOverride>,
-) -> TalkConfig {
-	resolve_with_source(ability, override_cfg).0
-}
-
-/// [`resolve_talk_config`] plus the tier that produced the result.
-pub fn resolve_with_source(
 	ability: &TalkAbility,
 	override_cfg: Option<&TalkConfigOverride>,
 ) -> (TalkConfig, TalkConfigSource) {
@@ -359,7 +352,7 @@ pub async fn play(
 			}
 		}
 	};
-	let (mut cfg, source) = resolve_with_source(&ability, cam_cfg.talk_config.as_ref());
+	let (mut cfg, source) = resolve_talk_config(&ability, cam_cfg.talk_config.as_ref());
 	cfg.channel_id = cam_cfg.channel_id;
 	let ac = &cfg.audio_config;
 	tracing::info!(
@@ -445,19 +438,18 @@ mod tests {
 			length_per_encoder: 256,
 			..Default::default()
 		};
-		let (cfg, src) = resolve_with_source(&camera_ability(), Some(&o));
+		let (cfg, src) = resolve_talk_config(&camera_ability(), Some(&o));
 		assert_eq!(src, TalkConfigSource::ConfigOverride);
 		assert_eq!(cfg.duplex, "HDX");
 		assert_eq!(cfg.audio_stream_mode, "followVideoStream");
 		assert_eq!(cfg.audio_config.sample_rate, 8000);
 		assert_eq!(cfg.audio_config.length_per_encoder, 256);
 		assert_eq!(cfg.audio_config.priority, None);
-		assert_eq!(resolve_talk_config(&camera_ability(), Some(&o)), cfg);
 	}
 
 	#[test]
 	fn tier2_camera_ability_used_when_lists_present() {
-		let (cfg, src) = resolve_with_source(&camera_ability(), None);
+		let (cfg, src) = resolve_talk_config(&camera_ability(), None);
 		assert_eq!(src, TalkConfigSource::CameraAbility);
 		assert_eq!(cfg.duplex, "HDX");
 		assert_eq!(cfg.audio_stream_mode, "mixAudioStream");
@@ -467,13 +459,13 @@ mod tests {
 
 	#[test]
 	fn tier3_defaults_when_ability_empty_or_partial() {
-		let (cfg, src) = resolve_with_source(&TalkAbility::default(), None);
+		let (cfg, src) = resolve_talk_config(&TalkAbility::default(), None);
 		assert_eq!(src, TalkConfigSource::Defaults);
 		assert_eq!(cfg, defaults());
 		// One empty list is enough to fall through (doorbell reply shape).
 		let mut partial = camera_ability();
 		partial.audio_config_list.clear();
-		assert_eq!(resolve_talk_config(&partial, None), defaults());
+		assert_eq!(resolve_talk_config(&partial, None).0, defaults());
 	}
 
 	#[test]
@@ -485,7 +477,7 @@ mod tests {
 		] {
 			let mut ability = camera_ability();
 			bad(&mut ability.audio_config_list[0].audio_config);
-			let (cfg, src) = resolve_with_source(&ability, None);
+			let (cfg, src) = resolve_talk_config(&ability, None);
 			assert_eq!(src, TalkConfigSource::Defaults);
 			assert_eq!(cfg, defaults());
 		}
@@ -495,7 +487,7 @@ mod tests {
 	fn empty_override_table_equals_defaults() {
 		let o: TalkConfigOverride = toml::from_str("").unwrap();
 		assert_eq!(
-			resolve_talk_config(&TalkAbility::default(), Some(&o)),
+			resolve_talk_config(&TalkAbility::default(), Some(&o)).0,
 			defaults()
 		);
 	}
