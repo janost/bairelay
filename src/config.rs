@@ -1207,6 +1207,31 @@ pub fn warn_idle_timeout_below_prune_floor(config: &Config) {
 /// Effective TLS listener port (used when `certificate` is set).
 pub const DEFAULT_TLS_BIND_PORT: u16 = 8555;
 
+/// Longest accepted value of a `*_secs` duration setting: one day.
+/// Far past any sane hold or timeout, and it keeps every later
+/// `Duration::from_secs_f64` call in range (that panics on NaN,
+/// negative, infinite and too-large values).
+pub const MAX_DURATION_SECS: f64 = 86_400.0;
+
+/// Check a `*_secs` setting: a representable `Duration` (finite, not
+/// negative), at most [`MAX_DURATION_SECS`], and non-zero unless
+/// `allow_zero`. `what` names the setting in the error.
+fn check_duration_secs(what: &str, secs: f64, allow_zero: bool) -> Result<(), String> {
+	let ok = std::time::Duration::try_from_secs_f64(secs)
+		.is_ok_and(|d| (allow_zero || !d.is_zero()) && secs <= MAX_DURATION_SECS);
+	if ok {
+		return Ok(());
+	}
+	let range = if allow_zero {
+		"between 0 and"
+	} else {
+		"greater than 0 and at most"
+	};
+	Err(format!(
+		"{what} must be {range} {MAX_DURATION_SECS} seconds (got {secs})"
+	))
+}
+
 /// Validate a parsed Config. Returns Ok(()) or Err with a description.
 pub fn validate_config(config: &Config) -> Result<(), String> {
 	// Plain RTSP listener: bind_port = 0 means "skip plain", which is
@@ -1398,49 +1423,27 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 			));
 		}
 
-		// `Duration::from_secs_f64` panics on NaN, negative, infinite, or
-		// otherwise non-representable values. The threshold is consumed
-		// inside `CameraHandle::stream_source` long after parse, so any
-		// bad value would surface as a late runtime panic. Refuse at
-		// startup while the error still has context.
-		if cam.pause.bridge_gaps
-			&& (!cam.pause.gap_threshold_secs.is_finite() || cam.pause.gap_threshold_secs <= 0.0)
-		{
-			return Err(format!(
-				"Camera '{}': pause.gap_threshold_secs must be a positive finite number (got {})",
-				cam.name, cam.pause.gap_threshold_secs,
-			));
+		// Every duration below is turned into a `Duration` long after
+		// parse (`from_secs_f64` panics on a bad value); refuse at startup
+		// while the error still has context.
+		let cam_secs = |what: &str, secs: f64, allow_zero: bool| {
+			check_duration_secs(&format!("Camera '{}': {what}", cam.name), secs, allow_zero)
+		};
+		if cam.pause.bridge_gaps {
+			cam_secs(
+				"pause.gap_threshold_secs",
+				cam.pause.gap_threshold_secs,
+				false,
+			)?;
 		}
-
-		// idle_disconnect_timeout_secs: same sanity check as above.
-		if let Some(t) = cam.idle_disconnect_timeout_secs
-			&& (!t.is_finite() || t <= 0.0)
-		{
-			return Err(format!(
-				"Camera '{}': idle_disconnect_timeout_secs must be a positive finite number (got {})",
-				cam.name, t,
-			));
+		if let Some(t) = cam.idle_disconnect_timeout_secs {
+			cam_secs("idle_disconnect_timeout_secs", t, false)?;
 		}
-
-		// Neolink pause.timeout migration alias: same sanity check.
-		if let Some(t) = cam.pause.timeout
-			&& (!t.is_finite() || t <= 0.0)
-		{
-			return Err(format!(
-				"Camera '{}': pause.timeout must be a positive finite number (got {})",
-				cam.name, t,
-			));
+		if let Some(t) = cam.pause.timeout {
+			cam_secs("pause.timeout", t, false)?;
 		}
-
-		// motion_wake_hold_secs: same sanity check. 0 is allowed (release
-		// the wake lock immediately on Stop), but NaN / negative / infinite
-		// would panic in `Duration::from_secs_f64`.
-		if !cam.motion_wake_hold_secs.is_finite() || cam.motion_wake_hold_secs < 0.0 {
-			return Err(format!(
-				"Camera '{}': motion_wake_hold_secs must be a non-negative finite number (got {})",
-				cam.name, cam.motion_wake_hold_secs,
-			));
-		}
+		// 0 releases the wake lock as soon as motion stops.
+		cam_secs("motion_wake_hold_secs", cam.motion_wake_hold_secs, true)?;
 	}
 
 	// `[push_listener]` validation. The block itself is optional and the
@@ -1448,14 +1451,12 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 	if let Some(ref pl) = config.push_listener
 		&& pl.enable
 	{
-		// `Duration::from_secs_f64` panics on NaN / negative / infinite.
-		// 0 is allowed — release the wake-lock immediately.
-		if !pl.motion_wake_hold_secs.is_finite() || pl.motion_wake_hold_secs < 0.0 {
-			return Err(format!(
-				"[push_listener]: motion_wake_hold_secs must be a non-negative finite number (got {})",
-				pl.motion_wake_hold_secs,
-			));
-		}
+		// 0 is allowed: release the wake-lock immediately.
+		check_duration_secs(
+			"[push_listener]: motion_wake_hold_secs",
+			pl.motion_wake_hold_secs,
+			true,
+		)?;
 		// Operator config rejects port 0; the chosen ephemeral port is
 		// never surfaced, so DNS-redirect from cameras can't reach it.
 		if pl.push_listener_port == 0 {
@@ -1506,13 +1507,11 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 				));
 			}
 		}
-		// `Duration::from_secs_f64` panics on NaN / negative / infinite.
-		if !wh.motion_wake_hold_secs.is_finite() || wh.motion_wake_hold_secs < 0.0 {
-			return Err(format!(
-				"[webhook]: motion_wake_hold_secs must be a non-negative finite number (got {})",
-				wh.motion_wake_hold_secs,
-			));
-		}
+		check_duration_secs(
+			"[webhook]: motion_wake_hold_secs",
+			wh.motion_wake_hold_secs,
+			true,
+		)?;
 		if let Some(addr) = &wh.webhook_addr
 			&& addr.parse::<std::net::IpAddr>().is_err()
 		{
@@ -1637,6 +1636,26 @@ mod tests {
 		};
 		config.cameras = vec![cloud, local];
 		config
+	}
+
+	#[test]
+	fn check_duration_secs_bounds() {
+		for ok in [0.5, 30.0, MAX_DURATION_SECS] {
+			check_duration_secs("x", ok, false).expect("in range");
+		}
+		check_duration_secs("x", 0.0, true).expect("zero allowed");
+		for bad in [
+			0.0,
+			-1.0,
+			f64::NAN,
+			f64::INFINITY,
+			MAX_DURATION_SECS + 1.0,
+			1e20,
+		] {
+			let err = check_duration_secs("x", bad, false).expect_err("out of range");
+			assert!(err.starts_with("x must be"), "{err}");
+		}
+		assert!(check_duration_secs("x", -0.5, true).is_err());
 	}
 
 	#[test]

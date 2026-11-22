@@ -101,6 +101,7 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # max_encryption = "aes"      # none | aes | bcencrypt
 # idle_disconnect = false     # true for battery cams
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
+#                                    # every *_secs setting: at most 86400 (1 day)
 # motion_wake_hold_secs = 30  # wake-lock hold after motion stops
 # enabled = true
 # permitted_users = ["me"]

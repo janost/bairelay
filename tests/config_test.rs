@@ -1935,6 +1935,18 @@ fn validate_rejects_push_listener_infinite_hold() {
 }
 
 #[test]
+fn validate_rejects_huge_finite_durations() {
+	// Finite but past `Duration`'s range: `from_secs_f64` would panic.
+	let cfg = push_listener_cfg(1e20, 443);
+	let err = validate_config(&cfg).expect_err("1e20 must reject");
+	assert!(err.contains("motion_wake_hold_secs"), "error: {err}");
+	let mut cfg = push_listener_cfg(30.0, 443);
+	cfg.cameras[0].idle_disconnect_timeout_secs = Some(1e20);
+	let err = validate_config(&cfg).expect_err("1e20 must reject");
+	assert!(err.contains("idle_disconnect_timeout_secs"), "error: {err}");
+}
+
+#[test]
 fn validate_accepts_push_listener_zero_hold() {
 	let cfg = push_listener_cfg(0.0, 443);
 	validate_config(&cfg).expect("zero hold is legal");
