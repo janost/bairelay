@@ -50,9 +50,12 @@ pub fn build_audio_specific_config_hex(aot: u8, sample_rate: u32, channels: u8) 
 	Some(format!("{:02X}{:02X}", byte0, byte1))
 }
 
-/// Minimal ADTS header parse (7 bytes, no CRC).
+/// Parsed ADTS fixed + variable header (ISO/IEC 13818-7 §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdtsHeader {
+	/// Header length in bytes: 7, or 9 when `protection_absent == 0` and a
+	/// CRC follows. The raw AAC data starts at this offset.
+	pub header_len: usize,
 	/// Audio Object Type (e.g. 2 for AAC-LC).
 	pub aot: u8,
 	/// Sampling rate in Hz.
@@ -67,16 +70,33 @@ pub struct AdtsHeader {
 	/// 16 kHz; 2048 for HE-AAC). When the camera packs multiple frames
 	/// in one ADTS packet, the RTP timestamp must advance by
 	/// `aac_frames * samples_per_au` per packet, not by a single AU.
+	///
+	/// RFC 3640 carries one raw_data_block per AU, and splitting a
+	/// multi-block frame needs `raw_data_block_position` (CRC-protected
+	/// frames) or a bitstream parse (unprotected ones). Callers that
+	/// forward `[header_len..frame_length]` as one AU must drop frames
+	/// with `aac_frames > 1` instead.
 	pub aac_frames: u8,
 }
 
-/// Parse an ADTS header from the start of a buffer. Returns header + body offset.
+/// Parse an ADTS header from the start of a buffer. Returns `None` unless
+/// the buffer holds at least the whole header (7 or 9 bytes) and the
+/// declared `frame_length` covers it.
 pub fn parse_adts(buf: &[u8]) -> Option<AdtsHeader> {
-	if buf.len() < 7 {
+	if buf.len() < ADTS_HEADER_LEN {
 		return None;
 	}
 	// Sync word 0xFFF in first 12 bits
 	if buf[0] != 0xFF || (buf[1] & 0xF0) != 0xF0 {
+		return None;
+	}
+	// protection_absent == 0: a 16-bit CRC follows the 7-byte header.
+	let header_len = if buf[1] & 0x01 == 0 {
+		ADTS_HEADER_LEN + 2
+	} else {
+		ADTS_HEADER_LEN
+	};
+	if buf.len() < header_len {
 		return None;
 	}
 	let profile = (buf[2] >> 6) & 0x03;
@@ -89,12 +109,11 @@ pub fn parse_adts(buf: &[u8]) -> Option<AdtsHeader> {
 		| ((buf[4] as usize) << 3)
 		| (((buf[5] as usize) >> 5) & 0x07);
 	// frame_length carries header-included total length (ISO/IEC
-	// 13818-7 §6.2). A value < 7 means the encoder is claiming the
-	// header is shorter than the ADTS minimum — malformed input we
-	// can't safely strip-and-forward downstream. handle_aac has its
-	// own defensive check, but rejecting at parse time keeps every
-	// ADTS-bearing call site (test, fuzz, future consumers) honest.
-	if frame_length < ADTS_HEADER_LEN {
+	// 13818-7 §6.2). A value below the header length is malformed input
+	// we can't safely strip-and-forward downstream. Rejecting at parse
+	// time keeps every ADTS-bearing call site (test, fuzz, future
+	// consumers) honest.
+	if frame_length < header_len {
 		return None;
 	}
 	let sample_rates = [
@@ -105,6 +124,7 @@ pub fn parse_adts(buf: &[u8]) -> Option<AdtsHeader> {
 	// the actual count is that value + 1 per ISO/IEC 13818-7 §6.2.
 	let aac_frames = (buf[6] & 0x03) + 1;
 	Some(AdtsHeader {
+		header_len,
 		aot,
 		sample_rate,
 		channels,
@@ -113,7 +133,8 @@ pub fn parse_adts(buf: &[u8]) -> Option<AdtsHeader> {
 	})
 }
 
-/// Length of a minimal (no-CRC) ADTS header.
+/// Length of a minimal (no-CRC) ADTS header. CRC-protected headers are two
+/// bytes longer; use [`AdtsHeader::header_len`] to find the payload.
 pub const ADTS_HEADER_LEN: usize = 7;
 
 /// Build a single AAC-hbr RTP payload (RFC 3640): 4-byte AU-header section
@@ -168,6 +189,23 @@ mod tests {
 		assert_eq!(h.sample_rate, 44100);
 		assert_eq!(h.channels, 2);
 		assert_eq!(h.frame_length, 100);
+		assert_eq!(h.header_len, 7);
+		assert_eq!(h.aac_frames, 1);
+	}
+
+	#[test]
+	fn crc_protected_header_is_nine_bytes() {
+		// Same header with protection_absent=0 (byte1 0xF0) plus 2 CRC
+		// bytes, and number_of_raw_data_blocks_in_frame=1 (two blocks).
+		let buf = &[0xFF, 0xF0, 0x50, 0x80, 0x0C, 0x80, 0x01, 0xAB, 0xCD];
+		let h = parse_adts(buf).unwrap();
+		assert_eq!(h.header_len, 9);
+		assert_eq!(h.aac_frames, 2);
+		// Truncated before the CRC: not a whole header.
+		assert_eq!(parse_adts(&buf[..8]), None);
+		// frame_length 8 can't hold a 9-byte header.
+		let short = &[0xFF, 0xF0, 0x50, 0x80, 0x01, 0x00, 0x00, 0xAB, 0xCD];
+		assert_eq!(parse_adts(short), None);
 	}
 
 	#[test]
