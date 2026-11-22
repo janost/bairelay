@@ -23,6 +23,9 @@ pub fn classify(err: &anyhow::Error) -> i32 {
 		if cause.is::<ConfigError>() {
 			return EXIT_CONFIG;
 		}
+		if let Some(e) = cause.downcast_ref::<crate::run_support::LoadError>() {
+			return e.exit_code();
+		}
 		if let Some(core_err) = cause.downcast_ref::<CoreError>() {
 			return classify_core(core_err);
 		}
