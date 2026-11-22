@@ -525,6 +525,9 @@ impl UdpFlowState {
 /// inside this.
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Minimum gap between C2D_A answers to repeated D2C_T, as in nodelink-js.
+const C2D_A_THROTTLE: Duration = Duration::from_millis(750);
+
 struct UdpPayloadInner {
 	camera_addr: SocketAddr,
 	ack_tx: WatchSender<UdpAck>,
@@ -543,6 +546,8 @@ struct UdpPayloadInner {
 	/// for [`RECV_TIMEOUT`]. Heartbeats, acks and stray datagrams don't
 	/// extend it: they don't prove the stream is moving.
 	recv_deadline: Pin<Box<Sleep>>,
+	/// When we last answered a post-connect D2C_T.
+	last_c2d_a: Option<Instant>,
 	cancel: CancellationToken,
 	set: JoinSet<Result<()>>,
 }
@@ -694,6 +699,7 @@ impl UdpPayloadInner {
 			flow: UdpFlowState::new(client_id, camera_id),
 			resend_interval: interval(Duration::from_millis(500)), // Offical Client does resend every 500ms
 			recv_deadline: Box::pin(sleep(RECV_TIMEOUT)),
+			last_c2d_a: None,
 			cancel,
 			set,
 		}
@@ -754,6 +760,23 @@ impl UdpPayloadInner {
 							payload: UdpXml::R2cDisc(_),
 							..
 						}) => return Err(Error::RelayTerminate),
+						// The camera repeats D2C_T until it sees C2D_A; left
+						// unanswered after connect it sends D2C_DISC 5-10 s
+						// later (nodelink-js). Answer with the same tid.
+						BcUdp::Discovery(UdpDiscovery {
+							tid,
+							payload: UdpXml::D2cT(D2cT { sid, conn, cid, did }),
+						}) if cid == self.flow.client_id && did == self.flow.camera_id => {
+							let now = Instant::now();
+							if self.last_c2d_a.is_none_or(|t| now.duration_since(t) >= C2D_A_THROTTLE) {
+								self.last_c2d_a = Some(now);
+								let reply = BcUdp::Discovery(UdpDiscovery {
+									tid,
+									payload: UdpXml::C2dA(C2dA { sid, conn, cid, did, mtu: MTU as u32 }),
+								});
+								self.socket_in.feed(reply).await?;
+							}
+						}
 						BcUdp::Discovery(_disc) => {},
 						BcUdp::Ack(ack) => {
 							if ack.connection_id == self.flow.client_id {
@@ -1436,6 +1459,68 @@ mod tests {
 			.unwrap_err();
 		let inner = err.get_ref().and_then(|e| e.downcast_ref::<Error>());
 		assert!(matches!(inner, Some(Error::CameraTerminate)), "got {err:?}");
+	}
+
+	#[tokio::test]
+	async fn payload_source_answers_late_d2c_t_with_throttle() {
+		let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server_addr = server.local_addr().unwrap();
+		let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let client_addr = client_sock.local_addr().unwrap();
+		let _psource = UdpPayloadSource::new(
+			BcUdpSource::new_from_socket(client_sock, server_addr)
+				.await
+				.unwrap(),
+			1,
+			2,
+		)
+		.await;
+		let mut codec = BcUdpCodex::new();
+		for (tid, did) in [(5, 99), (6, 2), (7, 2)] {
+			let mut out = BytesMut::new();
+			let d2ct = BcUdp::Discovery(UdpDiscovery {
+				tid,
+				payload: UdpXml::D2cT(D2cT {
+					sid: 9,
+					conn: "local".into(),
+					cid: 1,
+					did,
+				}),
+			});
+			codec.encode(d2ct, &mut out).unwrap();
+			server.send_to(&out, client_addr).await.unwrap();
+		}
+
+		// Wrong did is ignored; the repeat inside 750 ms is throttled.
+		let mut answers = vec![];
+		let _ = tokio::time::timeout(Duration::from_millis(300), async {
+			let mut buf = [0u8; 2048];
+			loop {
+				let (n, _) = server.recv_from(&mut buf).await.unwrap();
+				let mut bm = BytesMut::from(&buf[..n]);
+				if let Ok(Some(BcUdp::Discovery(UdpDiscovery {
+					tid,
+					payload: UdpXml::C2dA(a),
+				}))) = codec.decode(&mut bm)
+				{
+					answers.push((tid, a));
+				}
+			}
+		})
+		.await;
+		assert_eq!(
+			answers,
+			vec![(
+				6,
+				C2dA {
+					sid: 9,
+					conn: "local".into(),
+					cid: 1,
+					did: 2,
+					mtu: MTU as u32,
+				}
+			)]
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
