@@ -218,54 +218,36 @@ enum State {
 	YieldNow, // Used to ensure we rest between polling packets so as to not starve the runtime
 }
 
+/// Receive throughput reported in [`UdpAck::recv_bytes_per_sec`]. The
+/// camera's CUBIC sender reads that field as its bandwidth estimate, so
+/// it must be the real receive rate: an under-report throttles the
+/// stream (neolink #428 saw 4 Mbit/s capped at ~340 kbit/s).
 #[derive(Default)]
-struct AckLatency {
-	current_values: Vec<u32>,
-	last_receive_time: Option<Instant>,
-	display_value: u32,
-	last_display_time: Option<Instant>,
+struct RecvRate {
+	window_start: Option<Instant>,
+	window_bytes: u64,
+	bytes_per_sec: u32,
 }
 
-impl AckLatency {
-	/// Used to get the current latency, in thd way that the official
-	/// client does. This is a value that seems to be updated only every second
-	/// Observed values are `0`,    `54785`,    `55062`,     `2528`,
-	fn get_value(&self) -> u32 {
-		self.display_value
-	}
+impl RecvRate {
+	const WINDOW: Duration = Duration::from_secs(1);
 
-	/// Used to updaet the average latency calculation
-	fn feed_ack(&mut self) {
-		// Update the last receive time
-		let now = Instant::now();
-		if let Some(last_receive_time) = self.last_receive_time {
-			let diff = (now - last_receive_time).as_micros();
-			self.current_values.push(diff as u32);
-			self.last_receive_time = Some(now);
-		} else {
-			self.last_receive_time = Some(now);
-		}
-
-		// Update the display_value
-		// this is done only ever 1s
-		if let Some(last_display_time) = self.last_display_time {
-			if now - last_display_time > Duration::from_secs(1) {
-				// A second has passed update this
-				self.last_display_time = Some(now);
-				let current_values_count = self.current_values.len() as u32;
-				let current_value = self
-					.current_values
-					.iter()
-					.fold(0u32, |acc, value| acc + *value / current_values_count);
-				self.current_values = vec![]; // Reset the average vec
-
-				self.display_value = current_value;
+	/// Count `bytes` received at `now`. Once a window of at least 1 s
+	/// closes its rate is latched. A window longer than 2 s spans an idle
+	/// gap and is discarded so the last real rate is held; reporting the
+	/// diluted rate would make the camera ramp up from near zero.
+	fn record(&mut self, now: Instant, bytes: usize) {
+		let start = *self.window_start.get_or_insert(now);
+		let elapsed = now.saturating_duration_since(start);
+		if elapsed >= Self::WINDOW {
+			if elapsed < 2 * Self::WINDOW {
+				let rate = u128::from(self.window_bytes) * 1_000_000 / elapsed.as_micros();
+				self.bytes_per_sec = u32::try_from(rate).unwrap_or(u32::MAX);
 			}
-		} else {
-			// First 1s is a zero value
-			self.last_display_time = Some(now);
-			self.display_value = 0;
+			self.window_start = Some(now);
+			self.window_bytes = 0;
 		}
+		self.window_bytes = self.window_bytes.saturating_add(bytes as u64);
 	}
 }
 
@@ -313,9 +295,10 @@ pub const REORDER_CAP: usize = 1024;
 ///   `u32::MAX` for symmetry across the connection lifetime.
 /// - `sent`: outgoing packets awaiting ack.
 /// - `received`: out-of-order recv packets pending in-order delivery.
-/// - `ack_latency`: rolling latency stat fed by every received ack.
+/// - `recv_rate`: receive throughput reported in outgoing acks.
 ///
-/// All methods are pure-state — no I/O, no spawn, no timers. The caller
+/// All methods are pure-state — no I/O, no spawn, no timers; time-aware
+/// methods take `now` from the caller. The caller
 /// (production: `UdpPayloadInner::run`; fuzz: the harness) drives the
 /// state by calling these with bytes off the wire and reading back the
 /// resulting outgoing UdpData / UdpAck packets.
@@ -330,7 +313,7 @@ pub struct UdpFlowState {
 	packets_want: u32,
 	sent: BTreeMap<u32, UdpData>,
 	received: BTreeMap<u32, Vec<u8>>,
-	ack_latency: AckLatency,
+	recv_rate: RecvRate,
 }
 
 impl UdpFlowState {
@@ -344,7 +327,7 @@ impl UdpFlowState {
 			packets_want: 0,
 			sent: BTreeMap::new(),
 			received: BTreeMap::new(),
-			ack_latency: AckLatency::default(),
+			recv_rate: RecvRate::default(),
 		}
 	}
 
@@ -370,13 +353,13 @@ impl UdpFlowState {
 		out
 	}
 
-	/// Camera→App: fold an inbound [`UdpData`] into the recv reorder
-	/// buffer. Returns `true` when the packet was inserted and the
+	/// Camera→App: fold an inbound [`UdpData`] received at `now` into the
+	/// recv reorder buffer. Returns `true` when the packet was inserted and the
 	/// caller should refresh the outgoing ack via [`build_send_ack`];
 	/// `false` when the packet was rejected (mismatched connection_id,
 	/// duplicate / already-consumed, REORDER_CAP overflow, or the
 	/// `u32::MAX` corner that would underflow ack-range arithmetic).
-	pub fn handle_data(&mut self, data: UdpData) -> bool {
+	pub fn handle_data(&mut self, data: UdpData, now: Instant) -> bool {
 		if data.connection_id != self.client_id {
 			return false;
 		}
@@ -386,6 +369,7 @@ impl UdpFlowState {
 			return false;
 		}
 		if packet_id >= self.packets_want && self.received.len() < REORDER_CAP {
+			self.recv_rate.record(now, data.payload.len());
 			self.received.insert(packet_id, data.payload);
 			true
 		} else if self.received.len() >= REORDER_CAP {
@@ -400,7 +384,7 @@ impl UdpFlowState {
 	}
 
 	/// Camera→App: process an inbound [`UdpAck`]. Marks every acked
-	/// packet_id as removable from `sent` and feeds the latency stat.
+	/// packet_id as removable from `sent`.
 	pub fn handle_ack(&mut self, ack: UdpAck) {
 		let start = ack.packet_id;
 		if start != 0xffffffff {
@@ -418,7 +402,6 @@ impl UdpFlowState {
 				log::debug!(
 					"BcUdp ACK with overlong range (start={start}, payload_len={payload_len}); dropping"
 				);
-				self.ack_latency.feed_ack();
 				return;
 			}
 			for (idx, &value) in ack.payload.iter().enumerate() {
@@ -428,7 +411,6 @@ impl UdpFlowState {
 				}
 			}
 		}
-		self.ack_latency.feed_ack();
 		log::trace!("sent: {}", self.sent.len());
 	}
 
@@ -495,7 +477,7 @@ impl UdpFlowState {
 				connection_id: self.camera_id,
 				packet_id: first_missing - 1, // Last we actually have is first_missing - 1
 				group_id: 0,
-				maybe_latency: self.ack_latency.get_value(),
+				recv_bytes_per_sec: self.recv_rate.bytes_per_sec,
 				payload: missing_ids,
 			}
 		} else {
@@ -749,7 +731,7 @@ impl UdpPayloadInner {
 							}
 						},
 						BcUdp::Data(data)  => {
-							if self.flow.handle_data(data) {
+							if self.flow.handle_data(data, Instant::now()) {
 								self.ack_tx.send_replace(self.flow.build_send_ack());
 							}
 						},
@@ -970,7 +952,7 @@ mod tests {
 			connection_id: conn,
 			group_id: 0,
 			packet_id: pid,
-			maybe_latency: 0,
+			recv_bytes_per_sec: 0,
 			payload: vec![],
 		})
 	}
@@ -988,44 +970,6 @@ mod tests {
 			tid: 7,
 			payload: UdpXml::C2dHb(C2dHb { cid, did }),
 		})
-	}
-
-	#[test]
-	fn ack_latency_initial_value_is_zero() {
-		let a = AckLatency::default();
-		assert_eq!(a.get_value(), 0);
-	}
-
-	#[test]
-	fn ack_latency_first_feed_sets_zero_display() {
-		let mut a = AckLatency::default();
-		a.feed_ack();
-		// First feed: no prior time, display_value stays zero.
-		assert_eq!(a.get_value(), 0);
-	}
-
-	#[test]
-	fn ack_latency_two_feeds_within_second_do_not_update_display() {
-		let mut a = AckLatency::default();
-		a.feed_ack();
-		a.feed_ack();
-		// Second feed is within 1s of first, display still zero.
-		assert_eq!(a.get_value(), 0);
-		// But the current_values now has one entry (diff of the two feeds).
-		assert_eq!(a.current_values.len(), 1);
-	}
-
-	#[tokio::test(flavor = "current_thread", start_paused = true)]
-	async fn ack_latency_display_updates_after_one_second() {
-		let mut a = AckLatency::default();
-		a.feed_ack();
-		tokio::time::advance(Duration::from_millis(250)).await;
-		a.feed_ack(); // pushes ~250ms diff
-		tokio::time::advance(Duration::from_millis(1_500)).await;
-		a.feed_ack(); // > 1s since first display — display_value recomputes.
-		assert!(a.get_value() > 0, "display_value should be non-zero");
-		// current_values cleared after display update.
-		assert!(a.current_values.is_empty());
 	}
 
 	#[tokio::test]
@@ -1331,7 +1275,7 @@ mod tests {
 		// touch the socket, but UdpPayloadInner::new does. So we can't
 		// easily instantiate one here without the runtime helpers. This
 		// test is intentionally simple — just makes sure `UdpAck::empty`
-		// round-trips through the ack_latency path covered elsewhere.
+		// has the expected shape.
 		let empty = UdpAck::empty(5);
 		assert_eq!(empty.connection_id, 5);
 		assert!(empty.payload.is_empty());
@@ -1457,6 +1401,10 @@ mod tests {
 		UdpFlowState::new(CID, DID)
 	}
 
+	fn now() -> Instant {
+		Instant::now()
+	}
+
 	fn data_pkt(packet_id: u32) -> UdpData {
 		UdpData {
 			connection_id: CID,
@@ -1468,8 +1416,8 @@ mod tests {
 	#[test]
 	fn handle_data_in_order_inserts_and_drains() {
 		let mut s = fresh();
-		assert!(s.handle_data(data_pkt(0)));
-		assert!(s.handle_data(data_pkt(1)));
+		assert!(s.handle_data(data_pkt(0), now()));
+		assert!(s.handle_data(data_pkt(1), now()));
 		let drained = s.drain_contiguous();
 		assert_eq!(drained.len(), 2);
 		assert_eq!(s.packets_want(), 2);
@@ -1479,13 +1427,13 @@ mod tests {
 	#[test]
 	fn handle_data_out_of_order_holds_until_gap_filled() {
 		let mut s = fresh();
-		assert!(s.handle_data(data_pkt(2)));
-		assert!(s.handle_data(data_pkt(1)));
+		assert!(s.handle_data(data_pkt(2), now()));
+		assert!(s.handle_data(data_pkt(1), now()));
 		// Gap at 0 → nothing drains.
 		assert!(s.drain_contiguous().is_empty());
 		assert_eq!(s.packets_want(), 0);
 		// Fill the gap; everything contiguous flushes.
-		assert!(s.handle_data(data_pkt(0)));
+		assert!(s.handle_data(data_pkt(0), now()));
 		let drained = s.drain_contiguous();
 		assert_eq!(drained.len(), 3);
 		assert_eq!(s.packets_want(), 3);
@@ -1496,7 +1444,7 @@ mod tests {
 		let mut s = fresh();
 		let mut bad = data_pkt(0);
 		bad.connection_id = CID + 1;
-		assert!(!s.handle_data(bad));
+		assert!(!s.handle_data(bad, now()));
 		assert_eq!(s.received_len(), 0);
 	}
 
@@ -1505,7 +1453,7 @@ mod tests {
 		let mut s = fresh();
 		// u32::MAX would underflow `end + 1` in build_send_ack —
 		// the guard refuses it before insert.
-		assert!(!s.handle_data(data_pkt(u32::MAX)));
+		assert!(!s.handle_data(data_pkt(u32::MAX), now()));
 		assert_eq!(s.received_len(), 0);
 	}
 
@@ -1514,23 +1462,23 @@ mod tests {
 		let mut s = fresh();
 		// Skip 0 so nothing drains; pile up an out-of-order flood.
 		for i in 1..=(REORDER_CAP as u32) {
-			assert!(s.handle_data(data_pkt(i)));
+			assert!(s.handle_data(data_pkt(i), now()));
 		}
 		assert_eq!(s.received_len(), REORDER_CAP);
 		// One past cap: dropped, returns false, len stays.
-		assert!(!s.handle_data(data_pkt(REORDER_CAP as u32 + 1)));
+		assert!(!s.handle_data(data_pkt(REORDER_CAP as u32 + 1), now()));
 		assert_eq!(s.received_len(), REORDER_CAP);
 	}
 
 	#[test]
 	fn handle_data_drops_already_consumed_duplicate() {
 		let mut s = fresh();
-		assert!(s.handle_data(data_pkt(0)));
-		assert!(s.handle_data(data_pkt(1)));
+		assert!(s.handle_data(data_pkt(0), now()));
+		assert!(s.handle_data(data_pkt(1), now()));
 		s.drain_contiguous();
 		// Now packets_want=2; an old packet_id=0 must drop, not
 		// re-insert and not panic.
-		assert!(!s.handle_data(data_pkt(0)));
+		assert!(!s.handle_data(data_pkt(0), now()));
 		assert_eq!(s.received_len(), 0);
 	}
 
@@ -1546,7 +1494,7 @@ mod tests {
 	#[test]
 	fn build_send_ack_reflects_in_order_progress() {
 		let mut s = fresh();
-		s.handle_data(data_pkt(0));
+		s.handle_data(data_pkt(0), now());
 		s.drain_contiguous();
 		let ack = s.build_send_ack();
 		assert_eq!(ack.packet_id, 0);
@@ -1563,9 +1511,9 @@ mod tests {
 		// The cap bounds it at 4× REORDER_CAP regardless of how far
 		// the max is from packets_want.
 		let mut s = fresh();
-		assert!(s.handle_data(data_pkt(0)));
+		assert!(s.handle_data(data_pkt(0), now()));
 		s.drain_contiguous();
-		assert!(s.handle_data(data_pkt(0xCA01_0000)));
+		assert!(s.handle_data(data_pkt(0xCA01_0000), now()));
 		let ack = s.build_send_ack();
 		assert!(
 			ack.payload.len() <= REORDER_CAP * 4,
@@ -1578,10 +1526,10 @@ mod tests {
 	fn build_send_ack_marks_received_and_missing() {
 		let mut s = fresh();
 		// Ingest 0 (consumed), then 2 + 4 with gaps at 3.
-		s.handle_data(data_pkt(0));
+		s.handle_data(data_pkt(0), now());
 		s.drain_contiguous();
-		s.handle_data(data_pkt(2));
-		s.handle_data(data_pkt(4));
+		s.handle_data(data_pkt(2), now());
+		s.handle_data(data_pkt(4), now());
 		let ack = s.build_send_ack();
 		// first_missing = 1 (packets_want=1 after drain; 1 not in
 		// received). packet_id = first_missing - 1 = 0.
@@ -1589,6 +1537,38 @@ mod tests {
 		// payload covers [first_missing..=end] = [1, 2, 3, 4]:
 		//   1 missing → 0, 2 received → 1, 3 missing → 0, 4 received → 1.
 		assert_eq!(ack.payload, vec![0, 1, 0, 1]);
+	}
+
+	fn data_bytes(packet_id: u32, len: usize) -> UdpData {
+		UdpData {
+			connection_id: CID,
+			packet_id,
+			payload: vec![0; len],
+		}
+	}
+
+	#[test]
+	fn ack_reports_receive_rate_per_second() {
+		let t0 = now();
+		let mut s = fresh();
+		// 10 × 1000 B inside the first second; nothing latched yet.
+		for i in 0..10 {
+			assert!(s.handle_data(
+				data_bytes(i, 1000),
+				t0 + Duration::from_millis(i as u64 * 50)
+			));
+		}
+		s.drain_contiguous();
+		assert_eq!(s.build_send_ack().recv_bytes_per_sec, 0);
+		// The first packet past the 1 s mark closes the window.
+		s.handle_data(data_bytes(10, 1000), t0 + Duration::from_secs(1));
+		s.drain_contiguous();
+		assert_eq!(s.build_send_ack().recv_bytes_per_sec, 10_000);
+		// Traffic stops: the value holds, including across a packet that
+		// closes a window spanning the idle gap.
+		s.handle_data(data_bytes(11, 1000), t0 + Duration::from_secs(10));
+		s.drain_contiguous();
+		assert_eq!(s.build_send_ack().recv_bytes_per_sec, 10_000);
 	}
 
 	#[test]
@@ -1601,7 +1581,7 @@ mod tests {
 			connection_id: DID,
 			packet_id: 0xffffffff,
 			group_id: 0,
-			maybe_latency: 0,
+			recv_bytes_per_sec: 0,
 			payload: vec![],
 		});
 		assert_eq!(s.sent_len(), 1);
@@ -1621,7 +1601,7 @@ mod tests {
 			connection_id: DID,
 			packet_id: 1,
 			group_id: 0,
-			maybe_latency: 0,
+			recv_bytes_per_sec: 0,
 			payload: vec![1, 1],
 		});
 		assert_eq!(s.sent_len(), 0);
@@ -1639,7 +1619,7 @@ mod tests {
 			connection_id: DID,
 			packet_id: u32::MAX - 1,
 			group_id: 0,
-			maybe_latency: 0,
+			recv_bytes_per_sec: 0,
 			payload: vec![1, 1, 1, 1],
 		});
 		// We cleared via retain(k > start) only; packet_id 0 did not
@@ -1674,8 +1654,8 @@ mod tests {
 		// counter via successive in-order feeds at increasing IDs.
 		// (We can't set packets_want directly since the field is
 		// private; this test focuses on regular wrap-free behaviour.)
-		s.handle_data(data_pkt(0));
-		s.handle_data(data_pkt(1));
+		s.handle_data(data_pkt(0), now());
+		s.handle_data(data_pkt(1), now());
 		assert_eq!(s.drain_contiguous().len(), 2);
 		assert_eq!(s.packets_want(), 2);
 		// Confirm consecutive drain calls past consumed IDs are no-ops.

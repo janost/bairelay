@@ -476,7 +476,7 @@ fn bcudp_ack_with_payload_roundtrip() {
 		connection_id: 82000,
 		group_id: 0,
 		packet_id: 2439,
-		maybe_latency: 54785,
+		recv_bytes_per_sec: 54785,
 		payload: vec![0x00, 0x01, 0x01, 0x01, 0x01],
 	}));
 }
