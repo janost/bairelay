@@ -647,7 +647,7 @@ async fn async_main() -> Result<()> {
 	// service (RTSP listeners, wake server, push and webhook listeners,
 	// watchdog, startup-wake). Each service holds the global cancel token; the
 	// supervisor cancels it (idempotent — the shutdown signal already fired it) and
-	// joins each task with a 2 s budget so a wedged subsystem can't
+	// joins every task within one shared 2 s budget so a wedged subsystem can't
 	// hold the process open.
 	sup.shutdown(Duration::from_secs(2)).await;
 
