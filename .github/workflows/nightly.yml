@@ -1,0 +1,154 @@
+name: Nightly
+
+# Every push to main rebuilds the binaries and replaces the assets of the
+# `nightly` pre-release, whose tag is moved to the pushed commit. Asset
+# names are fixed so download URLs stay stable:
+#   https://github.com/<owner>/<repo>/releases/download/nightly/<asset>
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight nightly; the next run re-uploads
+# every asset, so cancelling mid-publish is harmless.
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built inside Debian 13 so the binary links against trixie's
+          # glibc and runs on Debian 13 and newer.
+          - name: debian13-amd64
+            os: ubuntu-latest
+            container: debian:13
+            asset: bairelay-nightly-x86_64-debian13.tar.gz
+          - name: windows-amd64
+            os: windows-latest
+            container: ''
+            asset: bairelay-nightly-x86_64-windows.zip
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    permissions:
+      contents: read
+    steps:
+      # git must exist before checkout, or checkout falls back to a
+      # tarball download without history.
+      - name: Install build dependencies (Debian)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ca-certificates curl git zstd
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v7
+
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+
+      # aws-lc-rs on Windows needs NASM and libclang. CMake and LLVM are
+      # preinstalled on windows-latest; NASM comes from chocolatey.
+      - name: Install Windows build tools (NASM + LIBCLANG_PATH)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y nasm
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+          Add-Content -Path $env:GITHUB_ENV -Value 'LIBCLANG_PATH=C:\Program Files\LLVM\bin'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.name }}
+
+      - run: cargo build --locked --release --bin bairelay
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="bairelay-nightly"
+          mkdir -p "$dir"
+          cp target/release/bairelay README.md LICENSE CHANGELOG.md sample_config.toml "$dir/"
+          tar -czf "${{ matrix.asset }}" "$dir"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "bairelay-nightly"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item target\release\bairelay.exe, README.md, LICENSE, CHANGELOG.md, sample_config.toml "$dir\"
+          Compress-Archive -Path $dir -DestinationPath "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: publish nightly release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Move the nightly tag and replace the release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA::7}"
+          {
+            echo "Automated build of \`main\` at ${GITHUB_SHA} ($(date -u +%Y-%m-%d))."
+            echo
+            echo "Not a stable release. The \`nightly\` tag moves with every push to \`main\`."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+
+          if gh api "repos/${GH_REPO}/git/ref/tags/nightly" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/nightly" \
+              -f sha="${GITHUB_SHA}" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/${GH_REPO}/git/refs" \
+              -f ref=refs/tags/nightly -f sha="${GITHUB_SHA}" > /dev/null
+          fi
+
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release edit nightly --prerelease --latest=false \
+              --title "Nightly (${short})" --notes-file notes.md
+            gh release upload nightly dist/* --clobber
+          else
+            gh release create nightly dist/* --prerelease --latest=false \
+              --title "Nightly (${short})" --notes-file notes.md
+          fi

@@ -46,7 +46,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # No toolchain action: rustup installs the version + components pinned
       # in rust-toolchain.toml. An action that sets RUSTUP_TOOLCHAIN would
       # override that pin.
@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -72,7 +72,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --locked --no-deps
@@ -83,7 +83,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: hadolint Dockerfile
         uses: hadolint/hadolint-action@v3.3.0
         with:
@@ -103,7 +103,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
@@ -115,7 +115,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # Pre-built binary install — avoids the ~3-5 min `cargo install`

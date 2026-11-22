@@ -51,7 +51,7 @@ jobs:
             use_cross: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # rust-toolchain.toml pins the version; reproducible release artefacts
       # are defined by (commit, target triple, rustc version), so the channel
       # must not float.
@@ -161,10 +161,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all archives
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -222,7 +222,7 @@ jobs:
             platform: linux/arm64
             tarball_suffix: aarch64-linux
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve version + SHAs from the release
         env:
@@ -272,7 +272,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - run: rustup show
 
