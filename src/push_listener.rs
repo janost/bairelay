@@ -173,10 +173,9 @@ pub(crate) fn match_camera_by_uid<'a>(
 	cameras
 		.values()
 		.filter(|h| {
-			h.config()
-				.uid
-				.as_deref()
-				.is_some_and(|cfg_uid| registry_uid.starts_with(cfg_uid))
+			h.config().uid.as_deref().is_some_and(|cfg_uid| {
+				bairelay_wake_server::registry::uid_matches(registry_uid, cfg_uid)
+			})
 		})
 		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
 }
@@ -370,9 +369,9 @@ mod tests {
 
 	#[test]
 	fn match_by_uid_long_form_prefix() {
-		// Argus heartbeats long-form (config UID + firmware suffix);
-		// configured UID is the short form. Same pattern as
-		// `CameraRegistry::lookup_fresh`'s prefix fallback.
+		// Argus heartbeats long-form (config UID + 4-character firmware
+		// suffix); configured UID is the short form. Same rule as
+		// `bairelay_wake_server::registry::uid_matches`.
 		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
 		cameras.insert(
 			"front".into(),
@@ -391,15 +390,15 @@ mod tests {
 
 	#[test]
 	fn match_by_uid_prefers_longest_prefix_match() {
-		// Registry returns `UID-AB-FW1234`. Two configured cameras
-		// share the prefix root (`UID-A` and `UID-AB`). The longest
-		// match — `UID-AB` — must win, never the HashMap-iteration
-		// accident. Repeat with both insertion orders to guard
-		// against any incidental ordering.
+		// Registry returns `UID-A1234`, which is both `UID-A` plus a
+		// 4-character suffix and `UID-A1234` exactly. The exact (longer)
+		// UID must win, never the HashMap-iteration accident. Repeat
+		// with both insertion orders to guard against incidental
+		// ordering.
 		for (first, second) in [("short", "long"), ("long", "short")] {
 			let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
 			let short = handle_with_uid("short", Some("UID-A"));
-			let long = handle_with_uid("long", Some("UID-AB"));
+			let long = handle_with_uid("long", Some("UID-A1234"));
 			cameras.insert(
 				first.into(),
 				if first == "short" {
@@ -416,13 +415,25 @@ mod tests {
 					Arc::clone(&long)
 				},
 			);
-			let h = match_camera_by_uid(&cameras, "UID-AB-FW1234").expect("match");
+			let h = match_camera_by_uid(&cameras, "UID-A1234").expect("match");
 			assert_eq!(
 				h.name(),
 				"long",
 				"longest match must win regardless of insertion order"
 			);
 		}
+	}
+
+	#[test]
+	fn match_by_uid_rejects_loose_prefix() {
+		// A truncated or over-long UID must not select a camera by prefix.
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		cameras.insert(
+			"front".into(),
+			handle_with_uid("front", Some("9527000FRONT")),
+		);
+		assert!(match_camera_by_uid(&cameras, "9527000FRONT012345").is_none());
+		assert!(match_camera_by_uid(&cameras, "9527000").is_none());
 	}
 
 	#[test]

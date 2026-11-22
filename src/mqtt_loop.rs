@@ -78,9 +78,10 @@ pub fn build_broker_config(config: &Config) -> anyhow::Result<Option<bairelay_mq
 }
 
 /// Seal HA discovery (in-flight publishes finish, later ones are
-/// no-ops), publish "disconnected" availability for every camera, then
-/// unpublish HA discovery config for cameras whose `CameraHandle`
-/// had one attached. Wrapped under a 2 s hard timeout by the caller.
+/// no-ops), then publish "disconnected" availability for every camera.
+/// Discovery configs stay retained: deleting them would make HA drop
+/// each entity and its registry customisations on every restart.
+/// Wrapped under a 2 s hard timeout by the caller.
 /// Returns nothing — per-camera errors are logged and elided so a
 /// single bad publish doesn't abort the shutdown fan-out.
 pub async fn publish_shutdown_fanout(
@@ -95,15 +96,6 @@ pub async fn publish_shutdown_fanout(
 	for name in camera_names {
 		let publisher = StatusPublisher::new(mqtt, topic_prefix, name);
 		let _ = publisher.publish_connection(false).await;
-	}
-	for (name, cam) in cameras.iter() {
-		if let Err(e) = cam.unpublish_discovery().await {
-			tracing::warn!(
-				camera = %name,
-				error = %e,
-				"Failed to unpublish HA discovery on shutdown"
-			);
-		}
 	}
 }
 

@@ -515,7 +515,7 @@ Steps:
 5. Optional: drop a `/config/bairelay/config.toml` overlay via the File editor app or SSH.
 6. Start. Verify the app stays running (Log tab shows `bairelay starting version=X.Y.Z` and no immediate exit).
 7. Confirm MQTT entities appear in HA exactly as `ha-verify.sh` expects (same `homeassistant/.../config` discovery payloads, same entity IDs).
-8. Stop the app. Uninstall. Verify clean removal (retained MQTT discovery topics are unpublished).
+8. Stop the app. Verify the bairelay entities go unavailable but stay in HA (discovery configs remain retained). Uninstall.
 
 Issues at this surface are usually:
 
