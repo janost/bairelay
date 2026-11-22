@@ -237,12 +237,10 @@ impl BcCamera {
 
 		if dst_seconds != 0 {
 			let utc = timestamp.to_offset(UtcOffset::UTC);
-			let base_offset_seconds = timestamp
-				.offset()
-				.whole_seconds()
-				.saturating_sub(dst_seconds);
-			// Reolink uses positive seconds to indicate a negative UTC offset:
-			general.time_zone = Some(-base_offset_seconds);
+			general.time_zone = Some(camera_time_zone(
+				timestamp.offset().whole_seconds(),
+				dst_seconds,
+			));
 			general.year = Some(utc.year());
 			general.month = Some(utc.month().into());
 			general.day = Some(utc.day());
@@ -293,6 +291,16 @@ impl BcCamera {
 
 		Ok(())
 	}
+}
+
+/// The `<timeZone>` value for a host UTC offset with `dst_seconds` of
+/// camera-applied DST stripped. Reolink uses positive seconds for a
+/// negative UTC offset. `dst_seconds` derives from the camera's `<Dst>`
+/// offset, so saturate rather than overflow on a nonsense value.
+fn camera_time_zone(utc_offset_seconds: i32, dst_seconds: i32) -> i32 {
+	utc_offset_seconds
+		.saturating_sub(dst_seconds)
+		.saturating_neg()
 }
 
 /// Compute the DST offset (in seconds) the camera will apply to a
@@ -1134,6 +1142,14 @@ mod tests {
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("general", true).await;
 		cam.set_time(dt).await.expect("ok");
+	}
+
+	#[test]
+	fn camera_time_zone_strips_dst_and_saturates() {
+		assert_eq!(camera_time_zone(7200, 3600), -3600);
+		// A camera DST offset of i32::MAX hours saturates in
+		// dst_offset_seconds; negating the base must not overflow.
+		assert_eq!(camera_time_zone(-3600, i32::MAX), i32::MAX);
 	}
 
 	#[test]
