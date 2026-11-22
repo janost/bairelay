@@ -120,12 +120,6 @@ impl<'a> StatusPublisher<'a> {
 			.await
 	}
 
-	/// Publish floodlight task schedule as JSON (retained).
-	pub async fn publish_floodlight_tasks(&self, json: &str) -> Result<(), MqttError> {
-		let topic = topics::status_floodlight_tasks(&self.topic_prefix, &self.camera_name);
-		self.client.publish_retained(&topic, json.as_bytes()).await
-	}
-
 	/// Publish floodlight tasks enabled/disabled state (retained).
 	pub async fn publish_floodlight_tasks_enabled(&self, enabled: bool) -> Result<(), MqttError> {
 		let payload = if enabled { "on" } else { "off" };
@@ -266,7 +260,6 @@ mod tests {
 		let pub_ = StatusPublisher::new(&c, &p, &n);
 		pub_.publish_floodlight(true).await.unwrap();
 		pub_.publish_floodlight(false).await.unwrap();
-		pub_.publish_floodlight_tasks("[]").await.unwrap();
 		pub_.publish_floodlight_tasks_enabled(true).await.unwrap();
 		pub_.publish_floodlight_tasks_enabled(false).await.unwrap();
 	}
