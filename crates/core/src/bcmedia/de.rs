@@ -30,6 +30,29 @@ where
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
 
+/// Caps on the wire size fields of video frames. A 4K I-frame is a few MiB
+/// and the extra header a few bytes; anything above is corrupt or hostile,
+/// and without a cap the streaming `take()` returns Incomplete while the
+/// read buffer grows toward 4 GiB.
+const MAX_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
+const MAX_ADDITIONAL_HEADER: u32 = 1024;
+
+/// The `payload_size` and `additional_header_size` fields of a video frame,
+/// both checked against their caps.
+fn frame_sizes(buf: &[u8]) -> IResult<&[u8], (u32, u32)> {
+	let (buf, payload_size) = context(
+		"Video payload size exceeds cap",
+		verify(le_u32, |&n| n <= MAX_FRAME_PAYLOAD),
+	)
+	.parse(buf)?;
+	let (buf, additional_header_size) = context(
+		"Video additional header size exceeds cap",
+		verify(le_u32, |&n| n <= MAX_ADDITIONAL_HEADER),
+	)
+	.parse(buf)?;
+	Ok((buf, (payload_size, additional_header_size)))
+}
+
 impl BcMedia {
 	/// Parse a single [`BcMedia`] variant from the front of `buf`.
 	///
@@ -87,20 +110,23 @@ impl BcMedia {
 	}
 }
 
+/// Whether `x` (read little-endian) opens a [`BcMedia`] frame.
+pub(super) fn is_bcmedia_magic(x: u32) -> bool {
+	matches!(
+		x,
+		MAGIC_HEADER_BCMEDIA_INFO_V1
+			| MAGIC_HEADER_BCMEDIA_INFO_V2
+			| MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST
+			| MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST
+			| MAGIC_HEADER_BCMEDIA_AAC
+			| MAGIC_HEADER_BCMEDIA_ADPCM
+	)
+}
+
 fn bcmedia(buf: &[u8]) -> IResult<&[u8], BcMedia> {
 	let (buf, magic) = context(
 		"Failed to match any known bcmedia",
-		verify(le_u32, |x| {
-			matches!(
-				*x,
-				MAGIC_HEADER_BCMEDIA_INFO_V1
-					| MAGIC_HEADER_BCMEDIA_INFO_V2
-					| MAGIC_HEADER_BCMEDIA_IFRAME..=MAGIC_HEADER_BCMEDIA_IFRAME_LAST
-					| MAGIC_HEADER_BCMEDIA_PFRAME..=MAGIC_HEADER_BCMEDIA_PFRAME_LAST
-					| MAGIC_HEADER_BCMEDIA_AAC
-					| MAGIC_HEADER_BCMEDIA_ADPCM
-			)
-		}),
+		verify(le_u32, |x| is_bcmedia_magic(*x)),
 	)
 	.parse(buf)?;
 
@@ -243,8 +269,7 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
 		verify(take4, |x| matches!(x, "H264" | "H265")),
 	)
 	.parse(buf)?;
-	let (buf, payload_size) = le_u32(buf)?;
-	let (buf, additional_header_size) = le_u32(buf)?;
+	let (buf, (payload_size, additional_header_size)) = frame_sizes(buf)?;
 	let (buf, microseconds) = le_u32(buf)?;
 	let (buf, _unknown_b) = le_u32(buf)?;
 	let (buf, time) = if additional_header_size >= 4 {
@@ -303,8 +328,7 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
 		verify(take4, |x| matches!(x, "H264" | "H265")),
 	)
 	.parse(buf)?;
-	let (buf, payload_size) = le_u32(buf)?;
-	let (buf, additional_header_size) = le_u32(buf)?;
+	let (buf, (payload_size, additional_header_size)) = frame_sizes(buf)?;
 	let (buf, microseconds) = le_u32(buf)?;
 	let (buf, _unknown_b) = le_u32(buf)?;
 	let (buf, _additional_header) = take(additional_header_size).parse(buf)?;
@@ -345,7 +369,12 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
 
 fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
 	let (buf, payload_size) = le_u16(buf)?;
-	let (buf, _payload_size_b) = le_u16(buf)?;
+	// The size is sent twice; a mismatch means we are not on a frame.
+	let (buf, _payload_size_b) = context(
+		"AAC payload sizes disagree",
+		verify(le_u16, |&n| n == payload_size),
+	)
+	.parse(buf)?;
 	let (buf, data_slice) = take(payload_size).parse(buf)?;
 	let pad_size = match payload_size as u32 % PAD_SIZE {
 		0 => 0,
@@ -720,5 +749,50 @@ mod tests {
 			result.is_err(),
 			"ADPCM payload_size below sub-header must reject, got {result:?}"
 		);
+	}
+
+	/// A video frame header with `payload` and `additional_header` sizes,
+	/// and no body.
+	fn video_header(magic: u32, payload: u32, additional_header: u32) -> BytesMut {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&magic.to_le_bytes());
+		buf.extend_from_slice(b"H264");
+		buf.extend_from_slice(&payload.to_le_bytes());
+		buf.extend_from_slice(&additional_header.to_le_bytes());
+		buf.extend_from_slice(&[0u8; 8]); // microseconds, unknown
+		BytesMut::from(&buf[..])
+	}
+
+	#[test]
+	// An oversized size field must fail outright: Incomplete would make
+	// the codec buffer toward 4 GiB waiting for the body.
+	fn video_size_fields_above_cap_rejected() {
+		for magic in [MAGIC_HEADER_BCMEDIA_IFRAME, MAGIC_HEADER_BCMEDIA_PFRAME] {
+			for (payload, header) in [(u32::MAX, 0), (0, u32::MAX)] {
+				let result = BcMedia::deserialize(&mut video_header(magic, payload, header));
+				assert!(
+					matches!(result, Err(Error::NomError(_))),
+					"{magic:x} {payload} {header}: {result:?}"
+				);
+			}
+		}
+		// At the cap the header is fine; the body is just not there yet.
+		let result = BcMedia::deserialize(&mut video_header(
+			MAGIC_HEADER_BCMEDIA_IFRAME,
+			16 * 1024 * 1024,
+			0,
+		));
+		assert!(matches!(result, Err(Error::NomIncomplete(_))), "{result:?}");
+	}
+
+	#[test]
+	fn aac_payload_sizes_must_agree() {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&MAGIC_HEADER_BCMEDIA_AAC.to_le_bytes());
+		buf.extend_from_slice(&8u16.to_le_bytes());
+		buf.extend_from_slice(&9u16.to_le_bytes());
+		buf.extend_from_slice(&[0u8; 8]);
+		let result = BcMedia::deserialize(&mut BytesMut::from(&buf[..]));
+		assert!(matches!(result, Err(Error::NomError(_))), "{result:?}");
 	}
 }

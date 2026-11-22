@@ -2,9 +2,10 @@
 //!
 //! BcMediaCodex is used with a `[tokio_util::codec::Framed]` to form complete packets
 //!
+use crate::bcmedia::de::is_bcmedia_magic;
 use crate::bcmedia::model::*;
 use crate::{Error, Result};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use log::*;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -33,6 +34,24 @@ impl Encoder<BcMedia> for BcMediaCodex {
 		dst.extend_from_slice(buf.as_slice());
 		Ok(())
 	}
+}
+
+/// Upper bound on bytes searched for the next magic per resync step, so
+/// one corrupt stretch costs bounded work before the decoder yields.
+const MAX_RESYNC_SCAN: usize = 1024 * 1024;
+
+/// How many bytes to drop from the front of `buf`, whose leading frame
+/// failed to parse: up to the next known magic or, with none in view, all
+/// but the last 3 bytes, which may hold the start of a split magic. At
+/// least 1 so the decoder always makes progress.
+fn resync_offset(buf: &[u8]) -> usize {
+	let scan = &buf[..buf.len().min(MAX_RESYNC_SCAN)];
+	scan.windows(4)
+		.skip(1)
+		.position(|w| is_bcmedia_magic(u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+		.map(|p| p + 1)
+		.unwrap_or_else(|| scan.len().saturating_sub(3))
+		.max(1)
 }
 
 impl Decoder for BcMediaCodex {
@@ -75,9 +94,9 @@ impl Decoder for BcMediaCodex {
 							debug!("Error in stream attempting to restore");
 							trace!("   Stream Error: {:?}", e);
 						}
-						// Drop the whole packet and wait for a packet that starts with magic
-						self.amount_skipped += src.len();
-						src.clear();
+						let skip = resync_offset(src);
+						self.amount_skipped += skip;
+						src.advance(skip);
 						continue;
 					}
 				}
@@ -178,12 +197,12 @@ mod tests {
 	#[test]
 	fn decode_non_strict_skips_garbage_and_returns_none() {
 		let mut codec = BcMediaCodex::new(false);
-		// Garbage bytes with no valid magic — non-strict should drain
-		// and return None (buffer cleared, ready for resync).
+		// Garbage with no valid magic: non-strict drops it but keeps a
+		// 3-byte tail that could start a split magic.
 		let mut buf = BytesMut::from(&[0xffu8, 0xff, 0xff, 0xff][..]);
 		let out = codec.decode(&mut buf).expect("decode ok");
 		assert!(out.is_none());
-		assert!(buf.is_empty(), "non-strict decode should clear buffer");
+		assert_eq!(buf.len(), 3);
 	}
 
 	#[test]
@@ -202,17 +221,30 @@ mod tests {
 		assert!(matches!(out, BcMedia::Iframe(_)));
 	}
 
-	// Coverage note: lines 56-57 (Ok with amount_skipped>0 reset) and
-	// line 72 (non-strict `src.is_empty()` return after Err(e)) are
-	// defensive dead code. The non-strict error path calls
-	// `src.clear()` then `continue;`, so the next iteration always
-	// sees an empty src — which produces NomIncomplete (covered by
-	// lines 62-64), not the generic `Err(e)` arm. By the time control
-	// could reach line 72, amount_skipped has been reset in the
-	// NomIncomplete branch. Similarly, the Ok-arm reset at 56-57 would
-	// need the buffer to contain garbage *then* a valid frame, but
-	// `src.clear()` discards both. Leaving these three lines
-	// uncovered keeps codex.rs at 29/32 (90.6%).
+	#[test]
+	fn decode_non_strict_resyncs_to_frame_behind_garbage() {
+		// Garbage and a valid frame in one read: only the garbage goes.
+		let mut codec = BcMediaCodex::new(false);
+		let mut buf = BytesMut::from(&[0x12u8, 0x34, 0x56, 0x78, 0x9a][..]);
+		codec.encode(sample_iframe(), &mut buf).expect("encode");
+		let out = codec.decode(&mut buf).expect("decode ok").expect("some");
+		assert!(matches!(out, BcMedia::Iframe(_)));
+		assert!(buf.is_empty());
+	}
+
+	#[test]
+	fn decode_non_strict_resyncs_across_split_magic() {
+		let mut codec = BcMediaCodex::new(false);
+		let mut frame = BytesMut::new();
+		codec.encode(sample_iframe(), &mut frame).expect("encode");
+
+		let mut buf = BytesMut::from(&[0x12u8; 40][..]);
+		buf.extend_from_slice(&frame[..2]);
+		assert!(codec.decode(&mut buf).expect("decode ok").is_none());
+		buf.extend_from_slice(&frame[2..]);
+		let out = codec.decode(&mut buf).expect("decode ok").expect("some");
+		assert!(matches!(out, BcMedia::Iframe(_)));
+	}
 
 	#[test]
 	fn decode_non_strict_amount_skipped_reset_on_incomplete() {
