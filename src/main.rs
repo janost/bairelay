@@ -636,7 +636,8 @@ async fn async_main() -> Result<()> {
 		}
 	}
 
-	// Run the orchestrator (blocks until all camera tasks exit).
+	// Run the orchestrator (blocks until shutdown is requested and all
+	// camera tasks have exited).
 	// During their teardown the per-camera tasks publish a final
 	// "disconnected" status — these succeed because the MQTT event
 	// loop is still polling (mqtt_cancel hasn't fired yet).

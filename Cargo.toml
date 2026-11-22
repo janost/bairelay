@@ -144,3 +144,12 @@ bairelay-neolink-core = { workspace = true, features = ["test-util"] }
 # clock (`tokio::time::advance`, `start_paused = true`) used by the
 # gap-detection unit tests.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
+
+# Self-reference so integration tests in tests/ see the `test-util`
+# helpers (`StreamSource` inert constructors, `FakeFrameInjector`);
+# release builds never enable the feature.
+bairelay = { path = ".", features = ["test-util"] }
+
+[features]
+# Test scaffolding for integration tests; see the dev-dependency above.
+test-util = []

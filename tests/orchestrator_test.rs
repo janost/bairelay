@@ -107,15 +107,12 @@ async fn orchestrator_run_exits_on_cancel() {
 	let cancel = CancellationToken::new();
 	let orch = bairelay::orchestrator::Orchestrator::new(config, cancel.clone(), None);
 
-	// With no cameras, run() should return immediately (empty JoinSet)
+	// With no cameras, run() holds until shutdown, then returns.
 	let handle = tokio::spawn(async move {
 		orch.run().await;
 	});
+	cancel.cancel();
 
-	// Should complete quickly since there are no cameras to wait on
 	let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-	assert!(
-		result.is_ok(),
-		"run() with no cameras should return promptly"
-	);
+	assert!(result.is_ok(), "run() should return promptly on cancel");
 }

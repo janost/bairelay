@@ -202,9 +202,9 @@ async fn idle_since_records_release_timestamp() {
 	// fix for the wakeup-vs-watchdog race that disconnected a camera
 	// a few hundred ms before an MQTT `control/wakeup` could land.
 	let wl = bairelay::wake_lock::WakeLockCounter::new();
-	let before = std::time::Instant::now();
+	let before = tokio::time::Instant::now();
 	drop(wl.acquire());
-	let after = std::time::Instant::now();
+	let after = tokio::time::Instant::now();
 	let stamped = wl.idle_since().expect("idle_since populated post-release");
 	assert!(stamped >= before && stamped <= after);
 }

@@ -37,15 +37,13 @@ use tokio_util::sync::CancellationToken;
 
 use bairelay_rtsp::buffer::{LastFrameBuffer, VideoBurst};
 use bairelay_rtsp::codec::VideoCodec;
-use bairelay_rtsp::codec::nal::{
-	H264NalType, H265NalType, detect_codec, is_decodable_nal, split_annex_b,
-};
+use bairelay_rtsp::codec::nal::{H264NalType, H265NalType, is_decodable_nal, split_annex_b};
 use bairelay_rtsp::provider::Frame;
 use bairelay_rtsp::sdp::{SdpParams, VideoParams};
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
 
 use bairelay_neolink_core::bc_protocol::{BcCamera, StreamKind as CoreStreamKind};
-use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe};
+use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe, VideoType};
 
 use crate::bcmedia_dump::{BcMediaDumpConfig, FrameDumper};
 
@@ -150,7 +148,10 @@ pub enum GapState {
 
 /// A live `(camera, stream_kind)` media source. See module docs.
 pub struct StreamSource {
-	tx: broadcast::Sender<Frame>,
+	/// Weak so the channel closes when the reader and pacers (the only
+	/// strong senders) exit: subscribers then see `RecvError::Closed`
+	/// instead of waiting forever on a dead source.
+	tx: broadcast::WeakSender<Frame>,
 	/// Shared last-frame buffer owned by the [`CameraHandle`]. All sources
 	/// for the same camera write into this single buffer so the MQTT
 	/// preview publisher and RTSP placeholder code see one consistent view
@@ -159,19 +160,6 @@ pub struct StreamSource {
 	// Shared with the reader task so SDP updates land in one place and
 	// are observable by every `sdp_params()` caller.
 	sdp_params: Arc<RwLock<SdpParams>>,
-	/// Shared translator state. Held by `reader_task` via a clone of this
-	/// `Arc` — if `reader_task` is re-spawned across a Baichuan reconnect,
-	/// the PTS counters do not reset, so downstream RTP timestamps stay
-	/// monotonic across the reconnect boundary. Fixes the 4K-Terrace tail-
-	/// drain DTS warning observed during live-verify (see
-	/// `docs/implementation.md`, "Residual finding on 4K
-	/// Terrace").
-	///
-	/// Only read by `reader_task` (via a cloned `Arc`); the copy on
-	/// `StreamSource` exists to keep the state alive across any future
-	/// reader re-spawn, hence the `dead_code` allow.
-	#[allow(dead_code)]
-	translator_state: Arc<Mutex<StreamTranslatorState>>,
 	cancel: CancellationToken,
 	// Reader task handle, taken out by `stop_and_wait` for synchronous
 	// teardown so callers can ensure the task observed cancel + ran
@@ -199,49 +187,6 @@ pub struct StreamSource {
 	/// lock-and-release, never held across `.await`, so `std::sync::Mutex`
 	/// is the right primitive here.
 	gap_state: Arc<Mutex<GapState>>,
-	/// Last time a real live `Frame::Video` was forwarded. Compared
-	/// against `gap_threshold` by the gap-detection ticker. Seeded with
-	/// `tokio::time::Instant::now()` at source construction so the
-	/// initial state is `Live` (no spurious `Bridging` at startup).
-	///
-	/// Uses `tokio::time::Instant` rather than `std::time::Instant` so
-	/// the gap-detection unit tests can drive transitions under
-	/// `tokio::test(start_paused = true)` + `tokio::time::advance`.
-	/// Outside paused tests `tokio::time::Instant::now()` is backed by
-	/// the same monotonic clock as `std::time::Instant`.
-	///
-	/// Only read by `reader_task` (via a cloned `Arc`); the copy on
-	/// `StreamSource` exists to keep the state alive across any future
-	/// reader re-spawn, matching the same pattern as `translator_state`.
-	#[allow(dead_code)]
-	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
-	/// 90 kHz RTP timestamp of the last [`Frame::Video`] broadcast on
-	/// this source, regardless of whether it was a live frame or a
-	/// Bridging replay. `None` until the first emit. Updated by
-	/// `reader_task` (and its test stand-in) on every successful video
-	/// broadcast. Used by the replay-frame synth to advance PTS
-	/// monotonically across the `Live → Bridging → Live` boundary.
-	///
-	/// `Option<u32>` rather than `0` sentinel: the previous "rebind only
-	/// when *guard == 0" rule both (a) failed to rebind on a legitimate
-	/// 32-bit-wraparound zero and (b) coupled with a `now`-initialised
-	/// `last_emit_wallclock_at` to produce an unbounded first-replay PTS
-	/// jump (process-uptime × 90 kHz).
-	///
-	/// Held in an `Arc<Mutex<_>>` so a mid-stream reader re-spawn re-
-	/// binds the same state — synth PTS stays monotonic across the
-	/// reconnect, mirroring the `translator_state` pattern.
-	#[allow(dead_code)]
-	last_emitted_pts_90khz: Arc<Mutex<Option<u32>>>,
-	/// Wall-clock instant of the last [`Frame::Video`] broadcast (live
-	/// or replay). Paired with `last_emitted_pts_90khz` to derive the
-	/// next replay PTS as `last_pts + Δwall × 90_000`. `None` until the
-	/// first emit so the first replay's wall-clock delta is 0 (the
-	/// burst's `captured_pts_90khz` anchor stands alone). Uses
-	/// `tokio::time::Instant` so the replay tests can drive transitions
-	/// under `tokio::test(start_paused = true)`.
-	#[allow(dead_code)]
-	last_emit_wallclock_at: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 /// Shared parts of a [`StreamSource`] that are independent of the
@@ -252,6 +197,17 @@ pub struct StreamSource {
 /// Extracting this struct lets `start` and `start_inert_for_test_*`
 /// share the same construction code, so the per-field initialization
 /// at this one call site is exercised by both paths.
+///
+/// The reader-only fields:
+/// - `last_live_frame_at`: last time a live `Frame::Video` arrived,
+///   compared against `gap_threshold` by the gap ticker; seeded with
+///   now so the source starts `Live`. A `tokio::time::Instant` so
+///   paused-time tests drive it.
+/// - `last_emitted_pts_90khz`: 90 kHz timestamp of the last video
+///   broadcast, live or replay; `None` until the first. The replay
+///   synth advances from it across `Live → Bridging → Live`.
+/// - `last_emit_wallclock_at`: when that broadcast happened; `None`
+///   until the first, so the first replay's wall-clock delta is 0.
 struct StreamSourceParts {
 	tx: broadcast::Sender<Frame>,
 	last_frame: Arc<LastFrameBuffer>,
@@ -296,18 +252,14 @@ impl StreamSourceParts {
 
 	fn into_source(self, task: JoinHandle<()>) -> Arc<StreamSource> {
 		Arc::new(StreamSource {
-			tx: self.tx,
+			tx: self.tx.downgrade(),
 			last_frame: self.last_frame,
 			sdp_params: self.sdp_params,
-			translator_state: self.translator_state,
 			cancel: self.cancel,
 			task: Mutex::new(Some(task)),
 			last_idle_since: Mutex::new(None),
 			gap_threshold: self.gap_threshold,
 			gap_state: self.gap_state,
-			last_live_frame_at: self.last_live_frame_at,
-			last_emitted_pts_90khz: self.last_emitted_pts_90khz,
-			last_emit_wallclock_at: self.last_emit_wallclock_at,
 		})
 	}
 }
@@ -352,8 +304,8 @@ struct ReaderTaskArgs {
 /// Bundles the four `&mut` fields that `apply_bcmedia_packet` previously
 /// took individually:
 ///
-/// - `detected_codec` — H.264 vs H.265 verdict, latched on the first
-///   identifying NAL.
+/// - `detected_codec` — H.264 vs H.265 verdict: the first I-frame's
+///   BcMedia tag, replaced only by parameter-set evidence.
 /// - `aac_pts_next` — running 90 kHz-clock-independent AAC RTP timestamp
 ///   counter; advances by 1024 per AAC-LC AU (2048 for HE-AAC / HE-AACv2).
 /// - `g711_pts_next` — running 8 kHz G.711 µ-law RTP timestamp counter;
@@ -361,12 +313,6 @@ struct ReaderTaskArgs {
 /// - `aac_aot` — last observed ADTS AudioObjectType. Gates the one-shot
 ///   "unsupported AOT" warn in `handle_aac` so a latched-on-bad-AOT
 ///   stream doesn't log per packet.
-///
-/// Held by `StreamSource` in an `Arc<Mutex<_>>` so a mid-probe Baichuan
-/// reconnect that re-spawns `reader_task` re-binds the same state — PTS
-/// counters survive, so the next audio RTP packet after reconnect is not
-/// a backward DTS jump (the 4K-Terrace tail-drain symptom from 2D.1
-/// live-verify, see `docs/implementation.md`).
 #[derive(Debug, Default)]
 pub struct StreamTranslatorState {
 	pub detected_codec: Option<VideoCodec>,
@@ -377,6 +323,33 @@ pub struct StreamTranslatorState {
 	/// pacer. Used by `video_frame_duration` to compute the next pacer
 	/// emission interval. `None` until the first video frame.
 	pub last_video_pts_90khz: Option<u32>,
+	/// Raw `BcMedia` µs timestamp of the previous video frame.
+	last_video_raw_us: Option<u32>,
+	/// The camera's u32 µs clock (wraps every ~71.6 min) extended to a
+	/// monotonic u64; see [`StreamTranslatorState::video_pts_90khz`].
+	video_us: u64,
+}
+
+impl StreamTranslatorState {
+	/// 90 kHz RTP timestamp for a video frame stamped `raw_us` by the
+	/// camera. The raw clock is a u32 of µs, so mapping it directly
+	/// would jump backwards every 2^32 µs; instead each frame advances a
+	/// u64 accumulator by the wrapping delta, and the 90 kHz value is
+	/// truncated to u32 (RTP's own, clean 2^32-tick wrap). A backward
+	/// step (delta above 2^31: reordering or a clock reset) advances by
+	/// zero rather than leaping ahead by most of 2^32.
+	fn video_pts_90khz(&mut self, raw_us: u32) -> u32 {
+		self.video_us = match self.last_video_raw_us {
+			None => u64::from(raw_us),
+			Some(prev) => {
+				let delta = raw_us.wrapping_sub(prev);
+				let delta = if delta > 1 << 31 { 0 } else { delta };
+				self.video_us.wrapping_add(u64::from(delta))
+			}
+		};
+		self.last_video_raw_us = Some(raw_us);
+		(self.video_us.wrapping_mul(9) / 100) as u32
+	}
 }
 
 impl StreamSource {
@@ -465,10 +438,10 @@ impl StreamSource {
 	/// `BcCamera::stop_video`, so tests exercise the same translator
 	/// plumbing production uses without any real camera.
 	///
-	/// Gated on the `test-util` feature + `#[cfg(test)]` so release builds
-	/// do not carry it. Returns the `Arc<StreamSource>` only — the caller
-	/// drops its own `CancellationToken` or the source to terminate.
-	#[allow(dead_code, private_bounds)]
+	/// Returns the `Arc<StreamSource>` only — the caller drops its own
+	/// `CancellationToken` or the source to terminate.
+	#[cfg(test)]
+	#[allow(private_bounds)]
 	pub(crate) fn start_with_packet_source<S>(
 		camera_name: String,
 		kind: RtspStreamKind,
@@ -503,7 +476,9 @@ impl StreamSource {
 			last_emitted_pts_90khz: Arc::clone(&parts.last_emitted_pts_90khz),
 			last_emit_wallclock_at: Arc::clone(&parts.last_emit_wallclock_at),
 		};
+		let stop_on_exit = parts.cancel.clone().drop_guard();
 		let task = tokio::spawn(async move {
+			let _stop_on_exit = stop_on_exit;
 			let mut s = source;
 			drive_translator_loop(args, &mut s).await;
 		});
@@ -512,8 +487,18 @@ impl StreamSource {
 
 	/// Subscribe to the broadcast channel. Each RTSP session creates one
 	/// receiver; lagging receivers are dropped per session-task policy.
+	/// On a dead source the receiver is already closed.
 	pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
-		self.tx.subscribe()
+		match self.tx.upgrade() {
+			Some(tx) => tx.subscribe(),
+			None => broadcast::channel(1).1,
+		}
+	}
+
+	/// `false` once the reader has exited or been told to stop: a dead
+	/// source never produces another frame and must be replaced.
+	pub fn is_alive(&self) -> bool {
+		!self.cancel.is_cancelled()
 	}
 
 	/// Snapshot of the current SDP parameters.
@@ -585,7 +570,7 @@ impl StreamSource {
 
 	/// Current broadcast subscriber count (excluding any senders).
 	pub fn subscribers(&self) -> usize {
-		self.tx.receiver_count()
+		self.tx.upgrade().map_or(0, |tx| tx.receiver_count())
 	}
 
 	/// Configured gap-bridging threshold for this source. Task 5 (Phase
@@ -651,12 +636,8 @@ impl Drop for StreamSource {
 	}
 }
 
-// When compiled with only `feature = "test-util"` (i.e. from an
-// integration test's self-dep, not `cargo test` on this crate), the
-// `pub(crate)` helpers below appear unused — their callers live in
-// `#[cfg(test)]` unit-test modules that aren't compiled in that mode.
-// The `allow(dead_code)` silences the resulting warning.
-#[allow(dead_code)]
+/// Unit-test constructors and pokes.
+#[cfg(test)]
 impl StreamSource {
 	/// Build a `StreamSource` that owns only its broadcast channel and
 	/// translator state — no reader task, no `BcCamera`. Used by the
@@ -714,6 +695,27 @@ impl StreamSource {
 		(src, last_frame)
 	}
 
+	/// Test-only subscribe that returns a fresh broadcast receiver, so
+	/// unit tests can drive `receiver_count()` transitions without pulling
+	/// in the full RTSP provider subscription machinery.
+	pub(crate) fn subscribe_for_test(&self) -> broadcast::Receiver<Frame> {
+		self.subscribe()
+	}
+
+	/// Test-only: force this source's [`GapState`] without waiting for
+	/// the reader task's 200 ms ticker. Used by camera-side aggregator
+	/// tests that need to observe "source is bridging" transitions in
+	/// sub-millisecond time.
+	pub(crate) fn set_gap_state_for_test(&self, state: GapState) {
+		*lock_recover(&self.gap_state) = state;
+	}
+}
+
+/// Test constructors shared with the integration tests in `tests/`
+/// (through the `test-util` feature, which only the dev-dependency
+/// self-reference enables).
+#[cfg(any(test, feature = "test-util"))]
+impl StreamSource {
 	/// Shared core of the inert-for-test constructors: also accepts a
 	/// caller-provided [`LastFrameBuffer`] so the replay-frame tests can
 	/// preload a burst before the ticker fires.
@@ -721,9 +723,7 @@ impl StreamSource {
 	/// `pub` (not `pub(crate)`) so the Task 11 integration test
 	/// in `tests/fixture_replay.rs` can wire a real `StreamSource` behind
 	/// a `StreamProvider` shim and exercise production's gap-detection
-	/// ticker + `emit_replay_frame_if_bridging` end-to-end. The
-	/// `#[cfg(test)]` gate on the enclosing `impl` block keeps this out
-	/// of release builds.
+	/// ticker + `emit_replay_frame_if_bridging` end-to-end.
 	pub fn start_inert_for_test_with_gap_and_last_frame_and_injector(
 		gap_threshold: Duration,
 		last_frame: Arc<LastFrameBuffer>,
@@ -775,21 +775,6 @@ impl StreamSource {
 		(parts.into_source(task), injector)
 	}
 
-	/// Test-only subscribe that returns a fresh broadcast receiver, so
-	/// unit tests can drive `receiver_count()` transitions without pulling
-	/// in the full RTSP provider subscription machinery.
-	pub(crate) fn subscribe_for_test(&self) -> broadcast::Receiver<Frame> {
-		self.tx.subscribe()
-	}
-
-	/// Test-only: force this source's [`GapState`] without waiting for
-	/// the reader task's 200 ms ticker. Used by camera-side aggregator
-	/// tests that need to observe "source is bridging" transitions in
-	/// sub-millisecond time.
-	pub(crate) fn set_gap_state_for_test(&self, state: GapState) {
-		*lock_recover(&self.gap_state) = state;
-	}
-
 	/// Test-only: overwrite the SDP parameters on this source. The inert
 	/// constructors leave `SdpParams.video`/`audio` as `None` because
 	/// there's no reader task to populate them from a real IDR; the
@@ -811,12 +796,14 @@ impl StreamSource {
 /// `#[cfg(any(test, feature = "test-util"))]` gate on the struct + impl
 /// keeps this out of release builds; the `test-util` feature is only
 /// pulled in by `bairelay`'s own `[dev-dependencies]` self-reference.
+#[cfg(any(test, feature = "test-util"))]
 pub struct FakeFrameInjector {
 	gap_state: Arc<Mutex<GapState>>,
 	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
 	tx: broadcast::Sender<Frame>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl FakeFrameInjector {
 	/// Mark the source as having just received a real live video frame.
 	/// Mirrors a SUBSET of the state updates that `reader_task` performs
@@ -1136,12 +1123,6 @@ const VIDEO_PACER_QUEUE: usize = 300;
 
 // ── Reader task ──────────────────────────────────────────────────────
 
-/// Converts microseconds (from `BcMedia` packets) to a 90 kHz RTP clock
-/// via `µs * 9 / 100`. Wrapping arithmetic is the desired RTP behaviour.
-fn micros_to_90khz(micros: u32) -> u32 {
-	((micros as u64).wrapping_mul(9) / 100) as u32
-}
-
 /// Check whether the gap threshold has elapsed since the last live
 /// frame; flip `gap_state` to `Bridging` if so. Called on every
 /// gap-detection tick from both [`reader_task`] and its test stand-in
@@ -1186,6 +1167,11 @@ fn emit_replay_frame_if_bridging(
 	last_emit_wallclock_at: &Mutex<Option<tokio::time::Instant>>,
 ) {
 	if *lock_recover(gap_state) != GapState::Bridging {
+		return;
+	}
+	// The snapshot deep-copies the burst (up to 8 MiB), every tick:
+	// skip it when nobody would receive the replay.
+	if tx.receiver_count() == 0 {
 		return;
 	}
 	let Some(burst) = last_frame.video_snapshot() else {
@@ -1254,12 +1240,6 @@ fn emit_replay_frame_if_bridging(
 }
 
 /// Reader loop driving one `(camera, stream_kind)` source.
-///
-/// `translator_state` is an `Arc<Mutex<StreamTranslatorState>>` shared with
-/// the owning [`StreamSource`]. Holding it here (rather than keeping a
-/// stack-local copy) means a mid-stream re-spawn of this task across a
-/// Baichuan reconnect reuses the same PTS counters, so audio RTP
-/// timestamps stay monotonic across the reconnect boundary.
 async fn reader_task(args: ReaderTaskArgs) {
 	let ReaderTaskArgs {
 		camera,
@@ -1281,6 +1261,10 @@ async fn reader_task(args: ReaderTaskArgs) {
 		last_emitted_pts_90khz,
 		last_emit_wallclock_at,
 	} = args;
+	// Every exit path, early return or not, marks the source dead so
+	// `CameraHandle::stream_source` replaces it instead of handing out
+	// a source that will never produce a frame.
+	let _stop_on_exit = cancel.clone().drop_guard();
 	let start_video_future =
 		tokio::time::timeout(START_VIDEO_TIMEOUT, camera.start_video(core_kind, 0, false));
 	let stream_data = tokio::select! {
@@ -1353,6 +1337,9 @@ async fn reader_task(args: ReaderTaskArgs) {
 				"translator task ended unexpectedly");
 		}
 	}
+	// The stream is over however it ended: stop the pacers and mark the
+	// source dead now rather than after `stop_video`.
+	cancel.cancel();
 
 	// Graceful stop: send the explicit stop_video so the camera tears
 	// down its side of the preview. We cap with STOP_VIDEO_TIMEOUT so a
@@ -1744,22 +1731,25 @@ fn handle_iframe(
 		return None;
 	}
 
-	// Detect the codec from the first NAL that gives a verdict.
-	if state.detected_codec.is_none() {
-		for nal in &nals {
-			if let Some(c) = detect_codec(nal) {
-				state.detected_codec = Some(c);
-				break;
-			}
-		}
-	}
-	let codec = match state.detected_codec {
-		Some(c) => c,
-		None => {
-			tracing::warn!("I-frame with no detectable codec; dropping");
-			return None;
-		}
+	// The BcMedia tag names the codec; only a parameter set overrides
+	// it. Guessing from the first NAL misread an HEVC access unit led by
+	// Reolink's type-62 NAL as H.264 for the whole session.
+	let tagged = match iframe.video_type {
+		VideoType::H264 => VideoCodec::H264,
+		VideoType::H265 => VideoCodec::H265,
 	};
+	let evidence = nals.iter().find_map(|n| parameter_set_codec(n));
+	let codec = evidence.or(state.detected_codec).unwrap_or(tagged);
+	if state.detected_codec != Some(codec) {
+		if evidence.is_some_and(|c| c != tagged) {
+			tracing::warn!(
+				?tagged,
+				?codec,
+				"I-frame parameter sets contradict the BcMedia codec tag; following the parameter sets"
+			);
+		}
+		state.detected_codec = Some(codec);
+	}
 
 	// Filter NALs to the standard single-layer whitelist. Reolink Argus
 	// firmware emits HEVC NAL type 62 (UNSPEC62) inside access units;
@@ -1819,7 +1809,7 @@ fn handle_iframe(
 	// non-slice-then-slice ordering that marker-bit placement depends on.
 	// captured_pts_90khz lets the session send loop replay with a
 	// timestamp continuous with the live stream — see buffer.rs.
-	let burst_pts = micros_to_90khz(iframe.microseconds);
+	let burst_pts = state.video_pts_90khz(iframe.microseconds);
 	let burst = VideoBurst {
 		codec,
 		parameter_sets: parameter_sets.clone(),
@@ -1863,7 +1853,7 @@ fn handle_iframe(
 		return None;
 	}
 
-	let pts_90khz = micros_to_90khz(iframe.microseconds);
+	let pts_90khz = burst_pts;
 	let frame = Frame::Video {
 		codec,
 		nals: nals_bytes,
@@ -1881,6 +1871,26 @@ fn handle_iframe(
 	let duration = video_frame_duration(state, pts_90khz);
 	dispatch_paced_video(video_pace_tx, tx, frame, duration);
 	Some(pts_90khz)
+}
+
+/// The codec a parameter-set NAL belongs to (H.264 SPS/PPS, H.265
+/// VPS/SPS/PPS with a valid second header byte); `None` for any other
+/// NAL. The H.265 types are tested first: their header bytes (0x40,
+/// 0x42, 0x44) never read as an H.264 SPS/PPS, and H.264's (0x67,
+/// 0x68 and kin) never as an H.265 parameter set.
+fn parameter_set_codec(nal: &[u8]) -> Option<VideoCodec> {
+	let &b0 = nal.first()?;
+	if b0 & 0x80 != 0 {
+		return None;
+	}
+	let h265 = H265NalType::from_header_byte(b0);
+	if matches!(h265, H265NalType::VPS | H265NalType::SPS | H265NalType::PPS)
+		&& nal.get(1).is_some_and(|b| b & 0x07 >= 1)
+	{
+		return Some(VideoCodec::H265);
+	}
+	let h264 = H264NalType::from_header_byte(b0);
+	matches!(h264, H264NalType::SPS | H264NalType::PPS).then_some(VideoCodec::H264)
 }
 
 /// Returns true if `nal` is a codec parameter-set NAL (SPS/PPS for
@@ -2065,7 +2075,7 @@ fn handle_pframe(
 		.iter()
 		.map(|n| Bytes::copy_from_slice(n))
 		.collect();
-	let pts_90khz = micros_to_90khz(pframe.microseconds);
+	let pts_90khz = state.video_pts_90khz(pframe.microseconds);
 	let frame = Frame::Video {
 		codec,
 		nals: nals_bytes,
@@ -2779,6 +2789,29 @@ mod tests {
 		}
 	}
 
+	/// With no subscriber a bridging tick does nothing: no burst copy, no
+	/// synth state advanced. A subscriber gets the replay.
+	#[tokio::test]
+	async fn bridging_replay_skips_without_subscribers() {
+		let (tx, _) = broadcast::channel::<Frame>(4);
+		let last_frame = Arc::new(LastFrameBuffer::new());
+		last_frame.replace_video(fake_burst_with_pts_90khz(90_000));
+		let gap_state = Mutex::new(GapState::Bridging);
+		let last_pts = Mutex::new(None);
+		let last_at = Mutex::new(None);
+		let tick =
+			|| emit_replay_frame_if_bridging(&tx, &last_frame, &gap_state, &last_pts, &last_at);
+
+		tick();
+		assert_eq!(*last_pts.lock().unwrap(), None);
+		assert!(last_at.lock().unwrap().is_none());
+
+		let mut rx = tx.subscribe();
+		tick();
+		assert!(matches!(rx.try_recv(), Ok(Frame::Video { .. })));
+		assert_eq!(*last_pts.lock().unwrap(), Some(90_000));
+	}
+
 	/// once `Bridging`, every ticker fire must push a
 	/// synthesised replay [`Frame::Video`] onto the broadcast channel,
 	/// derived from the cached [`VideoBurst`]. PTS must advance past
@@ -3128,11 +3161,36 @@ mod tests {
 	}
 
 	#[test]
-	fn micros_to_90khz_matches_reference() {
-		// 1 second = 1_000_000 µs → 90_000 ticks.
-		assert_eq!(micros_to_90khz(1_000_000), 90_000);
-		// 0 stays 0.
-		assert_eq!(micros_to_90khz(0), 0);
+	fn video_pts_first_frame_maps_raw_micros() {
+		let pts = |us| StreamTranslatorState::default().video_pts_90khz(us);
+		assert_eq!(pts(1_000_000), 90_000);
+		assert_eq!(pts(0), 0);
+		assert_eq!(pts(100), 9);
+	}
+
+	/// The camera's u32 µs clock wraps every ~71.6 min. Across the wrap
+	/// the 90 kHz timestamp keeps advancing by the real interval instead
+	/// of jumping back to near zero.
+	#[test]
+	fn video_pts_stays_monotonic_across_the_micros_wrap() {
+		let mut s = StreamTranslatorState::default();
+		let frame_us = 33_333u32;
+		let before = s.video_pts_90khz(u32::MAX - 10_000);
+		let after = s.video_pts_90khz((u32::MAX - 10_000).wrapping_add(frame_us));
+		// 33 333 µs is 2 999.97 ticks; integer division lands on either side.
+		assert!((2_999..=3_000).contains(&after.wrapping_sub(before)));
+		// The pre-fix mapping restarted near zero here.
+		assert!(after > before);
+	}
+
+	/// A backward step (reordered frame, clock reset) holds the
+	/// timestamp instead of leaping ahead by most of 2^32 µs.
+	#[test]
+	fn video_pts_holds_on_a_backward_step() {
+		let mut s = StreamTranslatorState::default();
+		let t = s.video_pts_90khz(10_000_000);
+		assert_eq!(s.video_pts_90khz(9_000_000), t);
+		assert_eq!(s.video_pts_90khz(9_100_000), t + 9_000);
 	}
 
 	/// Build a minimal H.265 Annex-B access unit containing VPS + SPS +
@@ -3154,6 +3212,55 @@ mod tests {
 		out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
 		out.extend_from_slice(&[0x26, 0x01, 0xaf, 0x08, 0x46]);
 		out
+	}
+
+	/// Detected codec after one I-frame tagged `tag` carrying `data`.
+	fn codec_after_iframe(tag: VideoType, data: Vec<u8>) -> Option<VideoCodec> {
+		let (tx, _rx) = broadcast::channel::<Frame>(4);
+		let sdp_params = Arc::new(RwLock::new(SdpParams {
+			server_ip: "0.0.0.0".to_string(),
+			session_id: "0".to_string(),
+			session_name: "unit".to_string(),
+			video: None,
+			audio: None,
+		}));
+		let mut state = StreamTranslatorState::default();
+		let iframe = BcMediaIframe {
+			video_type: tag,
+			microseconds: 0,
+			time: None,
+			data,
+		};
+		handle_iframe(
+			&iframe,
+			&tx,
+			None,
+			&Arc::new(LastFrameBuffer::new()),
+			&sdp_params,
+			&mut state,
+		);
+		state.detected_codec
+	}
+
+	/// An HEVC access unit led by Reolink's type-62 NAL (whose header
+	/// byte reads as an H.264 NAL) keeps the BcMedia tag's H.265.
+	#[test]
+	fn codec_follows_the_tag_when_a_type_62_nal_leads() {
+		let mut data = vec![0x00, 0x00, 0x00, 0x01, 0x7C, 0x01, 0xAB, 0xCD];
+		data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, 0x08]);
+		assert_eq!(
+			codec_after_iframe(VideoType::H265, data),
+			Some(VideoCodec::H265)
+		);
+	}
+
+	/// Parameter sets outrank a contradicting tag.
+	#[test]
+	fn codec_follows_parameter_sets_over_the_tag() {
+		assert_eq!(
+			codec_after_iframe(VideoType::H264, synthetic_h265_iframe_bytes()),
+			Some(VideoCodec::H265)
+		);
 	}
 
 	fn synthetic_h265_pframe_bytes() -> Vec<u8> {
@@ -4189,18 +4296,6 @@ mod tests {
 			map_stream_kind(RtspStreamKind::Extern),
 			CoreStreamKind::Extern
 		));
-	}
-
-	#[test]
-	fn micros_to_90khz_edge_cases() {
-		assert_eq!(micros_to_90khz(0), 0);
-		assert_eq!(micros_to_90khz(1_000_000), 90_000);
-		// 100 µs = 9 ticks.
-		assert_eq!(micros_to_90khz(100), 9);
-		// Large-but-representable value wraps cleanly inside u32.
-		let big = u32::MAX / 10;
-		// Must not panic (wrapping arithmetic).
-		let _ = micros_to_90khz(big);
 	}
 
 	#[tokio::test]
@@ -5284,6 +5379,32 @@ mod tests {
 		// SDP video is populated.
 		let sdp = src.sdp_params();
 		assert!(sdp.video.is_some());
+	}
+
+	/// A stream that ends on its own leaves a dead source: it reports
+	/// it, and its subscribers see `Closed` instead of waiting forever
+	/// (the source itself holds only a weak sender).
+	#[tokio::test]
+	async fn ended_stream_marks_the_source_dead_and_closes_subscribers() {
+		let mut queue = std::collections::VecDeque::new();
+		queue.push_back(Err(bairelay_neolink_core::Error::StreamFinished));
+		let src = StreamSource::start_with_packet_source(
+			"cam-x".to_string(),
+			RtspStreamKind::Main,
+			Arc::new(LastFrameBuffer::new()),
+			Duration::from_secs(5),
+			ScriptedSource { queue },
+		);
+		let mut rx = src.subscribe();
+		let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+			.await
+			.expect("a subscriber of a dead source must not hang");
+		assert!(matches!(got, Err(broadcast::error::RecvError::Closed)));
+		assert!(!src.is_alive());
+		assert!(matches!(
+			src.subscribe().try_recv(),
+			Err(broadcast::error::TryRecvError::Closed)
+		));
 	}
 
 	#[tokio::test]

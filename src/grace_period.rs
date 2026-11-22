@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use crate::wake_lock::WakeLockCounter;
 
 // ── GracePeriod ──────────────────────────────────────────────────────
@@ -17,38 +19,31 @@ impl GracePeriod {
 		}
 	}
 
-	/// Runs the grace period loop. Returns when the grace period expires
-	/// (wake lock is observed idle at the deadline tick).
-	///
-	/// Semantics: this is a "check at deadline" countdown, not a
-	/// "sustained idle" timer. A brief acquire+release pair that both
-	/// happen inside the `duration` sleep window is invisible — by the
-	/// time the sleep ends, the count is back to zero and we return.
-	/// Realistic consumers (the motion listener holds for
-	/// `motion_wake_hold_secs` ≈ 30 s, much longer than the typical
-	/// `idle_disconnect_timeout_secs`) don't generate sub-window
-	/// flicker, so the deadline-only check matches the operator's
-	/// "camera was idle long enough to disconnect" intent.
+	/// Returns once the wake lock has been idle for `duration` in one
+	/// stretch. Any acquire restarts the countdown from its release,
+	/// even a brief acquire+release that falls entirely inside a sleep:
+	/// the deadline is re-derived from `idle_since()` after each wake.
+	/// A lock never acquired counts as idle from the call.
 	pub async fn run(self) {
+		let started = Instant::now();
 		loop {
 			// Register for notification BEFORE checking state
 			// to avoid TOCTOU race with Notify
-			let notification = self.wake_lock.notify_future();
-
+			let released = self.wake_lock.notify_future();
 			if !self.wake_lock.is_idle() {
-				notification.await;
+				released.await;
+				continue;
 			}
-
-			// Start countdown
-			tokio::time::sleep(self.duration).await;
-
-			// Check if still idle after sleep. A brief acquire+release
-			// inside the sleep window is intentionally not visible here.
-			if self.wake_lock.is_idle() {
+			let idle_from = match self.wake_lock.idle_since() {
+				Some(at) => at,
+				None if self.wake_lock.is_idle() => started,
+				None => continue, // acquired just now
+			};
+			let deadline = idle_from + self.duration;
+			if Instant::now() >= deadline {
 				return; // Grace period expired — caller should disconnect
 			}
-			// Otherwise, lock is currently held — loop back to wait for
-			// the next release before re-arming the countdown.
+			tokio::time::sleep_until(deadline).await;
 		}
 	}
 }

@@ -160,7 +160,11 @@ impl Orchestrator {
 		&self.cancel
 	}
 
-	/// Spawn per-camera connection loops and wait for all to complete.
+	/// Spawn per-camera connection loops and return once shutdown is
+	/// requested and every loop has exited. Camera loops end only on
+	/// shutdown (or a panic); waiting for the token too means an early
+	/// end can never stop the daemon with exit 0 behind a supervisor's
+	/// `Restart=on-failure`.
 	pub async fn run(&self) {
 		let mut set = tokio::task::JoinSet::new();
 
@@ -173,12 +177,12 @@ impl Orchestrator {
 			});
 		}
 
-		// Wait for all tasks (they exit on cancellation)
 		while let Some(result) = set.join_next().await {
 			if let Err(e) = result {
 				tracing::error!("Camera task panicked: {}", e);
 			}
 		}
+		self.cancel.cancelled().await;
 	}
 }
 
@@ -300,15 +304,22 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
-	async fn run_with_no_cameras_returns_immediately() {
-		let cfg = Config::default();
+	/// With no camera task left to wait on, run() still holds until
+	/// shutdown: returning early would end the daemon with exit 0.
+	#[tokio::test(start_paused = true)]
+	async fn run_with_no_cameras_waits_for_shutdown() {
 		let cancel = CancellationToken::new();
-		let orch = Orchestrator::new(cfg, cancel, None);
-		// No cameras → no spawned tasks → run() should complete fast.
-		tokio::time::timeout(std::time::Duration::from_millis(500), orch.run())
-			.await
-			.expect("run returns without pending cameras");
+		let orch = Orchestrator::new(Config::default(), cancel.clone(), None);
+		let run = orch.run();
+		tokio::pin!(run);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_secs(3600), &mut run)
+				.await
+				.is_err(),
+			"run() returned before shutdown"
+		);
+		cancel.cancel();
+		run.await;
 	}
 
 	#[tokio::test]

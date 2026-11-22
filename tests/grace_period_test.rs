@@ -44,3 +44,19 @@ async fn resets_on_reacquire() {
 	let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
 	assert!(result.is_ok()); // Grace period fired after second release
 }
+
+/// A brief acquire+release inside the countdown restarts it: the
+/// camera must be idle for the full duration after the last release.
+#[tokio::test(start_paused = true)]
+async fn brief_reacquire_inside_the_window_restarts_the_countdown() {
+	let wl = WakeLockCounter::new();
+	drop(wl.acquire());
+	let start = tokio::time::Instant::now();
+	let handle = tokio::spawn(GracePeriod::new(wl.clone(), Duration::from_secs(10)).run());
+
+	tokio::time::sleep(Duration::from_secs(4)).await;
+	drop(wl.acquire());
+
+	handle.await.unwrap();
+	assert_eq!(start.elapsed(), Duration::from_secs(14));
+}

@@ -111,6 +111,32 @@ async fn publish_ai_objects(
 	}
 }
 
+/// Session teardown: publish `status/motion` and every AI object that is
+/// on as off (all retained), as the Stop that would clear them can't
+/// arrive once the session is gone. Leaves topics already off alone.
+pub(crate) async fn clear_alarm_state(
+	publisher: &StatusPublisher<'_>,
+	cache: &StatusCache,
+	caps: CameraCapabilitiesView,
+) {
+	if cache.motion() == Some(true) {
+		let _ = publisher.publish_motion(false).await;
+		cache.set_motion(false);
+	}
+	// Every cached object was published on, so its topic exists and an
+	// off may be published even where `caps` now retracts it.
+	let mut seen_on = cache.ai_objects().unwrap_or_default();
+	publish_ai_objects(
+		publisher,
+		cache,
+		caps,
+		AiBaseline::Cache,
+		&mut seen_on,
+		AiObjects::default(),
+	)
+	.await;
+}
+
 /// Session-start AI reset: publish `off` for every object whose topic
 /// `caps` keeps (retracted topics are cleared by discovery), clearing a
 /// retained `on` an earlier session or process left, and cache the
@@ -135,16 +161,28 @@ async fn reset_ai_objects(
 	(reset, seen_on)
 }
 
+/// How long a motion subscription must last before its failure restarts
+/// the resubscribe backoff from 1 s.
+const MOTION_STREAM_STABLE: Duration = Duration::from_secs(60);
+
+/// How long active motion holds the wake lock without a fresh Start.
+/// Cameras repeat Start in every push while motion lasts, so this much
+/// silence means the Stop was lost; without it a lost Stop would keep a
+/// battery camera awake until the session ends some other way.
+pub(crate) const MOTION_START_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Wake lock the motion listener holds for motion and doorbell presses.
 ///
-/// A motion Start holds it until `hold` after the matching Stop. A press
-/// holds it for `hold` from the press, and leaves an active motion's
-/// release to its Stop. `release_at` is `Some` only inside a hold
-/// window, so a held guard with no deadline means motion is active.
+/// A motion Start holds it until `hold` after the matching Stop, or
+/// [`MOTION_START_TIMEOUT`] after the last Start if no Stop arrives. A
+/// press holds it for `hold` from the press, and leaves an active
+/// motion's release to its Stop. `motion_until` is `Some` exactly while
+/// motion is active; `release_at` only inside a hold window.
 struct EventWakeHold {
 	wake_lock: WakeLockCounter,
 	hold: Duration,
 	guard: Option<WakeLockGuard>,
+	motion_until: Option<tokio::time::Instant>,
 	release_at: Option<tokio::time::Instant>,
 }
 
@@ -154,6 +192,7 @@ impl EventWakeHold {
 			wake_lock,
 			hold,
 			guard: None,
+			motion_until: None,
 			release_at: None,
 		}
 	}
@@ -164,14 +203,22 @@ impl EventWakeHold {
 		}
 	}
 
-	/// Motion started: cancel any pending release and hold the lock.
+	/// When the lock goes next, absent new events.
+	fn deadline(&self) -> Option<tokio::time::Instant> {
+		self.motion_until.or(self.release_at)
+	}
+
+	/// Motion started (or repeated): cancel any pending release and
+	/// hold the lock, refreshing the lost-Stop deadline.
 	fn motion_start(&mut self) {
 		self.release_at = None;
+		self.motion_until = Some(tokio::time::Instant::now() + MOTION_START_TIMEOUT);
 		self.acquire();
 	}
 
 	/// Motion stopped: release `hold` from now.
 	fn motion_stop(&mut self) {
+		self.motion_until = None;
 		if self.guard.is_some() {
 			self.release_at = Some(tokio::time::Instant::now() + self.hold);
 		}
@@ -180,9 +227,8 @@ impl EventWakeHold {
 	/// Doorbell pressed: hold the lock, releasing `hold` from now unless
 	/// motion is active.
 	fn doorbell_press(&mut self) {
-		let motion_active = self.guard.is_some() && self.release_at.is_none();
 		self.acquire();
-		if !motion_active {
+		if self.motion_until.is_none() {
 			self.release_at = Some(tokio::time::Instant::now() + self.hold);
 		}
 	}
@@ -199,9 +245,10 @@ impl EventWakeHold {
 		}
 	}
 
-	/// Hold window expired: drop the lock.
+	/// Hold window expired, or active motion went silent: drop the lock.
 	fn release(&mut self) {
 		self.guard = None;
+		self.motion_until = None;
 		self.release_at = None;
 	}
 }
@@ -342,10 +389,10 @@ pub async fn motion_listener(
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	// Sustained network flap with N cameras × M retries/min produces a
-	// firehose of warns and pointless reconnect attempts. Use the same
-	// 1 → 60 s exponential ladder as the camera reconnect path; reset
-	// to 1 s every time we successfully subscribe so a transient blip
-	// doesn't permanently inflate the retry interval.
+	// firehose of warns and pointless reconnect attempts. Use a 1 → 60 s
+	// exponential ladder, reset only after a subscription that lasted
+	// `MOTION_STREAM_STABLE`: a stream that dies right after subscribing
+	// would otherwise resubscribe every second.
 	let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
 	// Last reported AI object states and the objects published `on`
 	// this session, both starting from the session-start reset.
@@ -362,6 +409,12 @@ pub async fn motion_listener(
 	loop {
 		let mut motion_data = match bc_camera.listen_on_motion().await {
 			Ok(md) => md,
+			Err(e @ CoreError::MissingAbility { .. }) => {
+				// Retrying can't grant the ability; same as the
+				// floodlight listener.
+				tracing::debug!(camera = %camera_name, error = %e, "Motion listener not supported");
+				return;
+			}
 			Err(e) => {
 				tracing::warn!(camera = %camera_name, error = %e, "Failed to start motion listener");
 				if !backoff.sleep_with_cancel(&cancel).await {
@@ -370,8 +423,7 @@ pub async fn motion_listener(
 				continue;
 			}
 		};
-		// Subscribed cleanly — fast retries again on the next failure.
-		backoff.reset();
+		let subscribed_at = tokio::time::Instant::now();
 		// This listener owns the press edge: `listen_on_motion` reports
 		// the raw `visitor` state. The edge starts again on each
 		// subscribe. A press published within `held_press_window` (e.g.
@@ -399,16 +451,16 @@ pub async fn motion_listener(
 			// release is scheduled, point it 24 h out as a placeholder
 			// — the `if release_at.is_some()` guard disables that arm,
 			// so the placeholder is never actually reached.
-			let release_at = wake_hold.release_at;
+			let release_at = wake_hold.deadline();
 			let release_deadline = release_at
 				.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
 
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = tokio::time::sleep_until(release_deadline), if release_at.is_some() => {
-					// Hold-down expired with no new event — drop the
-					// wake-lock guard so the camera becomes eligible
-					// for idle disconnect.
+					// Hold-down expired, or motion went silent without a
+					// Stop — drop the wake-lock guard so the camera
+					// becomes eligible for idle disconnect.
 					wake_hold.release();
 				}
 				// Every update is consumed in order: `next_motion()`
@@ -437,9 +489,13 @@ pub async fn motion_listener(
 			}
 		}
 
-		// Inner loop bailed (camera-side error). Re-subscribe with the
-		// same exponential ladder; `backoff` was reset on the prior
-		// successful subscribe so this is a fresh 1 s start.
+		// Inner loop bailed (camera-side error). Release the dead
+		// subscription before the backoff. A long-lived stream earns a
+		// fresh 1 s start; one that died quickly keeps climbing.
+		drop(motion_data);
+		if subscribed_at.elapsed() >= MOTION_STREAM_STABLE {
+			backoff.reset();
+		}
 		if !backoff.sleep_with_cancel(&cancel).await {
 			break;
 		}
@@ -636,7 +692,7 @@ pub async fn preview_poller(
 	cancel: CancellationToken,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
-	let overlay_cache = OverlayCache::new();
+	let overlay_cache = Arc::new(OverlayCache::new());
 	let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
 	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	// Drop the immediate first tick to avoid an unexpected burst on connect.
@@ -692,12 +748,23 @@ pub async fn preview_poller(
 				// camera PreviewState is non-Live. Gated by
 				// `pause.preview_overlay` (default true) so operators can
 				// opt out of the image/ab_glyph dependency at runtime.
-				let payload = crate::preview_overlay::rendered_preview(
-					jpeg_bytes,
-					preview_overlay_enabled,
-					*preview_state_rx.borrow_and_update(),
-					Some(&overlay_cache),
-				);
+				//
+				// The render decodes and re-encodes the JPEG, so it runs
+				// on the blocking pool rather than a runtime worker.
+				let state = *preview_state_rx.borrow_and_update();
+				let payload = if preview_overlay_enabled {
+					let cache = Arc::clone(&overlay_cache);
+					let render = tokio::task::spawn_blocking(move || cache.render(&jpeg_bytes, state));
+					match render.await {
+						Ok(rendered) => rendered,
+						Err(e) => {
+							tracing::warn!(camera = %camera_name, error = %e, "preview overlay render failed");
+							continue;
+						}
+					}
+				} else {
+					jpeg_bytes
+				};
 
 				if let Err(e) = publisher.publish_preview(&payload).await {
 					// If the broker advertises a lower MaxPacketSize the
@@ -729,6 +796,10 @@ pub async fn floodlight_poller(
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+	// As in battery_poller: keep polls a full interval apart after a
+	// stalled one, and skip the tick that lands as the session starts.
+	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	ticker.tick().await;
 
 	loop {
 		tokio::select! {
@@ -806,9 +877,15 @@ pub async fn publish_pir_state(
 	mqtt: SharedMqttClient,
 	topic_prefix: String,
 	status_cache: Arc<StatusCache>,
+	cancel: CancellationToken,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
-	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_pirstate()).await {
+	let Some(result) =
+		cancellable(&cancel, Duration::from_secs(10), bc_camera.get_pirstate()).await
+	else {
+		return;
+	};
+	match result {
 		Ok(Ok(pir_state)) => {
 			let enabled = pir_state.enable == 1;
 			tracing::debug!(camera = %camera_name, enabled, "PIR state");
@@ -830,7 +907,7 @@ pub async fn publish_pir_state(
 /// `cancel` fires: `None` when cancelled, else the timeout result. A
 /// poll in flight at shutdown or session end must not hold teardown
 /// for its whole timeout — the camera may already be logged out.
-async fn cancellable<F: std::future::Future>(
+pub(crate) async fn cancellable<F: std::future::Future>(
 	cancel: &CancellationToken,
 	limit: Duration,
 	request: F,
@@ -1880,6 +1957,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		)
 		.await;
 
@@ -2650,6 +2728,69 @@ mod tests {
 		rig.stop().await;
 	}
 
+	/// A lost Stop must not hold the wake lock for the rest of the
+	/// session: active motion with no fresh Start releases after
+	/// `MOTION_START_TIMEOUT`, and each repeated Start refreshes it.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_releases_wake_hold_when_stop_never_arrives() {
+		let rig = AlarmRig::spawn_with(
+			Duration::from_secs(30),
+			CameraCapabilities::default(),
+			empty_cache(),
+		);
+		rig.send(now_start(), None, false).await;
+		assert_eq!(rig.wake_lock.count(), 1);
+		let almost = MOTION_START_TIMEOUT - Duration::from_secs(1);
+		tokio::time::sleep(almost).await;
+		rig.send(now_start(), None, false).await;
+		tokio::time::sleep(almost).await;
+		assert_eq!(
+			rig.wake_lock.count(),
+			1,
+			"a repeated Start refreshes the deadline"
+		);
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert_eq!(rig.wake_lock.count(), 0, "silent motion releases the lock");
+		rig.stop().await;
+	}
+
+	/// Teardown clears motion and AI objects left on, once; topics
+	/// already off stay quiet.
+	#[tokio::test]
+	async fn clear_alarm_state_turns_off_what_is_on() {
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let publisher = StatusPublisher::new(&mqtt, "bairelay", "cam1");
+		let cache = empty_cache();
+		cache.set_motion(true);
+		cache.set_ai_objects([AiObject::Person].into_iter().collect());
+		let caps = CameraCapabilitiesView::from(CameraCapabilities::default());
+
+		clear_alarm_state(&publisher, &cache, caps).await;
+		clear_alarm_state(&publisher, &cache, caps).await;
+
+		let rows: Vec<_> = mock
+			.published()
+			.into_iter()
+			.map(|(t, p, r)| (t, String::from_utf8(p).unwrap(), r))
+			.collect();
+		assert_eq!(
+			rows,
+			[
+				(
+					"bairelay/cam1/status/motion".to_string(),
+					"off".to_string(),
+					true
+				),
+				(
+					"bairelay/cam1/status/ai/person".to_string(),
+					"off".to_string(),
+					true
+				),
+			]
+		);
+		assert_eq!(cache.motion(), Some(false));
+	}
+
 	/// AI confirmed absent: only an `on` (evidence) and its later `off`
 	/// publish.
 	#[tokio::test(start_paused = true)]
@@ -2889,7 +3030,7 @@ mod tests {
 		tokio::time::sleep(Duration::from_secs(20)).await;
 		rig.send(now_start(), None, false).await;
 		rig.send(now_start(), None, false).await;
-		tokio::time::sleep(Duration::from_secs(60)).await;
+		tokio::time::sleep(MOTION_START_TIMEOUT - Duration::from_secs(10)).await;
 		assert_eq!(rig.wake_lock.count(), 1, "motion active again");
 
 		rig.send(now_stop(), None, false).await;
@@ -3010,6 +3151,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		)
 		.await;
 		assert!(
@@ -3245,6 +3387,111 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(50)).await;
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+	}
+
+	/// A camera without the motion ability is not resubscribed forever.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_returns_on_missing_ability() {
+		let fake = FakeCameraBuilder::new()
+			.with_motion_stream_error(|| {
+				bairelay_neolink_core::bc_protocol::Error::MissingAbility {
+					name: "alarm".into(),
+					requested: "read".into(),
+					actual: "none".into(),
+				}
+			})
+			.build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		tokio::time::timeout(
+			Duration::from_secs(60),
+			motion_listener(
+				"cam1".to_string(),
+				fake,
+				mqtt,
+				"bairelay".to_string(),
+				WakeLockCounter::new(),
+				CancellationToken::new(),
+				Duration::from_secs(30),
+				empty_cache(),
+				CameraCapabilities::default(),
+				None,
+			),
+		)
+		.await
+		.expect("MissingAbility must end the listener");
+	}
+
+	/// A stream that fails right after subscribing keeps climbing the
+	/// backoff (subscribes at 0, 1, 3 and 7 s) instead of resubscribing
+	/// every second.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_backs_off_a_stream_that_dies_at_once() {
+		let mut builder = FakeCameraBuilder::new();
+		let mut txs = Vec::new();
+		for _ in 0..12 {
+			let (tx, rx) = tokio::sync::mpsc::channel::<AlarmItem>(1);
+			tx.try_send(Err(bairelay_neolink_core::bc_protocol::Error::Other(
+				"dies at once",
+			)))
+			.unwrap();
+			txs.push(tx);
+			builder = builder.with_motion_stream(
+				bairelay_neolink_core::bc_protocol::MotionData::test_new_alarm(rx),
+			);
+		}
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let task = tokio::spawn(motion_listener(
+			"cam1".to_string(),
+			builder.build(),
+			mqtt,
+			"bairelay".to_string(),
+			WakeLockCounter::new(),
+			cancel.clone(),
+			Duration::from_secs(30),
+			empty_cache(),
+			CameraCapabilities::default(),
+			None,
+		));
+
+		tokio::time::sleep(Duration::from_secs(10)).await;
+		// A consumed stream's receiver is dropped when it fails.
+		let subscribes = txs.iter().filter(|tx| tx.is_closed()).count();
+		assert_eq!(subscribes, 4);
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	/// Like the battery poller, the floodlight poller skips the tick that
+	/// lands as the session starts and polls one interval later.
+	#[tokio::test(start_paused = true)]
+	async fn floodlight_poller_skips_the_session_start_tick() {
+		use std::sync::atomic::AtomicUsize;
+		let polls = Arc::new(AtomicUsize::new(0));
+		let counted = Arc::clone(&polls);
+		let fake = FakeCameraBuilder::new()
+			.with_is_floodlight_tasks_enabled(move || {
+				counted.fetch_add(1, Ordering::SeqCst);
+				Ok(true)
+			})
+			.build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let task = tokio::spawn(floodlight_poller(
+			"cam1".to_string(),
+			fake,
+			mqtt,
+			"bairelay".to_string(),
+			1_000,
+			cancel.clone(),
+			empty_cache(),
+		));
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		assert_eq!(polls.load(Ordering::SeqCst), 0);
+		tokio::time::sleep(Duration::from_millis(600)).await;
+		assert_eq!(polls.load(Ordering::SeqCst), 1);
+		cancel.cancel();
+		task.await.unwrap();
 	}
 
 	/// `floodlight_listener` with a driver that errors on
@@ -3604,6 +3851,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		));
 		tokio::time::advance(Duration::from_secs(11)).await;
 		let _ = task.await;

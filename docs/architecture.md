@@ -186,14 +186,16 @@ Two separate notifications:
 
 Both use `Notify::notify_one()` (not `notify_waiters()`) so a permit is stored when no waiter is registered — late `.notified().await` calls still fire. The grace-period timer listens on `notify_release` and starts a countdown; any new `acquire()` before the countdown expires resets it.
 
-The watchdog also monitors wake-lock state and can force-disconnect via a `disconnect_signal: Notify` on each camera.
+The watchdog also monitors wake-lock state and can force-disconnect via `request_disconnect()`, which cancels the camera's live session token (a child of the camera token). Between sessions it is a no-op, so a request that lands during teardown can't end the next session.
 
 ### Watchdog
 
 A tokio task that runs every 30 seconds. For each camera with `idle_disconnect` enabled:
 
 1. If connected with zero wake locks held, call `request_disconnect()` to cancel the session.
-2. If there are stream sources with no subscribers older than `stream_prune_grace_secs` (default 30), drop them. The default is intentionally ≤ each camera's `idle_disconnect_timeout_secs` (default 45) so a cached `StreamSource` can never outlive the Baichuan session that feeds it.
+2. If there are stream sources with no subscribers older than `stream_prune_grace_secs` (default 30), drop them. The default is intentionally ≤ each camera's `idle_disconnect_timeout_secs` (default 45) so a cached `StreamSource` can never outlive the Baichuan session that feeds it. Sources whose reader has exited are dropped on the same sweep. The sweep holds the per-camera create lock until each dropped reader has finished its `stop_video`, so a new SETUP can't overlap it with `start_video`.
+
+A source whose reader exits (`start_video` failed or timed out, the stream ended, the translator panicked) is marked dead. `CameraHandle::stream_source` replaces a dead entry instead of returning it, and because `StreamSource` keeps only a weak broadcast sender, the channel closes with the reader and its RTSP sessions end instead of hanging.
 
 The watchdog is a safety net, not the primary lifecycle mechanism.
 
@@ -254,7 +256,9 @@ Production impls forward to the concrete types (`BcCamera`, `Discovery`, `Stream
 - **Library crates** (`core`, `rtsp`, `mqtt`, `wake-server`): use `thiserror` with typed error enums. Each crate defines its own error type.
 - **Binary crate** (`bairelay`): uses `anyhow` for top-level error propagation with context.
 - **Connection failures**: logged and retried with exponential backoff. Never crash the process.
-- **Authentication failures**: stop retrying permanently. Don't hammer the camera with bad credentials.
+- **Authentication failures**: retried on a long backoff (5, 10, 20, then every 30 min), logged at error with the retry delay. Don't hammer the camera with bad credentials, but recover without a restart once they're fixed.
+- **Reconnect backoff**: 2 s doubling to 60 s. It restarts from 2 s only after a session that stayed up 60 s or ended on request (grace period, watchdog), so a camera that drops right after login can't drive a reconnect storm.
+- **Daemon lifetime**: the orchestrator returns only once shutdown is requested, so the process never exits 0 on its own.
 - **Protocol errors**: logged at warn / error. Malformed packets from cameras are discarded, not propagated.
 - **Configuration errors**: fail fast at startup with clear messages.
 
