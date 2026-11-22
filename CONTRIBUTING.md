@@ -15,7 +15,7 @@ That's it for the read-only contributor experience. No GStreamer, no OpenSSL, no
 
 ## Prerequisites
 
-- A recent stable Rust toolchain (1.74+). Install via [rustup](https://rustup.rs/).
+- A recent stable Rust toolchain (1.100+). Install via [rustup](https://rustup.rs/).
 - A C toolchain for `aws-lc-rs` (the rustls crypto provider):
   - **Linux**: `build-essential` (Debian / Ubuntu) or `base-devel` (Arch) or the equivalent in your distro.
   - **macOS**: Xcode Command Line Tools (`xcode-select --install`).

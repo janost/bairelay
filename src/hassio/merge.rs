@@ -367,7 +367,7 @@ mod tests {
 	#[test]
 	fn end_to_end_merge_validates_clean() {
 		use crate::hassio::options::{
-			build_base_config, HassioCamera, HassioOptions, MqttServiceFlags,
+			HassioCamera, HassioOptions, MqttServiceFlags, build_base_config,
 		};
 
 		let opts = HassioOptions {

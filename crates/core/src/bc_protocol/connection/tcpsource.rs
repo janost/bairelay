@@ -1,6 +1,6 @@
-use crate::bc::model::*;
 use crate::Result;
-use crate::{bc::codex::BcCodex, Credentials};
+use crate::bc::model::*;
+use crate::{Credentials, bc::codex::BcCodex};
 use delegate::delegate;
 use futures::{sink::Sink, stream::Stream};
 use std::net::SocketAddr;

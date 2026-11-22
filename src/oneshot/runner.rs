@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bairelay_neolink_core::bc_protocol::BcCamera;
 use futures::future::BoxFuture;
 use tokio::time::timeout;

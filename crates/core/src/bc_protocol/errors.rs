@@ -542,8 +542,8 @@ mod tests {
 		let err: Error = int_err.into();
 		assert_eq!(format!("{}", err), "Error in try from NonZeroInt");
 
-		let gen: Error = cookie_factory::GenError::BufferTooSmall(1).into();
-		assert_eq!(format!("{}", gen), "Cookie GenError");
+		let err: Error = cookie_factory::GenError::BufferTooSmall(1).into();
+		assert_eq!(format!("{}", err), "Cookie GenError");
 
 		let (_tx, mut rx) = tokio::sync::mpsc::channel::<u8>(1);
 		rx.close();
@@ -595,19 +595,19 @@ mod tests {
 		assert!(matches!(e, Error::NomIncomplete(1)));
 		// Error(_) → NomError
 		let raw: &[u8] = &[];
-		let e: Error = nom::Err::Error::<NomErrorType>(nom::error::VerboseError {
+		let e: Error = nom::Err::Error::<NomErrorType>(nom_language::error::VerboseError {
 			errors: vec![(
 				raw,
-				nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
+				nom_language::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
 			)],
 		})
 		.into();
 		assert!(matches!(e, Error::NomError(_)));
 		// Failure(_) → NomError
-		let e: Error = nom::Err::Failure::<NomErrorType>(nom::error::VerboseError {
+		let e: Error = nom::Err::Failure::<NomErrorType>(nom_language::error::VerboseError {
 			errors: vec![(
 				raw,
-				nom::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
+				nom_language::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
 			)],
 		})
 		.into();

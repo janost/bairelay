@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use rustls::RootCertStore;
 
 #[derive(thiserror::Error, Debug)]
 pub enum TlsConfigError {

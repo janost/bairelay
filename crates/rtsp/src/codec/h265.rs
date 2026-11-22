@@ -12,7 +12,7 @@
 //! through HA's `ffmpeg:` re-publish wrapper and exit go2rtc's frame.jpeg
 //! transcoder with status 183.
 
-use crate::rtp::{build_packet, RtpCounters};
+use crate::rtp::{RtpCounters, build_packet};
 
 /// Dynamic RTP payload type used by bairelay for H.265.
 pub const H265_PAYLOAD_TYPE: u8 = 96;

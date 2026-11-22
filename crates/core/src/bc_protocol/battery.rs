@@ -7,14 +7,14 @@
 
 use super::{BcCamera, PrintFormat, Result};
 use crate::{
-	bc::{model::*, xml::BatteryInfo},
 	Error,
+	bc::{model::*, xml::BatteryInfo},
 };
 
 #[cfg(test)]
 use crate::bc::xml::BcXml;
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_xml, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_xml};
 
 impl BcCamera {
 	/// Create a handller to respond to battery messages

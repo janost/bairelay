@@ -8,8 +8,8 @@
 //! and the cancel token, so the caller's accept loop never waits on it
 //! and nothing outlives shutdown.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;

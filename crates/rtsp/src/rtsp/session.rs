@@ -34,8 +34,7 @@ pub enum Transition {
 /// its lifetime. RFC 7826 §18.49 merely requires "random … at least eight
 /// octets"; we exceed that comfortably.
 pub fn new_session_id() -> String {
-	use rand::Rng;
-	let bytes: [u8; 16] = rand::thread_rng().gen();
+	let bytes: [u8; 16] = rand::random();
 	bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

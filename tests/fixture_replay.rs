@@ -31,10 +31,10 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use bairelay::audio_presence::AudioPresence;
-use bairelay::stream_source::{apply_bcmedia_packet, GapState, StreamTranslatorState};
+use bairelay::stream_source::{GapState, StreamTranslatorState, apply_bcmedia_packet};
 use bairelay_rtsp::buffer::LastFrameBuffer;
-use bairelay_rtsp::codec::nal::{H264NalType, H265NalType};
 use bairelay_rtsp::codec::VideoCodec;
+use bairelay_rtsp::codec::nal::{H264NalType, H265NalType};
 use bairelay_rtsp::provider::{
 	Frame, SessionGuard, StreamError, StreamProvider, SubscriptionHandle,
 };
@@ -44,8 +44,8 @@ use bairelay_rtsp::server::rtcp::SR_INTERVAL;
 use bairelay_rtsp::server::{RtspServer, ServerConfig};
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
 
-use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe, VideoType};
 use bairelay_neolink_core::Error as NeolinkError;
+use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe, VideoType};
 
 /// Capacity of the replay broadcast channel. Mirrors production
 /// (`BROADCAST_CAPACITY` in `src/stream_source.rs`) so backpressure
@@ -1240,7 +1240,7 @@ impl WireReader {
 /// never emits either (see `crates/rtsp/src/rtp.rs`).
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // `ssrc` is decoded for completeness / future-proofing
-					// even though the current assertions don't inspect it.
+// even though the current assertions don't inspect it.
 struct RtpHeader {
 	version: u8,
 	marker: bool,
@@ -1301,7 +1301,7 @@ fn decode_rtp_header(pkt: &[u8]) -> Option<RtpHeader> {
 /// `crates/rtsp/src/server/packetizer.rs`), so we don't handle it.
 #[derive(Debug)]
 #[allow(dead_code)] // Body bytes are parsed for completeness; the assertions
-					// in this file only inspect NAL types, not bodies.
+// in this file only inspect NAL types, not bodies.
 enum H265Fragment {
 	Single(Vec<u8>),
 	FuStart { nal_header: [u8; 2], body: Vec<u8> },

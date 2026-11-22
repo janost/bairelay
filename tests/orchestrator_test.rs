@@ -1,7 +1,7 @@
 use tokio_util::sync::CancellationToken;
 
-use bairelay::config::test_helpers::{minimal_camera_config, two_camera_config};
 use bairelay::config::Config;
+use bairelay::config::test_helpers::{minimal_camera_config, two_camera_config};
 
 #[tokio::test]
 async fn camera_state_starts_disconnected() {

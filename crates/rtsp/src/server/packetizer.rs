@@ -1,8 +1,8 @@
 //! Frame → RTP dispatch for session send loops.
 
+use crate::codec::VideoCodec;
 use crate::codec::h264::{self, DEFAULT_MTU};
 use crate::codec::h265;
-use crate::codec::VideoCodec;
 use crate::provider::{AudioPayload, Frame};
 use crate::rtp::RtpCounters;
 
@@ -70,7 +70,7 @@ pub fn dispatch(frame: &Frame, counters: &mut RtpCounters) -> Vec<Vec<u8>> {
 }
 
 fn dispatch_audio(payload: &AudioPayload, pts: u32, counters: &mut RtpCounters) -> Vec<Vec<u8>> {
-	use crate::codec::aac::{build_au_hbr_payload, AAC_PAYLOAD_TYPE};
+	use crate::codec::aac::{AAC_PAYLOAD_TYPE, build_au_hbr_payload};
 	use crate::codec::g711::G711_PAYLOAD_TYPE;
 	use crate::rtp::build_packet;
 

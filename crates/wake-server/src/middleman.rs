@@ -11,10 +11,10 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::WakeServerError;
 use crate::packet::{decode_discovery, encode_discovery};
 use crate::registry::SessionAnchors;
 use crate::route::advertise_ip;
-use crate::WakeServerError;
 
 pub(crate) async fn run(
 	sock: Arc<UdpSocket>,

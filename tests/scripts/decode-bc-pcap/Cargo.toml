@@ -1,7 +1,7 @@
 [package]
 name = "decode-bc-pcap"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 description = "Offline decoder for captured Reolink Baichuan-over-UDP sessions. Replays tcpdump captures through bairelay_neolink_core's Bc / BcUdp parsers + AES-CFB and prints decrypted Bc messages."
 

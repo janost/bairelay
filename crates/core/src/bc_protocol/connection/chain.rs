@@ -76,33 +76,29 @@ where
 	let mut map = Some(map);
 	let mut relay = Some(relay);
 
-	if flags.local {
-		if let Some(fut) = local.take() {
-			if let Ok(Ok(v)) = timeout(per_step_timeout, fut).await {
-				return Ok((DiscoveryStep::Local, v));
-			}
-		}
+	if flags.local
+		&& let Some(fut) = local.take()
+		&& let Ok(Ok(v)) = timeout(per_step_timeout, fut).await
+	{
+		return Ok((DiscoveryStep::Local, v));
 	}
-	if flags.remote {
-		if let Some(fut) = remote.take() {
-			if let Ok(Ok(v)) = timeout(per_step_timeout, fut).await {
-				return Ok((DiscoveryStep::Remote, v));
-			}
-		}
+	if flags.remote
+		&& let Some(fut) = remote.take()
+		&& let Ok(Ok(v)) = timeout(per_step_timeout, fut).await
+	{
+		return Ok((DiscoveryStep::Remote, v));
 	}
-	if flags.map {
-		if let Some(fut) = map.take() {
-			if let Ok(Ok(v)) = timeout(per_step_timeout, fut).await {
-				return Ok((DiscoveryStep::Map, v));
-			}
-		}
+	if flags.map
+		&& let Some(fut) = map.take()
+		&& let Ok(Ok(v)) = timeout(per_step_timeout, fut).await
+	{
+		return Ok((DiscoveryStep::Map, v));
 	}
-	if flags.relay {
-		if let Some(fut) = relay.take() {
-			if let Ok(Ok(v)) = timeout(per_step_timeout, fut).await {
-				return Ok((DiscoveryStep::Relay, v));
-			}
-		}
+	if flags.relay
+		&& let Some(fut) = relay.take()
+		&& let Ok(Ok(v)) = timeout(per_step_timeout, fut).await
+	{
+		return Ok((DiscoveryStep::Relay, v));
 	}
 
 	Err(Error::DiscoveryTimeout)
@@ -111,9 +107,9 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::bc_protocol::resolution::{discovery_flags_for, DiscoveryMethods};
-	use std::sync::atomic::{AtomicU8, Ordering};
+	use crate::bc_protocol::resolution::{DiscoveryMethods, discovery_flags_for};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicU8, Ordering};
 	use tokio::time::Duration as TkDuration;
 
 	// Helper: AtomicU8 bitmask tracking which branches actually ran.

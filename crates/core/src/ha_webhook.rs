@@ -14,8 +14,8 @@
 //! Every parser here is pure and panic-free on any input. Each input
 //! is size-bounded by a named limit before any parsing work.
 
-use crate::bc::xml::{parse_lossy_utf8, AlarmEvent, AlarmEventList, BcXml};
-use rand::RngCore;
+use crate::bc::xml::{AlarmEvent, AlarmEventList, BcXml, parse_lossy_utf8};
+use rand::TryRng;
 use serde_json::{Map, Value};
 
 /// Largest accepted header block in bytes: the request line, every
@@ -31,11 +31,13 @@ pub const ALARM_CMD: u64 = 33;
 pub const TOKEN_HEX_LEN: usize = 32;
 
 /// A fresh 128-bit token as [`TOKEN_HEX_LEN`] lowercase hex digits: 16
-/// bytes from the operating system's random source (`OsRng`).
+/// bytes from the operating system's random source (`SysRng`).
 pub fn random_hex_token() -> String {
 	use std::fmt::Write as _;
 	let mut bytes = [0u8; TOKEN_HEX_LEN / 2];
-	rand::rngs::OsRng.fill_bytes(&mut bytes);
+	rand::rngs::SysRng
+		.try_fill_bytes(&mut bytes)
+		.expect("OS random source unavailable");
 	bytes
 		.iter()
 		.fold(String::with_capacity(TOKEN_HEX_LEN), |mut token, b| {
@@ -375,10 +377,10 @@ pub fn alarm_events_from_xml(xml: &str) -> Option<Vec<AlarmEvent>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::bc_protocol::{classify_alarm_events, MotionStatus};
+	use crate::bc_protocol::{MotionStatus, classify_alarm_events};
+	use HttpRequestError::*;
 	use proptest::prelude::*;
 	use std::time::Instant;
-	use HttpRequestError::*;
 
 	/// A `POST` to `/hook/abc` with `body` and a matching `Content-Length`.
 	fn post(body: &str) -> Vec<u8> {

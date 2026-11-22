@@ -31,7 +31,7 @@
 //! orchestration lives in `login.rs`.
 
 use super::credentials::Credentials;
-use super::{md5_string, Error, Truncate};
+use super::{Error, Truncate, md5_string};
 use crate::bc::crypto::EncryptionProtocol;
 use base64::Engine as _;
 
@@ -65,11 +65,7 @@ pub(crate) fn parse_challenge(payload: &[u8]) -> Option<(String, String)> {
 			.map(|&b| b as char)
 			.collect();
 		let s = s.trim().to_string();
-		if s.is_empty() {
-			None
-		} else {
-			Some(s)
-		}
+		if s.is_empty() { None } else { Some(s) }
 	};
 	Some((slot(0)?, slot(CHALLENGE_SLOT)?))
 }

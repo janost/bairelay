@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
 use bairelay_neolink_core::bc_protocol::{BcCamera, CameraDriver};
@@ -525,7 +525,7 @@ impl CameraHandle {
 
 	/// The camera's configured `address` when it is an IP literal.
 	pub fn configured_ip(&self) -> Option<IpAddr> {
-		use crate::bc_opts::{parse_address, AddressHost};
+		use crate::bc_opts::{AddressHost, parse_address};
 		match parse_address(self.config.address.as_deref()?).ok()?.host {
 			AddressHost::Ip(ip) => Some(ip),
 			AddressHost::Name(_) => None,
@@ -1613,10 +1613,10 @@ async fn aggregate_preview_state_loop(
 fn is_login_failure(err: &anyhow::Error) -> bool {
 	use bairelay_neolink_core::Error as CoreError;
 	for cause in err.chain() {
-		if let Some(core) = cause.downcast_ref::<CoreError>() {
-			if matches!(core, CoreError::AuthFailed | CoreError::CameraLoginFail) {
-				return true;
-			}
+		if let Some(core) = cause.downcast_ref::<CoreError>()
+			&& matches!(core, CoreError::AuthFailed | CoreError::CameraLoginFail)
+		{
+			return true;
 		}
 	}
 	let msg = format!("{:?}", err);
@@ -3503,12 +3503,10 @@ mod tests {
 		cfg: Option<bairelay_neolink_core::bc::xml::HaCfg>,
 	) -> (
 		Arc<std::sync::atomic::AtomicUsize>,
-		impl Fn() -> Result<
-				Option<bairelay_neolink_core::bc::xml::HaCfg>,
-				bairelay_neolink_core::Error,
-			> + Send
-			+ Sync
-			+ 'static,
+		impl Fn() -> Result<Option<bairelay_neolink_core::bc::xml::HaCfg>, bairelay_neolink_core::Error>
+		+ Send
+		+ Sync
+		+ 'static,
 	) {
 		let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 		let counter = Arc::clone(&reads);

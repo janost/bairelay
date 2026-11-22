@@ -1,8 +1,8 @@
 use super::model::*;
 use cookie_factory::bytes::*;
 use cookie_factory::sequence::tuple;
-use cookie_factory::{combinator::*, gen};
 use cookie_factory::{GenError, SerializeFn, WriteContext};
+use cookie_factory::{combinator::*, r#gen};
 use log::error;
 use std::io::Write;
 
@@ -23,7 +23,7 @@ impl Bc {
 		let payload_offset;
 
 		match &self.body {
-			BcBody::ModernMsg(ref modern) => {
+			BcBody::ModernMsg(modern) => {
 				let ext_bytes: Option<Vec<u8>> = match &modern.extension {
 					Some(ext) => Some(ext.serialize(vec![]).map_err(|e| {
 						error!("Extension XML serialize failed: {e}");
@@ -42,7 +42,7 @@ impl Bc {
 				let payload_is_xml = matches!(&modern.payload, Some(BcPayloads::BcXml(_)));
 
 				// First serialize ext (already encrypted below).
-				let (temp_buf, ext_len) = gen(
+				let (temp_buf, ext_len) = r#gen(
 					opt_ref(&ext_bytes, |b| {
 						bc_ext_bytes(self.meta.channel_id as u32, b, encryption_protocol)
 					}),
@@ -62,7 +62,7 @@ impl Bc {
 				};
 
 				// Now get the payload part of the body and add to ext_buf
-				let (temp_buf, _) = gen(
+				let (temp_buf, _) = r#gen(
 					opt_ref(&payload_bytes, |b| {
 						bc_payload_bytes(
 							self.meta.channel_id as u32,
@@ -76,8 +76,8 @@ impl Bc {
 				body_buf = temp_buf;
 			}
 
-			BcBody::LegacyMsg(ref legacy) => {
-				let (buf, _) = gen(bc_legacy(legacy), vec![]).map_err(|e| {
+			BcBody::LegacyMsg(legacy) => {
+				let (buf, _) = r#gen(bc_legacy(legacy), vec![]).map_err(|e| {
 					error!("Send error: {}", e);
 					e
 				})?;
@@ -89,7 +89,7 @@ impl Bc {
 		// Now have enough info to create the header
 		let header = BcHeader::from_meta(&self.meta, body_buf.len() as u32, payload_offset);
 
-		let (buf, _n) = gen(tuple((bc_header(&header), slice(body_buf))), buf)?;
+		let (buf, _n) = r#gen(tuple((bc_header(&header), slice(body_buf))), buf)?;
 
 		Ok(buf)
 	}
@@ -192,7 +192,7 @@ where
 	S: Fn(&'a T) -> F + 'a,
 {
 	move |buf: WriteContext<W>| {
-		if let Some(ref val) = opt {
+		if let Some(val) = opt {
 			ser(val)(buf)
 		} else {
 			do_nothing()(buf)

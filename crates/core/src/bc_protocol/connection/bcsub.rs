@@ -1,12 +1,12 @@
 use super::BcConnection;
 use crate::bcmedia::codex::BcMediaCodex;
-use crate::{bc::model::*, bcmedia::model::*, Error, Result};
+use crate::{Error, Result, bc::model::*, bcmedia::model::*};
 use futures::stream::{Stream, TryStreamExt};
 use std::io::{Error as IoError, Result as IoResult};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::codec::FramedRead;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
@@ -125,8 +125,8 @@ impl<'a> BcSubscription<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::bc_protocol::connection::mock::MockConnection;
 	use crate::bc_protocol::BcCamera;
+	use crate::bc_protocol::connection::mock::MockConnection;
 
 	/// Drive the `send` debug-path branch: `msg_num = None` means the
 	/// subscription hasn't yet committed to a specific request number,

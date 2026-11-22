@@ -1,9 +1,9 @@
 use super::{crc::calc_crc, model::*, xml_crypto::encrypt};
 use crate::Error;
+use cookie_factory::SerializeFn;
 use cookie_factory::bytes::*;
 use cookie_factory::sequence::tuple;
-use cookie_factory::SerializeFn;
-use cookie_factory::{combinator::*, gen};
+use cookie_factory::{combinator::*, r#gen};
 use log::error;
 use std::io::Write;
 
@@ -36,17 +36,17 @@ impl BcUdp {
 				})?;
 				let xml_payload = encrypt(payload.tid, &xml_bytes);
 				let xml_len = len_as_u32(xml_payload.len())?;
-				gen(bcudp_disc(payload, &xml_payload, xml_len), buf)?
+				r#gen(bcudp_disc(payload, &xml_payload, xml_len), buf)?
 			}
 			BcUdp::Ack(payload) => {
 				let binary_payload = &payload.payload;
 				let bin_len = len_as_u32(binary_payload.len())?;
-				gen(bcudp_ack(payload, binary_payload, bin_len), buf)?
+				r#gen(bcudp_ack(payload, binary_payload, bin_len), buf)?
 			}
 			BcUdp::Data(payload) => {
 				let binary_payload = &payload.payload;
 				let bin_len = len_as_u32(binary_payload.len())?;
-				gen(bcudp_data(payload, binary_payload, bin_len), buf)?
+				r#gen(bcudp_data(payload, binary_payload, bin_len), buf)?
 			}
 		};
 

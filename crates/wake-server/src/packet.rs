@@ -5,7 +5,6 @@ use bairelay_neolink_core::bcudp::{
 	xml::UdpXml,
 };
 use bytes::BytesMut;
-use rand::Rng;
 
 use crate::WakeServerError;
 
@@ -54,12 +53,12 @@ fn validate_uid_bounds(payload: &UdpXml) -> Result<(), WakeServerError> {
 		UdpXml::D2rR(r) => Some(r.uid.as_str()),
 		_ => None,
 	};
-	if let Some(u) = uid {
-		if u.len() > MAX_UID_LEN {
-			return Err(WakeServerError::UnexpectedPacketKind {
-				kind: "uid-too-long",
-			});
-		}
+	if let Some(u) = uid
+		&& u.len() > MAX_UID_LEN
+	{
+		return Err(WakeServerError::UnexpectedPacketKind {
+			kind: "uid-too-long",
+		});
 	}
 	Ok(())
 }
@@ -74,7 +73,7 @@ pub fn encode_discovery(tid: u32, payload: UdpXml) -> Result<Vec<u8>, WakeServer
 
 /// Mint a random session ID for `R2D_C` / `R2C_C_R`.
 pub fn random_sid() -> u32 {
-	rand::thread_rng().gen()
+	rand::random()
 }
 
 #[cfg(test)]

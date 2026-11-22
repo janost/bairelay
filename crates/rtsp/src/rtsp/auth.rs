@@ -1,7 +1,7 @@
 //! RTSP authentication (Basic + Digest).
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use thiserror::Error;
 
 /// Errors produced while validating an `Authorization` header.
@@ -85,8 +85,7 @@ pub struct Nonce {
 impl Nonce {
 	/// Mint a fresh nonce from 16 random bytes.
 	pub fn random() -> Self {
-		use rand::Rng;
-		let bytes: [u8; 16] = rand::thread_rng().gen();
+		let bytes: [u8; 16] = rand::random();
 		let value = bytes.iter().map(|b| format!("{b:02x}")).collect();
 		Self {
 			value,

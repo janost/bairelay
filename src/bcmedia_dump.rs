@@ -305,8 +305,8 @@ mod tests {
 		VideoType,
 	};
 	use std::io::Cursor;
-	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	fn sample_iframe() -> BcMedia {
 		BcMedia::Iframe(BcMediaIframe {

@@ -215,10 +215,11 @@ impl OverlayCache {
 		let input_hash = fast_hash(jpeg);
 		{
 			let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-			if let Some(entry) = guard.as_ref() {
-				if entry.state == state && entry.input_hash == input_hash {
-					return entry.rendered.clone();
-				}
+			if let Some(entry) = guard.as_ref()
+				&& entry.state == state
+				&& entry.input_hash == input_hash
+			{
+				return entry.rendered.clone();
 			}
 		}
 		let rendered = render(jpeg, state);

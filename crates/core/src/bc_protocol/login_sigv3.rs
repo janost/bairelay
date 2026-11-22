@@ -23,9 +23,8 @@
 //! official app (`BaichuanDevice::signatureLoginV3`).
 
 use base64::Engine as _;
-use cfb_mode::cipher::generic_array::GenericArray;
-use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-use rand::RngCore;
+use cfb_mode::cipher::KeyIvInit;
+use rand::TryRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -116,7 +115,9 @@ pub(crate) fn build_sigv3_extras(
 
 	// Our ephemeral X25519 keypair.
 	let mut sk_bytes = [0u8; 32];
-	rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+	rand::rngs::SysRng
+		.try_fill_bytes(&mut sk_bytes)
+		.map_err(|_| Error::Other("sigV3: OS random source unavailable"))?;
 	let our_secret = StaticSecret::from(sk_bytes);
 	let our_public = PublicKey::from(&our_secret);
 
@@ -151,7 +152,9 @@ pub(crate) fn build_sigv3_extras(
 
 	// AES-128-CFB-128, in-place (stream cipher: ct len == pt len).
 	let mut ct = json.clone().into_bytes();
-	Aes128CfbEnc::new(GenericArray::from_slice(key), GenericArray::from_slice(iv)).encrypt(&mut ct);
+	Aes128CfbEnc::new_from_slices(key, iv)
+		.map_err(|_| Error::Other("sigV3: derived AES key/IV not 16 bytes"))?
+		.encrypt(&mut ct);
 
 	// `derived` is a fixed 32-byte buffer so these halves are always 16 bytes;
 	// map the (unreachable) error rather than `expect`, keeping the crate
@@ -242,23 +245,18 @@ mod tests {
 		// AES-128-CFB-128 (matches the app's AES_cfb128_encrypt): stream
 		// cipher, so ciphertext length == plaintext length (no padding),
 		// and decrypt with the same key/iv recovers the plaintext.
-		use cfb_mode::cipher::AsyncStreamCipher;
 		let key = unhex("000102030405060708090a0b0c0d0e0f");
 		let iv = unhex("101112131415161718191a1b1c1d1e1f");
 		let pt = b"hello sigv3 proof"; // 17 bytes (not block-aligned)
 		let mut buf = pt.to_vec();
-		Aes128CfbEnc::new(
-			GenericArray::from_slice(&key),
-			GenericArray::from_slice(&iv),
-		)
-		.encrypt(&mut buf);
+		Aes128CfbEnc::new_from_slices(&key, &iv)
+			.unwrap()
+			.encrypt(&mut buf);
 		assert_eq!(buf.len(), pt.len(), "CFB must not pad");
 		assert_ne!(&buf, pt, "must actually encrypt");
-		cfb_mode::Decryptor::<aes::Aes128>::new(
-			GenericArray::from_slice(&key),
-			GenericArray::from_slice(&iv),
-		)
-		.decrypt(&mut buf);
+		cfb_mode::Decryptor::<aes::Aes128>::new_from_slices(&key, &iv)
+			.unwrap()
+			.decrypt(&mut buf);
 		assert_eq!(&buf, pt, "CFB decrypt must recover plaintext");
 	}
 

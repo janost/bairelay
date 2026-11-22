@@ -184,8 +184,7 @@ impl BcCamera {
 		} else {
 			return Err(Error::UnintelligibleReply {
 				reply: std::sync::Arc::new(msg),
-				why:
-					"The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
+				why: "The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
 			});
 		}
 
@@ -324,8 +323,7 @@ impl BcCamera {
 		} else {
 			return Err(Error::UnintelligibleReply {
 				reply: std::sync::Arc::new(msg),
-				why:
-					"The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
+				why: "The camera did not accept the TalkConfig xml. Audio format is likely incorrect",
 			});
 		}
 
@@ -495,7 +493,7 @@ impl BufRead for BufferedStream {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::bc_protocol::connection::mock::{reply_200_empty, reply_err_code, MockConnection};
+	use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty, reply_err_code};
 	use std::io::Read;
 	use std::time::Duration;
 

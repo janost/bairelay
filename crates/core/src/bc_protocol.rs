@@ -52,7 +52,7 @@ mod users;
 mod version;
 
 pub use alarm::{
-	classify_alarm, classify_alarm_events, AiObject, AiObjects, AlarmUpdate, VisitorEdge,
+	AiObject, AiObjects, AlarmUpdate, VisitorEdge, classify_alarm, classify_alarm_events,
 };
 pub use camera_driver::CameraDriver;
 pub(crate) use connection::*;
@@ -1044,7 +1044,7 @@ mod discoverer_fallback_tests {
 	//! module in the crate, but no single arm depends on wall time.
 	use super::*;
 	use crate::bc_protocol::connection::discovery::test_support::{
-		ok_discovery, CallLog, Outcome, ScriptedDiscoverer,
+		CallLog, Outcome, ScriptedDiscoverer, ok_discovery,
 	};
 	use crate::bc_protocol::resolution::DiscoveryMethods;
 	use std::sync::Arc;

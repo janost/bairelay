@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bairelay_mqtt::{
-	parse_control_message, ConnectionError, Event, MqttEventLoop, Packet, SharedMqttClient,
-	StatusPublisher,
+	ConnectionError, Event, MqttEventLoop, Packet, SharedMqttClient, StatusPublisher,
+	parse_control_message,
 };
 use tokio_util::sync::CancellationToken;
 

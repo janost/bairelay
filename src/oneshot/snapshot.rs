@@ -42,7 +42,9 @@ pub async fn run_via_driver(
 ) -> Result<Outcome> {
 	check_json_output(mode_json, output_path)?;
 	if use_stream {
-		anyhow::bail!("snapshot --use-stream-raw requires a concrete BcCamera; not supported through CameraDriver");
+		anyhow::bail!(
+			"snapshot --use-stream-raw requires a concrete BcCamera; not supported through CameraDriver"
+		);
 	}
 	capture_via_snap(cam, output_path).await
 }
@@ -130,10 +132,10 @@ pub(crate) async fn drain_first_iframe(
 			StreamStep::Got(i) => return Ok(i),
 			StreamStep::Continue => continue,
 			StreamStep::ReadError(e) => {
-				return Err(anyhow::anyhow!(e)).context("stream read error")
+				return Err(anyhow::anyhow!(e)).context("stream read error");
 			}
 			StreamStep::ReceiveError(e) => {
-				return Err(anyhow::anyhow!(e)).context("stream receive error")
+				return Err(anyhow::anyhow!(e)).context("stream receive error");
 			}
 			StreamStep::TimedOut => {
 				anyhow::bail!("no I-frame received within {}s", window.as_secs());
@@ -634,7 +636,7 @@ mod tests {
 	async fn run_snap_path_via_mock_connection() {
 		use bairelay_neolink_core::bc::model::*;
 		use bairelay_neolink_core::bc::xml::*;
-		use bairelay_neolink_core::bc_protocol::connection::mock::{reply_200_xml, MockConnection};
+		use bairelay_neolink_core::bc_protocol::connection::mock::{MockConnection, reply_200_xml};
 
 		let tmp = tempfile::NamedTempFile::new().unwrap();
 		let path = tmp.path().to_path_buf();

@@ -2,13 +2,13 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::convert::{TryFrom, TryInto};
 use time::{
-	macros::date, parsing::Parsed, Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset,
-	Weekday,
+	Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset, Weekday, macros::date,
+	parsing::Parsed,
 };
 
 #[cfg(test)]
 use crate::bc_protocol::connection::mock::{
-	reply_200_empty, reply_200_xml, reply_err_code, MockConnection,
+	MockConnection, reply_200_empty, reply_200_xml, reply_err_code,
 };
 
 impl BcCamera {
@@ -408,23 +408,23 @@ fn nth_weekday_of_month(year: i32, month: Month, week_index: u8, weekday: Weekda
 	let last_day = month.length(year);
 	if week_index == 5 {
 		for d in (1..=last_day).rev() {
-			if let Ok(date) = Date::from_calendar_date(year, month, d) {
-				if date.weekday() == weekday {
-					return Some(date);
-				}
+			if let Ok(date) = Date::from_calendar_date(year, month, d)
+				&& date.weekday() == weekday
+			{
+				return Some(date);
 			}
 		}
 		return None;
 	}
 	for d in 1..=7 {
-		if let Ok(date) = Date::from_calendar_date(year, month, d) {
-			if date.weekday() == weekday {
-				let day_of_target = d + (week_index - 1) * 7;
-				if day_of_target > last_day {
-					return None;
-				}
-				return Date::from_calendar_date(year, month, day_of_target).ok();
+		if let Ok(date) = Date::from_calendar_date(year, month, d)
+			&& date.weekday() == weekday
+		{
+			let day_of_target = d + (week_index - 1) * 7;
+			if day_of_target > last_day {
+				return None;
 			}
+			return Date::from_calendar_date(year, month, day_of_target).ok();
 		}
 	}
 	None

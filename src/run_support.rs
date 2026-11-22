@@ -15,21 +15,17 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{Cli, Command};
-use crate::config::{parse_config, validate_config, Config};
+use crate::config::{Config, parse_config, validate_config};
 use crate::oneshot::classify;
 use crate::oneshot::dispatch::{dispatch_oneshot, find_camera_config, snapshot_json_preflight};
 use crate::oneshot::errors::ConfigError;
-use crate::oneshot::output::{format_failure, format_success, Mode, Outcome};
+use crate::oneshot::output::{Mode, Outcome, format_failure, format_success};
 use crate::oneshot::{runner, snapshot};
 
 /// Pick the one-shot output mode from the CLI flag. Extracted so the
 /// `cli.json → Mode` mapping is pinned in one place.
 pub fn cli_output_mode(cli: &Cli) -> Mode {
-	if cli.json {
-		Mode::Json
-	} else {
-		Mode::Human
-	}
+	if cli.json { Mode::Json } else { Mode::Human }
 }
 
 /// Read a config file, parse the TOML, then run the validator. Any

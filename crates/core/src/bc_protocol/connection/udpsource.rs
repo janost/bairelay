@@ -10,7 +10,7 @@ use futures::{
 	sink::{Sink, SinkExt},
 	stream::{IntoAsyncRead, Stream, StreamExt, TryStreamExt},
 };
-use rand::{seq::SliceRandom, thread_rng, Rng};
+use rand::seq::SliceRandom;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, Result as IoResult};
 use std::net::SocketAddr;
@@ -22,10 +22,10 @@ use tokio::{
 	net::UdpSocket,
 	sync::{
 		mpsc::channel,
-		watch::{channel as watch, Sender as WatchSender},
+		watch::{Sender as WatchSender, channel as watch},
 	},
 	task::JoinSet,
-	time::{interval, sleep, Duration, Instant, Interval},
+	time::{Duration, Instant, Interval, interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
@@ -614,10 +614,7 @@ impl UdpPayloadInner {
                                         // At least I think that is what this is for.
                                         // Might also have to do this for the relay but not sure
                                         let msg = BcUdp::Discovery(UdpDiscovery {
-                                            tid: {
-                                                let mut rng = thread_rng();
-                                                (rng.gen::<u8>()) as u32
-                                            },
+                                            tid: rand::random::<u8>() as u32,
                                             payload: UdpXml::C2dHb(C2dHb {
                                                     cid: thread_client_id,
                                                     did: thread_camera_id,
@@ -675,10 +672,7 @@ impl UdpPayloadInner {
 					loop {
 						thread_interval.tick().await;
 						let msg = BcUdp::Discovery(UdpDiscovery {
-							tid: {
-								let mut rng = thread_rng();
-								(rng.gen::<u8>()) as u32
-							},
+							tid: rand::random::<u8>() as u32,
 							payload: UdpXml::C2dHb(C2dHb {
 									cid: thread_client_id,
 									did: thread_camera_id,
@@ -929,11 +923,7 @@ impl futures::AsyncWrite for UdpPayloadSource {
 /// Helper to create a UdpStream
 async fn connect() -> Result<UdpSocket> {
 	let mut ports: Vec<u16> = (53500..54000).collect();
-	{
-		let mut rng = thread_rng();
-		ports.shuffle(&mut rng);
-		drop(rng); // Do not hold RNG over an await
-	}
+	ports.shuffle(&mut rand::rng());
 
 	let addrs: Vec<_> = ports
 		.iter()
@@ -946,11 +936,7 @@ async fn connect() -> Result<UdpSocket> {
 
 async fn connect_try_port(port: u16) -> Result<UdpSocket> {
 	let mut ports: Vec<u16> = (53500..54000).collect();
-	{
-		let mut rng = thread_rng();
-		ports.shuffle(&mut rng);
-		drop(rng); // Do not hold RNG over an await
-	}
+	ports.shuffle(&mut rand::rng());
 
 	let addrs: Vec<_> = [port]
 		.iter()

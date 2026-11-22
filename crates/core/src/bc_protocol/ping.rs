@@ -2,7 +2,7 @@ use super::{BcCamera, Result};
 use crate::bc::model::*;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_empty, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty};
 
 impl BcCamera {
 	/// Ping the camera will either return Ok(()) which means a sucess reply

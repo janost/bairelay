@@ -1,7 +1,4 @@
-use aes::{
-	cipher::{AsyncStreamCipher, KeyIvInit},
-	Aes128,
-};
+use aes::{Aes128, cipher::KeyIvInit};
 use cfb_mode::{Decryptor, Encryptor};
 
 type Aes128CfbEnc = Encryptor<Aes128>;
@@ -12,7 +9,7 @@ const XML_KEY: [u8; 8] = [0x1F, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0xFF];
 // The per-session key (derived from password + login NONCE in
 // `Credentials::make_aeskey`) supplies the freshness — IV reuse across
 // sessions doesn't leak plaintext because the key changes every login.
-const IV: &[u8] = b"0123456789abcdef";
+const IV: [u8; 16] = *b"0123456789abcdef";
 
 /// These are the encyption modes supported by the camera
 ///
@@ -25,20 +22,35 @@ pub enum EncryptionProtocol {
 	BCEncrypt,
 	/// Latest cameras/firmwares use Aes with the key derived from
 	/// the camera's password and the negotiated NONCE
-	Aes {
-		/// The encryptor
-		enc: Aes128CfbEnc,
-		/// The decryptor
-		dec: Aes128CfbDec,
-	},
+	Aes(AesKey),
 	/// Same as Aes but the media stream is also encrypted and not just
 	/// the control commands
-	FullAes {
-		/// The encryptor
-		enc: Aes128CfbEnc,
-		/// The decryptor
-		dec: Aes128CfbDec,
-	},
+	FullAes(AesKey),
+}
+
+/// AES-128-CFB key material. Every BC message is encrypted from the
+/// IV afresh, so a cipher instance is built per call (key expansion is
+/// cheap next to the message I/O).
+#[derive(Clone)]
+pub struct AesKey {
+	key: [u8; 16],
+	iv: [u8; 16],
+}
+
+impl std::fmt::Debug for AesKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("AesKey(..)")
+	}
+}
+
+impl AesKey {
+	fn decrypt(&self, buf: &mut [u8]) {
+		Aes128CfbDec::new(&self.key.into(), &self.iv.into()).decrypt(buf);
+	}
+
+	fn encrypt(&self, buf: &mut [u8]) {
+		Aes128CfbEnc::new(&self.key.into(), &self.iv.into()).encrypt(buf);
+	}
 }
 
 impl EncryptionProtocol {
@@ -52,27 +64,18 @@ impl EncryptionProtocol {
 	}
 	/// Helper to make aes
 	pub fn aes(key: [u8; 16]) -> Self {
-		EncryptionProtocol::Aes {
-			enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-			dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-		}
+		EncryptionProtocol::Aes(AesKey { key, iv: IV })
 	}
 	/// Full AES (control + media stream) with an explicit IV. Account ("cloud")
 	/// cameras encrypt the leading `encryptLen` bytes of every media payload
 	/// with the same derived key/IV as the control session, so the post-login
 	/// session must be `FullAes`, not `Aes` (which leaves media plaintext).
 	pub fn full_aes_with_iv(key: [u8; 16], iv: [u8; 16]) -> Self {
-		EncryptionProtocol::FullAes {
-			enc: Aes128CfbEnc::new(key.as_slice().into(), iv.as_slice().into()),
-			dec: Aes128CfbDec::new(key.as_slice().into(), iv.as_slice().into()),
-		}
+		EncryptionProtocol::FullAes(AesKey { key, iv })
 	}
 	/// Helper to make full aes
 	pub fn full_aes(key: [u8; 16]) -> Self {
-		EncryptionProtocol::FullAes {
-			enc: Aes128CfbEnc::new(key.as_slice().into(), IV.into()),
-			dec: Aes128CfbDec::new(key.as_slice().into(), IV.into()),
-		}
+		EncryptionProtocol::FullAes(AesKey { key, iv: IV })
 	}
 
 	/// Decrypt the data, offset comes from the header of the packet
@@ -86,11 +89,9 @@ impl EncryptionProtocol {
 					.map(|(key, i)| *i ^ key ^ (offset as u8))
 					.collect()
 			}
-			EncryptionProtocol::Aes { dec, .. } | EncryptionProtocol::FullAes { dec, .. } => {
-				// AES decryption
-
+			EncryptionProtocol::Aes(key) | EncryptionProtocol::FullAes(key) => {
 				let mut decrypted = buf.to_vec();
-				dec.clone().decrypt(&mut decrypted);
+				key.decrypt(&mut decrypted);
 				decrypted
 			}
 		}
@@ -107,10 +108,9 @@ impl EncryptionProtocol {
 				// Encrypt is the same as decrypt
 				self.decrypt(offset, buf)
 			}
-			EncryptionProtocol::Aes { enc, .. } | EncryptionProtocol::FullAes { enc, .. } => {
-				// AES encryption
+			EncryptionProtocol::Aes(key) | EncryptionProtocol::FullAes(key) => {
 				let mut encrypted = buf.to_vec();
-				enc.clone().encrypt(&mut encrypted);
+				key.encrypt(&mut encrypted);
 				encrypted
 			}
 		}
@@ -130,11 +130,11 @@ fn helper_constructors_match_explicit_variants() {
 	let key = [0u8; 16];
 	assert!(matches!(
 		EncryptionProtocol::aes(key),
-		EncryptionProtocol::Aes { .. }
+		EncryptionProtocol::Aes(_)
 	));
 	assert!(matches!(
 		EncryptionProtocol::full_aes(key),
-		EncryptionProtocol::FullAes { .. }
+		EncryptionProtocol::FullAes(_)
 	));
 }
 

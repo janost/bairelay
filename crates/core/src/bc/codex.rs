@@ -75,7 +75,7 @@ impl Encoder<Bc> for BcCodex {
 		// *post-login* session; the login message itself stays BCEncrypt
 		// (confirmed on the wire against a cloud-bound camera).
 		let enc_protocol: &EncryptionProtocol = match self.context.get_encrypted() {
-			EncryptionProtocol::Aes { .. } | EncryptionProtocol::FullAes { .. }
+			EncryptionProtocol::Aes(_) | EncryptionProtocol::FullAes(_)
 				if item.meta.msg_id == 1 =>
 			{
 				// During login the encyption protocol cannot go higher than BCEncrypt
@@ -124,15 +124,16 @@ impl Decoder for BcCodex {
 		// reply itself arrived under BCEncrypt; every message after it on the
 		// control AND media are AES keyed by the ECDHE-derived (key, iv).
 		// Apply the FullAes switch armed while encoding the login.
-		if let Some((msg_num, key, iv)) = self.pending_session_aes {
-			if bc.meta.msg_id == 1 && bc.meta.msg_num == msg_num {
-				if bc.meta.response_code == 200 {
-					self.context
-						.set_encrypted(EncryptionProtocol::full_aes_with_iv(key, iv));
-				}
-				// Resolved (accepted or rejected) — disarm either way.
-				self.pending_session_aes = None;
+		if let Some((msg_num, key, iv)) = self.pending_session_aes
+			&& bc.meta.msg_id == 1
+			&& bc.meta.msg_num == msg_num
+		{
+			if bc.meta.response_code == 200 {
+				self.context
+					.set_encrypted(EncryptionProtocol::full_aes_with_iv(key, iv));
 			}
+			// Resolved (accepted or rejected) — disarm either way.
+			self.pending_session_aes = None;
 		}
 		// Update context
 		if let Bc {
@@ -151,23 +152,22 @@ impl Decoder for BcCodex {
 					..
 				}),
 		} = &bc
+			&& response_code >> 8 == 0xdd
 		{
-			if response_code >> 8 == 0xdd {
-				// Login reply has the encryption info
-				// Set that the encryption type now
-				let encryption_protocol_byte = (response_code & 0xff) as usize;
-				match encryption_protocol_byte {
-					0x00 => self.context.set_encrypted(EncryptionProtocol::Unencrypted),
-					0x01 => self.context.set_encrypted(EncryptionProtocol::BCEncrypt),
-					0x02 => self.context.set_encrypted(EncryptionProtocol::aes(
-						self.context.credentials.make_aeskey(nonce),
-					)),
-					0x12 => self.context.set_encrypted(EncryptionProtocol::full_aes(
-						self.context.credentials.make_aeskey(nonce),
-					)),
-					_ => {
-						return Err(Error::UnknownEncryption(encryption_protocol_byte));
-					}
+			// Login reply has the encryption info
+			// Set that the encryption type now
+			let encryption_protocol_byte = (response_code & 0xff) as usize;
+			match encryption_protocol_byte {
+				0x00 => self.context.set_encrypted(EncryptionProtocol::Unencrypted),
+				0x01 => self.context.set_encrypted(EncryptionProtocol::BCEncrypt),
+				0x02 => self.context.set_encrypted(EncryptionProtocol::aes(
+					self.context.credentials.make_aeskey(nonce),
+				)),
+				0x12 => self.context.set_encrypted(EncryptionProtocol::full_aes(
+					self.context.credentials.make_aeskey(nonce),
+				)),
+				_ => {
+					return Err(Error::UnknownEncryption(encryption_protocol_byte));
 				}
 			}
 		}
@@ -414,7 +414,7 @@ mod tests {
 		let _ = codex.decode(&mut buf).expect("decode ok");
 		assert!(matches!(
 			codex.context.get_encrypted(),
-			EncryptionProtocol::Aes { .. }
+			EncryptionProtocol::Aes(_)
 		));
 	}
 
@@ -440,7 +440,7 @@ mod tests {
 		let _ = codex.decode(&mut buf).expect("decode ok");
 		assert!(matches!(
 			codex.context.get_encrypted(),
-			EncryptionProtocol::FullAes { .. }
+			EncryptionProtocol::FullAes(_)
 		));
 	}
 
@@ -576,7 +576,7 @@ mod tests {
 		let _ = codex.decode(&mut login_reply(42, 200)).expect("decode");
 		assert!(matches!(
 			codex.context.get_encrypted(),
-			EncryptionProtocol::FullAes { .. }
+			EncryptionProtocol::FullAes(_)
 		));
 		assert!(codex.pending_session_aes.is_none());
 	}

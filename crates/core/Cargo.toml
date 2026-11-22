@@ -11,43 +11,44 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-aes = "0.8.2"
+aes = "0.9"
 async-trait = "0.1"
-base64 = "0.22"
-bytes = "1.4.0"
-cfb-mode = "0.8.2"
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-sha2 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-cookie-factory = "0.3.2"
-crc32fast = "1.3.2"
-crossbeam-channel = "0.5.8"
-delegate = "0.12.0"
-futures = "0.3.28"
-get_if_addrs = "0.5.3"
-lazy_static = "1.4.0"
-log = "0.4.17"
-md5 = "0.7.0"
-nom = { version = "7.1.3", features = ["alloc"] }
+base64 = "0.23"
+bytes = "1"
+cfb-mode = "0.9"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+cookie-factory = "0.3"
+crc32fast = "1"
+crossbeam-channel = "0.5"
+delegate = "0.13"
+futures = "0.3"
+if-addrs = "0.15"
+log = "0.4"
+md5 = "0.8"
+nom = "8"
+nom-language = "0.1"
 quick-xml.workspace = true
-rand = "0.8.5"
-regex = "1.7.3"
+rand = "0.10"
+regex = "1"
 # Cloud bundle minting for account ("cloud") cameras: HTTPS to
 # apis.reolink.com. rustls-tls (no OpenSSL) + gzip + json.
-reqwest = { version = "0.12", default-features = false, features = [
-	"rustls-tls",
+reqwest = { version = "0.13", default-features = false, features = [
+	"rustls",
+	"form",
 	"gzip",
 	"json",
 	"charset",
 	"http2",
 ] }
-serde = { version = "1.0.106", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-time = { version = "0.3.36" , features = [ "macros", "parsing", "local-offset" ]}
-tokio = { version = "1.27.0", features = ["full"] }
-tokio-stream = { version = "0.1.12", features = ["sync", "time", "net"] }
-tokio-util = { version = "0.7.7", features = ["full", "tracing"] }
+time = { version = "0.3", features = [ "macros", "parsing", "local-offset" ]}
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync", "time", "net"] }
+tokio-util = { version = "0.7", features = ["full", "tracing"] }
 zeroize = "1.8"
 
 [features]
@@ -74,14 +75,14 @@ fuzz-api = []
 pcap-decode-api = []
 
 [dev-dependencies]
-assert_matches = "1.5.0"
+assert_matches = "1.5"
 env_logger = "0.11"
-indoc = "2.0.1"
+indoc = "2"
 # test-util brings in the virtual clock (`tokio::time::pause`,
 # `tokio::time::advance`, `#[tokio::test(start_paused = true)]`) that
 # Stage 6's discovery-chain and keepalive tests use to drive per-step
 # timeouts without real sleeps.
-tokio = { version = "1.27.0", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 # Property-based fuzz / round-trip testing for the protocol parsers
 # (BcMedia framing, BcUdp framing, XML payloads). The contract under
 # test is "any byte input either parses to a valid value or returns an

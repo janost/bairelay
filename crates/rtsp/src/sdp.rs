@@ -1,7 +1,7 @@
 //! SDP body generation per RFC 4566 for bairelay's codec combinations.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::codec::{AudioCodec, VideoCodec};
 

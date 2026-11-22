@@ -41,14 +41,14 @@ use std::task::{Context, Poll};
 
 use futures::sink::Sink;
 use futures::stream::Stream;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{BcConnSink, BcConnSource, BcConnection};
-use crate::bc::model::*;
 use crate::Error;
 use crate::Result;
+use crate::bc::model::*;
 
 /// Closure that builds zero, one, or many replies from the request.
 /// The mock invokes it the moment the request arrives, emitting each

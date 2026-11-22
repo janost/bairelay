@@ -1363,10 +1363,10 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 			));
 		}
 
-		if let Some(addr) = &cam.address {
-			if let Err(e) = crate::bc_opts::parse_address(addr) {
-				return Err(format!("Camera '{}': invalid address: {e}", cam.name));
-			}
+		if let Some(addr) = &cam.address
+			&& let Err(e) = crate::bc_opts::parse_address(addr)
+		{
+			return Err(format!("Camera '{}': invalid address: {e}", cam.name));
 		}
 
 		// Camera must have address or uid
@@ -1412,23 +1412,23 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 
 		// idle_disconnect_timeout_secs: same sanity check as above.
-		if let Some(t) = cam.idle_disconnect_timeout_secs {
-			if !t.is_finite() || t <= 0.0 {
-				return Err(format!(
-					"Camera '{}': idle_disconnect_timeout_secs must be a positive finite number (got {})",
-					cam.name, t,
-				));
-			}
+		if let Some(t) = cam.idle_disconnect_timeout_secs
+			&& (!t.is_finite() || t <= 0.0)
+		{
+			return Err(format!(
+				"Camera '{}': idle_disconnect_timeout_secs must be a positive finite number (got {})",
+				cam.name, t,
+			));
 		}
 
 		// Neolink pause.timeout migration alias: same sanity check.
-		if let Some(t) = cam.pause.timeout {
-			if !t.is_finite() || t <= 0.0 {
-				return Err(format!(
-					"Camera '{}': pause.timeout must be a positive finite number (got {})",
-					cam.name, t,
-				));
-			}
+		if let Some(t) = cam.pause.timeout
+			&& (!t.is_finite() || t <= 0.0)
+		{
+			return Err(format!(
+				"Camera '{}': pause.timeout must be a positive finite number (got {})",
+				cam.name, t,
+			));
 		}
 
 		// motion_wake_hold_secs: same sanity check. 0 is allowed (release
@@ -1444,33 +1444,31 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 
 	// `[push_listener]` validation. The block itself is optional and the
 	// enable=false case is a no-op; everything below is gated on enable.
-	if let Some(ref pl) = config.push_listener {
-		if pl.enable {
-			// `Duration::from_secs_f64` panics on NaN / negative / infinite.
-			// 0 is allowed — release the wake-lock immediately.
-			if !pl.motion_wake_hold_secs.is_finite() || pl.motion_wake_hold_secs < 0.0 {
-				return Err(format!(
-					"[push_listener]: motion_wake_hold_secs must be a non-negative finite number (got {})",
-					pl.motion_wake_hold_secs,
-				));
-			}
-			// Operator config rejects port 0; the chosen ephemeral port is
-			// never surfaced, so DNS-redirect from cameras can't reach it.
-			if pl.push_listener_port == 0 {
-				return Err(
-					"[push_listener]: push_listener_port must be greater than 0".to_string()
-				);
-			}
-			// The push listener depends on the shared `CameraRegistry` being
-			// populated by the wake server's `D2R_HB` handler. Without it
-			// every `lookup_by_ip` misses silently and motion never fires.
-			let wake_enabled = config.wake_server.as_ref().is_some_and(|w| w.enable);
-			if !wake_enabled {
-				return Err(
+	if let Some(ref pl) = config.push_listener
+		&& pl.enable
+	{
+		// `Duration::from_secs_f64` panics on NaN / negative / infinite.
+		// 0 is allowed — release the wake-lock immediately.
+		if !pl.motion_wake_hold_secs.is_finite() || pl.motion_wake_hold_secs < 0.0 {
+			return Err(format!(
+				"[push_listener]: motion_wake_hold_secs must be a non-negative finite number (got {})",
+				pl.motion_wake_hold_secs,
+			));
+		}
+		// Operator config rejects port 0; the chosen ephemeral port is
+		// never surfaced, so DNS-redirect from cameras can't reach it.
+		if pl.push_listener_port == 0 {
+			return Err("[push_listener]: push_listener_port must be greater than 0".to_string());
+		}
+		// The push listener depends on the shared `CameraRegistry` being
+		// populated by the wake server's `D2R_HB` handler. Without it
+		// every `lookup_by_ip` misses silently and motion never fires.
+		let wake_enabled = config.wake_server.as_ref().is_some_and(|w| w.enable);
+		if !wake_enabled {
+			return Err(
 					"[push_listener] requires [wake_server] enable = true; the push listener resolves peer IPs against the wake server's heartbeat registry"
 						.to_string(),
 				);
-			}
 		}
 	}
 
@@ -1513,26 +1511,26 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 				wh.motion_wake_hold_secs,
 			));
 		}
-		if let Some(addr) = &wh.webhook_addr {
-			if addr.parse::<std::net::IpAddr>().is_err() {
-				return Err(format!(
-					"[webhook]: webhook_addr '{addr}' must be an IP address"
-				));
-			}
-		}
-		if let Some(adv) = &wh.webhook_advertise {
-			if let Err(e) = parse_webhook_advertise(adv) {
-				return Err(format!("[webhook]: invalid webhook_advertise '{adv}': {e}"));
-			}
-		}
-	}
-	if let Some(cam) = config.cameras.iter().find(|c| c.webhook) {
-		if !webhook_enabled {
+		if let Some(addr) = &wh.webhook_addr
+			&& addr.parse::<std::net::IpAddr>().is_err()
+		{
 			return Err(format!(
-				"Camera '{}': webhook = true requires [webhook] enable = true",
-				cam.name
+				"[webhook]: webhook_addr '{addr}' must be an IP address"
 			));
 		}
+		if let Some(adv) = &wh.webhook_advertise
+			&& let Err(e) = parse_webhook_advertise(adv)
+		{
+			return Err(format!("[webhook]: invalid webhook_advertise '{adv}': {e}"));
+		}
+	}
+	if let Some(cam) = config.cameras.iter().find(|c| c.webhook)
+		&& !webhook_enabled
+	{
+		return Err(format!(
+			"Camera '{}': webhook = true requires [webhook] enable = true",
+			cam.name
+		));
 	}
 
 	// Each entry of `permitted_users` on a camera must reference a globally

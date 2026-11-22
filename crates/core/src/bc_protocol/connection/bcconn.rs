@@ -1,13 +1,13 @@
 use super::BcSubscription;
-use crate::{bc::model::*, Error, Result};
+use crate::{Error, Result, bc::model::*};
 use futures::future::BoxFuture;
 use futures::sink::{Sink, SinkExt};
 use futures::stream::{Stream, StreamExt};
 use log::*;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -363,8 +363,7 @@ impl Poller {
 									} else {
 										trace!(
 											"Ignoring uninteresting message id {} (number: {})",
-											msg_id,
-											msg_num
+											msg_id, msg_num
 										);
 										trace!("Contents: {:?}", response);
 									}
@@ -372,8 +371,7 @@ impl Poller {
 								(None, None) => {
 									trace!(
 										"Ignoring uninteresting message id {} (number: {})",
-										msg_id,
-										msg_num
+										msg_id, msg_num
 									);
 									trace!("Contents: {:?}", response);
 								}

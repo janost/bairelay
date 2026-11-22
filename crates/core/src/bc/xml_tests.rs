@@ -852,12 +852,14 @@ fn xml_battery_list_empty() {
 		</body>"#
 	);
 	let parsed = BcXml::try_parse(xml.as_bytes()).unwrap();
-	assert!(parsed
-		.battery_list
-		.as_ref()
-		.unwrap()
-		.battery_info
-		.is_empty());
+	assert!(
+		parsed
+			.battery_list
+			.as_ref()
+			.unwrap()
+			.battery_info
+			.is_empty()
+	);
 }
 
 // ---------------------------------------------------------------------------

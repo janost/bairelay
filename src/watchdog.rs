@@ -63,8 +63,8 @@ impl Watchdog {
 								cam.config(),
 								self.prune_grace,
 							);
-							if let Some(idle_since) = cam.wake_lock().idle_since() {
-								if idle_since.elapsed() >= grace {
+							if let Some(idle_since) = cam.wake_lock().idle_since()
+								&& idle_since.elapsed() >= grace {
 									tracing::warn!(
 										camera = %name,
 										idle_secs = idle_since.elapsed().as_secs(),
@@ -72,7 +72,6 @@ impl Watchdog {
 									);
 									cam.request_disconnect();
 								}
-							}
 						}
 					}
 				}

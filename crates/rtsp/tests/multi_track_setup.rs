@@ -272,8 +272,8 @@ impl StreamProvider for EmittingMockProvider {
 /// Bind and spawn the RTSP server, returning `(addr, cancel, provider)`.
 /// The `provider` is kept alive on the test side so the test can emit
 /// frames on its broadcast sender after PLAY.
-async fn spawn_server_with_emitting_provider(
-) -> (SocketAddr, CancellationToken, Arc<EmittingMockProvider>) {
+async fn spawn_server_with_emitting_provider()
+-> (SocketAddr, CancellationToken, Arc<EmittingMockProvider>) {
 	const MAX_ATTEMPTS: u32 = 5;
 	const READY_POLLS: u32 = 10;
 	const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);

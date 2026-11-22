@@ -1,9 +1,9 @@
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_xml, reply_err_code, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_xml, reply_err_code};
 
 impl BcCamera {
 	/// Helper to set the service state since they all share the same
@@ -137,13 +137,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;
@@ -187,13 +181,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;
@@ -237,13 +225,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;
@@ -287,13 +269,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;
@@ -337,13 +313,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;
@@ -387,13 +357,7 @@ impl BcCamera {
 		} = bcxml
 		{
 			if let Some(enabled) = set_on {
-				xml.enable = Some({
-					if enabled {
-						1
-					} else {
-						0
-					}
-				});
+				xml.enable = Some(enabled.into());
 			}
 			if let Some(port) = set_port {
 				xml.port = port;

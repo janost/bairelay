@@ -49,11 +49,7 @@ pub fn decode_sample(ulaw: u8) -> i16 {
 	let magnitude =
 		((mantissa as i32) << (exponent + 3)) + (BIAS as i32) * (1 << exponent) - BIAS as i32;
 	let s = magnitude.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-	if sign != 0 {
-		-s
-	} else {
-		s
-	}
+	if sign != 0 { -s } else { s }
 }
 
 /// Encode a PCM16 slice to µ-law.

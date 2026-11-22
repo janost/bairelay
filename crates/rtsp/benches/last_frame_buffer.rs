@@ -8,7 +8,9 @@
 
 use bairelay_rtsp::buffer::{LastFrameBuffer, VideoBurst};
 use bytes::Bytes;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 fn jpeg_set_get(c: &mut Criterion) {
 	let buf = LastFrameBuffer::new();

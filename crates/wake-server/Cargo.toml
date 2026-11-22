@@ -18,8 +18,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 quick-xml.workspace = true
 bytes = "1"
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util", "sync"] }
-toml = "0.8"
+toml = "1"

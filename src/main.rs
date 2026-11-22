@@ -15,8 +15,8 @@ use bairelay::config::{
 };
 use bairelay::local_time::LocalTimer;
 use bairelay::mqtt_loop::{
-	build_broker_config, build_rtsp_users, publish_shutdown_fanout, resolve_topic_prefix,
-	run_event_loop, SHUTDOWN_FANOUT_TIMEOUT,
+	SHUTDOWN_FANOUT_TIMEOUT, build_broker_config, build_rtsp_users, publish_shutdown_fanout,
+	resolve_topic_prefix, run_event_loop,
 };
 use bairelay::orchestrator::Orchestrator;
 use bairelay::run_support::{

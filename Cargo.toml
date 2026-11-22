@@ -60,8 +60,8 @@ default-members = [
 # and resets the build counter when the prefix changes.
 [workspace.package]
 version = "1.1.2"
-edition = "2021"
-rust-version = "1.93"
+edition = "2024"
+rust-version = "1.100"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/mgc8/bairelay"
 keywords = ["reolink", "rtsp", "mqtt", "baichuan", "home-assistant"]
@@ -90,7 +90,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-toml = "0.8"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -106,7 +106,6 @@ bairelay-rtsp.workspace = true
 bairelay-wake-server.workspace = true
 
 rustls = "0.23"
-rustls-pemfile = "2"
 # No-echo TTY input + plain-stdin read for `users add` / `users password`
 # when the operator omits the password positional. Keeps the secret out
 # of `ps auxww`, shell history, and supervisor argv-capture logs.
@@ -129,7 +128,7 @@ strip = "symbols"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
-rcgen = "0.13"
+rcgen = "0.14"
 
 # Enable bairelay_neolink_core's test scaffolding (`FakeCamera*`, `MockConnection*`,
 # `BcCamera::from_mock_connection`, `MotionData::test_new`) for the

@@ -205,8 +205,8 @@ mod tests {
 	/// report (account cameras) leaves IR unknown, not absent.
 	#[tokio::test]
 	async fn led_presence_reads_each_feature_from_its_own_signal() {
-		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 		use Presence::*;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 		let argus = support_with_led_ctrl(0, Some(0x4047));
 		let ir_cam = support_with_led_ctrl(0, Some(0x40));
 
@@ -285,8 +285,8 @@ mod tests {
 	/// Every field comes from its own detector for the camera's channel.
 	#[tokio::test]
 	async fn camera_capabilities_combines_every_detector() {
-		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 		use Presence::*;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 		let mut support = support_item(0, Some(1), None);
 		support.ptz_mode = Some("pt".to_string());
 		support.items[0].led_ctrl = Some(0x4047);

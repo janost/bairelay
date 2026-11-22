@@ -70,16 +70,16 @@ fn make_pki() -> Pki {
 		dn.push(rcgen::DnType::CommonName, "bairelay-test-ca");
 		dn
 	};
-	let ca = ca_params.self_signed(&ca_kp).unwrap();
+	let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
 
 	let server_kp = KeyPair::generate().unwrap();
 	let server_params =
 		CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-	let server_cert = server_params.signed_by(&server_kp, &ca, &ca_kp).unwrap();
+	let server_cert = server_params.signed_by(&server_kp, &ca).unwrap();
 
 	let client_kp = KeyPair::generate().unwrap();
 	let client_params = CertificateParams::new(vec!["test-client".into()]).unwrap();
-	let client_cert = client_params.signed_by(&client_kp, &ca, &ca_kp).unwrap();
+	let client_cert = client_params.signed_by(&client_kp, &ca).unwrap();
 
 	let mut roots = RootCertStore::empty();
 	roots.add(ca.der().clone()).unwrap();
@@ -251,11 +251,11 @@ fn make_wrong_ca_client_chain() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<
 		dn.push(rcgen::DnType::CommonName, "wrong-ca");
 		dn
 	};
-	let ca = ca_params.self_signed(&ca_kp).unwrap();
+	let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
 
 	let client_kp = KeyPair::generate().unwrap();
 	let client_params = CertificateParams::new(vec!["wrong-client".into()]).unwrap();
-	let client_cert = client_params.signed_by(&client_kp, &ca, &ca_kp).unwrap();
+	let client_cert = client_params.signed_by(&client_kp, &ca).unwrap();
 
 	(
 		vec![client_cert.der().clone()],

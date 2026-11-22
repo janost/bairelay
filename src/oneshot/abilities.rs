@@ -133,20 +133,28 @@ mod tests {
 		assert!(xml.contains("admin"));
 		assert!(xml.contains("reboot_rw"));
 		assert_eq!(entries.len(), 4);
-		assert!(entries
-			.iter()
-			.any(|e| e.module == "system" && e.name == "reboot" && e.kind == "rw"));
-		assert!(entries
-			.iter()
-			.any(|e| e.module == "system" && e.name == "general" && e.kind == "ro"));
-		assert!(entries
-			.iter()
-			.any(|e| e.module == "network" && e.name == "ping" && e.kind == "rw"));
+		assert!(
+			entries
+				.iter()
+				.any(|e| e.module == "system" && e.name == "reboot" && e.kind == "rw")
+		);
+		assert!(
+			entries
+				.iter()
+				.any(|e| e.module == "system" && e.name == "general" && e.kind == "ro")
+		);
+		assert!(
+			entries
+				.iter()
+				.any(|e| e.module == "network" && e.name == "ping" && e.kind == "rw")
+		);
 		// Underscore-bearing ability names survive: rsplit_once keeps
 		// `two_way_audio` as the name and `rw` as the kind.
-		assert!(entries
-			.iter()
-			.any(|e| e.module == "ptz" && e.name == "two_way_audio" && e.kind == "rw"));
+		assert!(
+			entries
+				.iter()
+				.any(|e| e.module == "ptz" && e.name == "two_way_audio" && e.kind == "rw")
+		);
 	}
 
 	#[tokio::test]

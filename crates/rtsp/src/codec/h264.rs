@@ -9,7 +9,7 @@
 //! (`stream_source::handle_iframe`) and the SDP `sprop-parameter-sets`
 //! fmtp attribute carries them out-of-band.
 
-use crate::rtp::{build_packet, RtpCounters};
+use crate::rtp::{RtpCounters, build_packet};
 
 /// RTP payload type for H.264 (dynamic; we use 96 by convention).
 pub const H264_PAYLOAD_TYPE: u8 = 96;

@@ -9,8 +9,8 @@ pub mod test_support;
 pub mod topics;
 
 pub use ai::AiObject;
-pub use client::{connect, ClientAuth, MqttConfig, MqttEventLoop, SharedMqttClient};
-pub use control::{parse_control_message, ControlCommand};
+pub use client::{ClientAuth, MqttConfig, MqttEventLoop, SharedMqttClient, connect};
+pub use control::{ControlCommand, parse_control_message};
 pub use discovery::{CameraEnableFlags, DiscoveryPublisher};
 pub use error::MqttError;
 pub use status::StatusPublisher;

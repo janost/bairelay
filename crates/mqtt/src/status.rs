@@ -1,7 +1,7 @@
 //! Status publishing helpers for pushing camera state to MQTT.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::ai::AiObject;
 use crate::client::SharedMqttClient;

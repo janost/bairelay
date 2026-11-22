@@ -1,9 +1,9 @@
 use super::model::*;
 use crate::Error;
+use cookie_factory::SerializeFn;
 use cookie_factory::bytes::*;
 use cookie_factory::sequence::tuple;
-use cookie_factory::SerializeFn;
-use cookie_factory::{combinator::*, gen};
+use cookie_factory::{combinator::*, r#gen};
 use std::io::Write;
 
 // PAD_SIZE: Media packets use 8 byte padding
@@ -36,14 +36,14 @@ impl BcMedia {
 	/// `deserialize` is fine. Tracked for future upstream alignment.
 	pub fn serialize<W: Write>(&self, buf: W) -> Result<W, Error> {
 		let (buf, _) = match &self {
-			BcMedia::InfoV1(payload) => gen(bcmedia_info_v1(payload), buf)?,
-			BcMedia::InfoV2(payload) => gen(bcmedia_info_v2(payload), buf)?,
+			BcMedia::InfoV1(payload) => r#gen(bcmedia_info_v1(payload), buf)?,
+			BcMedia::InfoV2(payload) => r#gen(bcmedia_info_v2(payload), buf)?,
 			BcMedia::Iframe(payload) => {
 				let pad_size = match payload.data.len() as u32 % PAD_SIZE {
 					0 => 0,
 					n => PAD_SIZE - n,
 				};
-				gen(
+				r#gen(
 					tuple((
 						bcmedia_iframe(payload),
 						slice(&payload.data),
@@ -57,7 +57,7 @@ impl BcMedia {
 					0 => 0,
 					n => PAD_SIZE - n,
 				};
-				gen(
+				r#gen(
 					tuple((
 						bcmedia_pframe(payload),
 						slice(&payload.data),
@@ -71,7 +71,7 @@ impl BcMedia {
 					0 => 0,
 					n => PAD_SIZE - n,
 				};
-				gen(
+				r#gen(
 					tuple((
 						bcmedia_aac(payload),
 						slice(&payload.data),
@@ -85,7 +85,7 @@ impl BcMedia {
 					0 => 0,
 					n => PAD_SIZE - n,
 				};
-				gen(
+				r#gen(
 					tuple((
 						bcmedia_adpcm(payload),
 						slice(&payload.data),
@@ -163,7 +163,7 @@ fn bcmedia_iframe<W: Write>(payload: &BcMediaIframe) -> impl SerializeFn<W> {
 		// fixed-size primitive serializers. `expect` documents the
 		// reasoning rather than `unwrap`'s silent-trust.
 		let extra_header = slice(
-			gen(tuple((le_u32(payload_time), le_u32(0))), vec![])
+			r#gen(tuple((le_u32(payload_time), le_u32(0))), vec![])
 				.expect("infallible: gen of fixed le_u32 tuple into Vec<u8> cannot fail")
 				.0,
 		);

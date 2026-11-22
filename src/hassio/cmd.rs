@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::config::{validate_config, CameraConfig, Config};
+use crate::config::{CameraConfig, Config, validate_config};
 use crate::hassio::{merge, options};
 
 #[allow(clippy::too_many_arguments)]
@@ -34,13 +34,13 @@ pub fn run(
 
 	let mut cfg = options::build_base_config(&opts, &mqtt_flags);
 
-	if let Some(p) = overlay {
-		if p.exists() {
-			let src = std::fs::read_to_string(p)
-				.map_err(|e| anyhow::anyhow!("read overlay at {}: {e}", p.display()))?;
-			let overlay_cfg = merge::parse_overlay(&src).map_err(|e| anyhow::anyhow!("{e}"))?;
-			cfg = merge::merge(cfg, overlay_cfg);
-		}
+	if let Some(p) = overlay
+		&& p.exists()
+	{
+		let src = std::fs::read_to_string(p)
+			.map_err(|e| anyhow::anyhow!("read overlay at {}: {e}", p.display()))?;
+		let overlay_cfg = merge::parse_overlay(&src).map_err(|e| anyhow::anyhow!("{e}"))?;
+		cfg = merge::merge(cfg, overlay_cfg);
 	}
 
 	validate_config(&cfg).map_err(|e| anyhow::anyhow!("merged config invalid: {e}"))?;

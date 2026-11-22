@@ -50,11 +50,9 @@ impl RtpCounters {
 	/// Construct a fresh counter pair with cryptographically random `ssrc`
 	/// and an unpredictable starting `seq`, per RFC 3550 recommendations.
 	pub fn random() -> Self {
-		use rand::Rng;
-		let mut rng = rand::thread_rng();
 		Self {
-			ssrc: rng.gen(),
-			seq: rng.gen(),
+			ssrc: rand::random(),
+			seq: rand::random(),
 		}
 	}
 

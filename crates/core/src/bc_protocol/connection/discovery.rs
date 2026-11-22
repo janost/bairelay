@@ -4,7 +4,7 @@
 //!
 use super::DiscoveryResult;
 use crate::bc::model::*;
-use crate::bc_protocol::{md5_string, Md5Trunc, TcpSource};
+use crate::bc_protocol::{Md5Trunc, TcpSource, md5_string};
 use crate::bcudp::codex::BcUdpCodex;
 use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
@@ -13,10 +13,9 @@ use futures::{
 	sink::SinkExt,
 	stream::{FuturesUnordered, StreamExt},
 };
-use lazy_static::lazy_static;
 use log::*;
-use rand::{seq::SliceRandom, thread_rng, Rng};
-use std::collections::{btree_map::Entry, BTreeMap, HashSet};
+use rand::seq::SliceRandom;
+use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 use std::convert::TryInto;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -24,11 +23,11 @@ use tokio::time::MissedTickBehavior;
 use tokio::{
 	net::UdpSocket,
 	sync::{
-		mpsc::{channel, Receiver, Sender},
 		RwLock, Semaphore,
+		mpsc::{Receiver, Sender, channel},
 	},
 	task::JoinSet,
-	time::{interval, timeout, Duration},
+	time::{Duration, interval, timeout},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -63,36 +62,33 @@ struct UidLookupResults {
 }
 
 const MTU: u32 = 1350;
-lazy_static! {
-	static ref P2P_RELAY_HOSTNAMES: [&'static str; 12] = [
-		"p2p.reolink.com",
-		"p2p1.reolink.com",
-		"p2p2.reolink.com",
-		"p2p3.reolink.com",
-		"p2p4.reolink.com",
-		"p2p5.reolink.com",
-		"p2p6.reolink.com",
-		"p2p7.reolink.com",
-		"p2p8.reolink.com",
-		"p2p9.reolink.com",
-		"p2p10.reolink.com",
-		"p2p11.reolink.com",
-		// These following are all currently set to 127.0.0.1
-		// probably reserved for future use
-		// "p2p12.reolink.com",
-		// "p2p13.reolink.com",
-		// "p2p14.reolink.com",
-		// "p2p15.reolink.com",
-		// "p2p16.reolink.com",
-	];
-	/// Maximum wait for a reply
-	static ref MAXIMUM_WAIT: Duration = Duration::from_secs(15);
-	/// Wait for tcp connections
-	static ref TCP_WAIT: Duration = Duration::from_secs(4);
-	/// How long to wait before resending
-	static ref RESEND_WAIT: Duration = Duration::from_millis(500);
-
-}
+const P2P_RELAY_HOSTNAMES: [&str; 12] = [
+	"p2p.reolink.com",
+	"p2p1.reolink.com",
+	"p2p2.reolink.com",
+	"p2p3.reolink.com",
+	"p2p4.reolink.com",
+	"p2p5.reolink.com",
+	"p2p6.reolink.com",
+	"p2p7.reolink.com",
+	"p2p8.reolink.com",
+	"p2p9.reolink.com",
+	"p2p10.reolink.com",
+	"p2p11.reolink.com",
+	// These following are all currently set to 127.0.0.1
+	// probably reserved for future use
+	// "p2p12.reolink.com",
+	// "p2p13.reolink.com",
+	// "p2p14.reolink.com",
+	// "p2p15.reolink.com",
+	// "p2p16.reolink.com",
+];
+/// Maximum wait for a reply
+const MAXIMUM_WAIT: Duration = Duration::from_secs(15);
+/// Wait for tcp connections
+const TCP_WAIT: Duration = Duration::from_secs(4);
+/// How long to wait before resending
+const RESEND_WAIT: Duration = Duration::from_millis(500);
 
 type Subscriber = Arc<RwLock<BTreeMap<u32, Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
 type Handlers = Arc<RwLock<Vec<Sender<Result<(UdpDiscovery, SocketAddr)>>>>>;
@@ -285,7 +281,7 @@ impl Discoverer {
 					}
 				}
 			} => v,
-			_ = tokio::time::sleep(*MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
+			_ = tokio::time::sleep(MAXIMUM_WAIT) => Err::<T, Error>(Error::DiscoveryTimeout),
 		}
 	}
 
@@ -320,18 +316,17 @@ impl Discoverer {
 		let mut reply = ReceiverStream::new(self.subscribe(target_tid).await?);
 		let msg = BcUdp::Discovery(disc);
 
-		let mut inter = interval(*RESEND_WAIT);
+		let mut inter = interval(RESEND_WAIT);
 		inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
 		let result = tokio::select! {
 			v = async {
 				// Recv while channel is viable
 				while let Some(msg) = reply.next().await {
-					if let Ok((reply, addr)) = msg {
-						if let Some(result) = map(reply, addr) {
+					if let Ok((reply, addr)) = msg
+						&& let Some(result) = map(reply, addr) {
 							return Ok(result);
 						}
-					}
 				}
 				Err(Error::DiscoveryIgnored)
 			} => {v},
@@ -346,7 +341,7 @@ impl Discoverer {
 			} => {Err::<T, Error>(v)},
 			_ = {
 				// Sleep then emit Timeout
-				tokio::time::sleep(*MAXIMUM_WAIT)
+				tokio::time::sleep(MAXIMUM_WAIT)
 			} => {
 				Err::<T, Error>(Error::DiscoveryTimeout)
 			}
@@ -361,7 +356,7 @@ impl Discoverer {
 			let target_tid = generate_tid();
 			disc.tid = target_tid;
 		}
-		let mut inter = interval(*RESEND_WAIT);
+		let mut inter = interval(RESEND_WAIT);
 		inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
 		let msg = BcUdp::Discovery(disc);
 
@@ -470,7 +465,7 @@ impl Discoverer {
 			}
 			(addrs, errors)
 		});
-		let out = timeout(*MAXIMUM_WAIT, task).await??;
+		let out = timeout(MAXIMUM_WAIT, task).await??;
 		trace!("Uid lookup to: {:?}", out.0);
 		Ok(out)
 	}
@@ -1180,7 +1175,7 @@ impl Discovery {
 		let username = "admin";
 		let password = Some("123456");
 		let mut tcp_source =
-			timeout(*TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
+			timeout(TCP_WAIT, TcpSource::new(addr, username, password, false)).await??;
 
 		let md5_username = md5_string(username, Md5Trunc::ZeroLast);
 		let md5_password = password
@@ -1204,7 +1199,7 @@ impl Discovery {
 			})
 			.await?;
 
-		let _bc: Bc = timeout(*TCP_WAIT, tcp_source.next())
+		let _bc: Bc = timeout(TCP_WAIT, tcp_source.next())
 			.await?
 			.ok_or(Error::CannotInitCamera)??; // Successful recv should mean a Bc packet if not then deser will fail
 		Ok(())
@@ -1424,13 +1419,13 @@ fn get_local_ip() -> Result<std::net::IpAddr> {
 /// fallback, which is identical to the legacy behaviour — no
 /// regression.
 fn get_local_ip_for_target(target: Option<std::net::IpAddr>) -> Result<std::net::IpAddr> {
-	let ifaces = get_if_addrs::get_if_addrs()?;
+	let ifaces = if_addrs::get_if_addrs()?;
 	if let Some(std::net::IpAddr::V4(target_v4)) = target {
 		for iface in &ifaces {
 			if iface.is_loopback() {
 				continue;
 			}
-			if let get_if_addrs::IfAddr::V4(v4) = &iface.addr {
+			if let if_addrs::IfAddr::V4(v4) = &iface.addr {
 				let mask_u32: u32 = v4.netmask.into();
 				let iface_u32: u32 = v4.ip.into();
 				let target_u32: u32 = target_v4.into();
@@ -1444,18 +1439,18 @@ fn get_local_ip_for_target(target: Option<std::net::IpAddr>) -> Result<std::net:
 	// behaviour when subnet-match finds nothing or target is unknown.
 	ifaces
 		.iter()
-		.find(|i| !i.is_loopback() && matches!(i.addr, get_if_addrs::IfAddr::V4(_)))
+		.find(|i| !i.is_loopback() && matches!(i.addr, if_addrs::IfAddr::V4(_)))
 		.map(|iface| Ok(iface.ip()))
 		.unwrap_or_else(|| Err(Error::Other("No Local Ip Address Found")))
 }
 
 fn get_broadcasts(ports: &[u16]) -> Result<Vec<SocketAddr>> {
 	let mut broadcasts = vec![Ipv4Addr::BROADCAST];
-	for iface in get_if_addrs::get_if_addrs()?.iter() {
-		if let get_if_addrs::IfAddr::V4(ifacev4) = &iface.addr {
-			if let Some(broadcast) = ifacev4.broadcast.as_ref() {
-				broadcasts.push(*broadcast);
-			}
+	for iface in if_addrs::get_if_addrs()?.iter() {
+		if let if_addrs::IfAddr::V4(ifacev4) = &iface.addr
+			&& let Some(broadcast) = ifacev4.broadcast.as_ref()
+		{
+			broadcasts.push(*broadcast);
 		}
 	}
 	let mut destinations: Vec<(Ipv4Addr, u16)> = broadcasts
@@ -1482,25 +1477,16 @@ fn generate_tid() -> u32 {
 	// 1 % per attempt and surfaced as `SimultaneousSubscription` warns
 	// at `register_at_all_relays`. With u32 the rate falls below 1e-7
 	// per attempt for any realistic relay count.
-	let mut rng = thread_rng();
-	let mut tid: u32 = rng.gen();
-	if tid == 0 {
-		tid = 1;
-	}
-	tid
+	rand::random::<u32>().max(1)
 }
 
 fn generate_cid() -> i32 {
-	let mut rng = thread_rng();
-	rng.gen()
+	rand::random()
 }
 
 async fn connect() -> Result<UdpSocket> {
 	let mut ports: Vec<u16> = (53500..54000).collect();
-	{
-		let mut rng = thread_rng();
-		ports.shuffle(&mut rng);
-	}
+	ports.shuffle(&mut rand::rng());
 
 	let addrs: Vec<_> = ports
 		.iter()
@@ -2149,13 +2135,13 @@ mod internal_tests {
 	/// (CI sandboxes).
 	#[test]
 	fn get_local_ip_for_target_prefers_subnet_match() {
-		let Ok(ifaces) = get_if_addrs::get_if_addrs() else {
+		let Ok(ifaces) = if_addrs::get_if_addrs() else {
 			return;
 		};
 		let v4_ifaces: Vec<_> = ifaces
 			.iter()
 			.filter_map(|i| match (&i.addr, i.is_loopback()) {
-				(get_if_addrs::IfAddr::V4(v4), false) => Some(v4.clone()),
+				(if_addrs::IfAddr::V4(v4), false) => Some(v4.clone()),
 				_ => None,
 			})
 			.collect();

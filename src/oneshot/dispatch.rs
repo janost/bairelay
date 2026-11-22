@@ -32,13 +32,11 @@ use crate::oneshot::{
 /// `Snapshot` with no `--output` path. Every other combination is
 /// valid and returns `Ok(())`.
 pub fn snapshot_json_preflight(json_mode: bool, cmd: &Command) -> Result<()> {
-	if json_mode {
-		if let Command::Snapshot { output: None, .. } = cmd {
-			return Err(UsageError::new(
-				"snapshot --json requires --output <path> (can't mix JSON and bytes on stdout)",
-			)
-			.into());
-		}
+	if json_mode && let Command::Snapshot { output: None, .. } = cmd {
+		return Err(UsageError::new(
+			"snapshot --json requires --output <path> (can't mix JSON and bytes on stdout)",
+		)
+		.into());
 	}
 	Ok(())
 }
@@ -689,7 +687,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn dispatch_service_variants_classify_as_unexpected() {
-		use crate::oneshot::classify::{classify, EXIT_UNEXPECTED, EXIT_USAGE};
+		use crate::oneshot::classify::{EXIT_UNEXPECTED, EXIT_USAGE, classify};
 
 		// Reaching `dispatch_oneshot` with a service-mode variant or
 		// CheckConfig is a programmer bug — must classify to

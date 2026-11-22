@@ -14,4 +14,4 @@ pub mod udp_pool;
 pub use registry::SessionRegistry;
 
 pub use listener::{RtspServer, ServerConfig};
-pub use tls::{install_crypto_provider, ClientAuthMode, TlsConfig, TlsConfigError};
+pub use tls::{ClientAuthMode, TlsConfig, TlsConfigError, install_crypto_provider};

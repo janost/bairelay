@@ -121,10 +121,10 @@ pub async fn mint_bundle(
 	refresh_token: Option<&str>,
 ) -> Result<Sigv3Bundle> {
 	let now = time::OffsetDateTime::now_utc().unix_timestamp();
-	if let Some((bundle, exp)) = cache().lock().unwrap().get(uid) {
-		if *exp - CACHE_MARGIN_SECS > now {
-			return Ok(bundle.clone());
-		}
+	if let Some((bundle, exp)) = cache().lock().unwrap().get(uid)
+		&& *exp - CACHE_MARGIN_SECS > now
+	{
+		return Ok(bundle.clone());
 	}
 
 	let bundle = mint_uncached(account, password, uid, mfa_trust_token, refresh_token).await?;

@@ -6,7 +6,9 @@
 
 use bairelay_rtsp::codec::{h264, h265};
 use bairelay_rtsp::rtp::RtpCounters;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const MTU: usize = 1400;
 

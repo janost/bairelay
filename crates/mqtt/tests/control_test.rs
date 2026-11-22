@@ -6,7 +6,7 @@
 // bairelay-default prefix is covered explicitly in one top-of-file
 // test so coverage is not neolink-only.
 
-use bairelay_mqtt::control::{parse_control_message, ControlCommand};
+use bairelay_mqtt::control::{ControlCommand, parse_control_message};
 
 const P: &str = "neolink";
 

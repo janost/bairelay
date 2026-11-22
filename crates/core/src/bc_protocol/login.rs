@@ -1,10 +1,10 @@
 use super::credentials::Credentials;
-use super::{md5_string, BcCamera, Error, Result, Truncate};
+use super::{BcCamera, Error, Result, Truncate, md5_string};
 use crate::bc::{model::*, xml::*};
 use std::sync::atomic::Ordering;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_xml, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_xml};
 
 /// Legacy-login `response_code` byte the client sends to announce the
 /// highest encryption it's willing to negotiate. The camera replies
@@ -194,7 +194,7 @@ impl BcCamera {
 					return Err(Error::UnintelligibleReply {
 						reply: std::sync::Arc::new(legacy_reply),
 						why: "Expected an Encryption message back",
-					})
+					});
 				}
 			}
 
@@ -349,7 +349,7 @@ impl BcCamera {
 								body: other,
 							}),
 							why: "Expected a DeviceInfo message back from login",
-						})
+						});
 					}
 				}
 			}
@@ -1350,8 +1350,8 @@ mod tests {
 		// authLogin path: legacy → Encryption{authTypeList: getAccesskey, no
 		// ECDHE} → getAccesskey (binary AES challenge) → authLogin → DeviceInfo.
 		use crate::bc::crypto::EncryptionProtocol;
-		use crate::bc_protocol::connection::mock::reply_200_xml;
 		use crate::bc_protocol::Credentials;
+		use crate::bc_protocol::connection::mock::reply_200_xml;
 		use base64::Engine as _;
 
 		let b64 = base64::engine::general_purpose::STANDARD;
@@ -1431,8 +1431,8 @@ mod tests {
 	#[tokio::test]
 	async fn run_authlogin_rejects_non_binary_challenge() {
 		// getAccesskey reply that isn't a binary challenge -> CameraLoginFail.
-		use crate::bc_protocol::connection::mock::reply_200_xml;
 		use crate::bc_protocol::Credentials;
+		use crate::bc_protocol::connection::mock::reply_200_xml;
 		let nonce = "n";
 		let creds = Credentials::new("admin", Some("pw".to_string()));
 		let mock = MockConnection::new()

@@ -7,12 +7,12 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use bairelay_mqtt::control::{ControlCommand, IrMode, PtzDirection};
-use bairelay_mqtt::{topics, SharedMqttClient, StatusPublisher};
+use bairelay_mqtt::{SharedMqttClient, StatusPublisher, topics};
 
 use bairelay_neolink_core::bc_protocol::{Direction, LightState};
 
 use crate::camera::CameraHandle;
-use crate::camera_tasks::{publish_after_led_write, LedWrite};
+use crate::camera_tasks::{LedWrite, publish_after_led_write};
 
 pub async fn dispatch_control(
 	cmd: ControlCommand,
@@ -191,11 +191,11 @@ pub async fn dispatch_control(
 		} => {
 			let result =
 				timeout_to_result(timeout(CMD_TIMEOUT, bc.moveto_ptz_preset(preset_id)).await);
-			if result.is_ok() {
-				if let Some(name) = cam.preset_name_for_id(preset_id) {
-					let topic = topics::status_ptz_preset(topic_prefix, camera);
-					let _ = mqtt.publish_retained(&topic, name.as_bytes()).await;
-				}
+			if result.is_ok()
+				&& let Some(name) = cam.preset_name_for_id(preset_id)
+			{
+				let topic = topics::status_ptz_preset(topic_prefix, camera);
+				let _ = mqtt.publish_retained(&topic, name.as_bytes()).await;
 			}
 			result
 		}
@@ -799,9 +799,10 @@ mod tests {
 
 		assert_eq!(*fake.calls().led_light_set.lock().unwrap(), vec![true]);
 		let rows = mock.published();
-		assert!(rows
-			.iter()
-			.any(|(t, p, _)| t == "bairelay/cam-led/control/led" && p == b"OK"));
+		assert!(
+			rows.iter()
+				.any(|(t, p, _)| t == "bairelay/cam-led/control/led" && p == b"OK")
+		);
 		assert!(
 			rows.iter()
 				.any(|(t, p, r)| t == "bairelay/cam-led/status/led" && p == b"on" && *r),
@@ -847,12 +848,13 @@ mod tests {
 			assert_eq!(calls.len(), 1, "one irled_light_set call per dispatch");
 			assert_eq!(calls[0], expected);
 			// New mode republished on status/ir (retained) and cached.
-			assert!(mock
-				.published()
-				.iter()
-				.any(|(t, p, r)| t == "bairelay/cam-ir/status/ir"
-					&& p == mode.as_payload().as_bytes()
-					&& *r));
+			assert!(
+				mock.published()
+					.iter()
+					.any(|(t, p, r)| t == "bairelay/cam-ir/status/ir"
+						&& p == mode.as_payload().as_bytes()
+						&& *r)
+			);
 			assert_eq!(cameras["cam-ir"].status_cache().ir(), Some(mode));
 		}
 	}
@@ -1137,11 +1139,12 @@ mod tests {
 			"bairelay",
 		)
 		.await;
-		assert!(mock
-			.published()
-			.iter()
-			.any(|(t, p, _)| t == "bairelay/cam-qb/status/battery"
-				&& std::str::from_utf8(p).unwrap_or("").contains("42")));
+		assert!(
+			mock.published()
+				.iter()
+				.any(|(t, p, _)| t == "bairelay/cam-qb/status/battery"
+					&& std::str::from_utf8(p).unwrap_or("").contains("42"))
+		);
 	}
 
 	/// `QueryBattery` with a driver error — the dispatch still completes,
@@ -1242,10 +1245,12 @@ mod tests {
 			"bairelay",
 		)
 		.await;
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpe/status/preview"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpe/status/preview")
+		);
 	}
 
 	/// `QueryPreview` with `preview_overlay = false` takes the
@@ -1288,10 +1293,11 @@ mod tests {
 		)
 		.await;
 
-		assert!(mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpov/status/preview"));
+		assert!(
+			mock.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpov/status/preview")
+		);
 	}
 
 	/// `QueryPir` publishes the camera's PIR state on `status/pir`.
@@ -1317,10 +1323,11 @@ mod tests {
 			"bairelay",
 		)
 		.await;
-		assert!(mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpir/status/pir"));
+		assert!(
+			mock.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpir/status/pir")
+		);
 	}
 
 	/// `QueryPir` with a driver error — dispatch returns without
@@ -1345,10 +1352,12 @@ mod tests {
 			"bairelay",
 		)
 		.await;
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpe/status/pir"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpe/status/pir")
+		);
 	}
 
 	/// `QueryPtzPreset` re-queries the camera, replaces the cached
@@ -1401,10 +1410,11 @@ mod tests {
 			vec![(1u8, "Garden".to_string()), (2u8, "Driveway".to_string())],
 			"QueryPtzPreset must replace the cache with fresh camera data"
 		);
-		assert!(mock
-			.published()
-			.iter()
-			.any(|(t, p, _)| t == "bairelay/cam-qptz/query/ptz/preset" && p == b"OK"));
+		assert!(
+			mock.published()
+				.iter()
+				.any(|(t, p, _)| t == "bairelay/cam-qptz/query/ptz/preset" && p == b"OK")
+		);
 	}
 
 	/// When `get_ptz_preset` returns an error, the handler logs and
@@ -1438,10 +1448,11 @@ mod tests {
 			vec![(7u8, "Front".to_string())],
 			"driver error must not clobber the previously-cached presets"
 		);
-		assert!(mock
-			.published()
-			.iter()
-			.any(|(t, p, _)| t == "bairelay/cam-qptze/query/ptz/preset" && p == b"OK"));
+		assert!(
+			mock.published()
+				.iter()
+				.any(|(t, p, _)| t == "bairelay/cam-qptze/query/ptz/preset" && p == b"OK")
+		);
 	}
 
 	/// When `get_ptz_preset` hangs past `CMD_TIMEOUT` the handler logs
@@ -1552,10 +1563,12 @@ mod tests {
 		let (_, _) = tokio::join!(dispatch, async {
 			tokio::time::advance(Duration::from_secs(31)).await;
 		});
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpit/status/pir"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpit/status/pir")
+		);
 	}
 
 	/// `QueryPreview` whose driver hangs past 30 s — no preview publish.
@@ -1575,10 +1588,12 @@ mod tests {
 		let (_, _) = tokio::join!(dispatch, async {
 			tokio::time::advance(Duration::from_secs(31)).await;
 		});
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-qpvt/status/preview"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-qpvt/status/preview")
+		);
 	}
 
 	/// PTZ where `send_ptz(direction)` hangs past the 30 s timeout —

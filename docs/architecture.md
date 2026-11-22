@@ -41,7 +41,7 @@ Owns the application lifecycle:
 
 ### `crates/core/` — `bairelay_neolink_core`
 
-Vendored Baichuan protocol implementation. Modernised to edition 2021 with updated dependencies. Public surface:
+Vendored Baichuan protocol implementation. Modernised to edition 2024 with updated dependencies. Public surface:
 
 - `BcCamera` — async API for every camera operation: login, streaming, PTZ, motion detection, battery, LED, reboot, etc.
 - `CameraDriver` — `dyn`-compatible trait mirroring the subset of `BcCamera` the binary's non-stream code paths call. Lets test code substitute a `FakeCamera` without a live camera session.

@@ -262,10 +262,10 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
 	let s = std::str::from_utf8(headers).ok()?;
 	for line in s.split("\r\n") {
-		if let Some((name, value)) = line.split_once(':') {
-			if name.eq_ignore_ascii_case("Content-Length") {
-				return value.trim().parse().ok();
-			}
+		if let Some((name, value)) = line.split_once(':')
+			&& name.eq_ignore_ascii_case("Content-Length")
+		{
+			return value.trim().parse().ok();
 		}
 	}
 	None
@@ -282,7 +282,7 @@ pub(crate) async fn dispatch_request(
 	state: &Arc<ConnectionState>,
 	req_bytes: &[u8],
 ) -> io::Result<()> {
-	use crate::rtsp::message::{build_response, parse_request, RtspMethod};
+	use crate::rtsp::message::{RtspMethod, build_response, parse_request};
 
 	let parsed = match parse_request(req_bytes) {
 		Ok(p) => p,
@@ -554,7 +554,7 @@ async fn authenticate(
 	method: &str,
 ) -> AuthOutcome {
 	use crate::rtsp::auth::{
-		build_basic_challenge, build_digest_challenge, verify_basic, verify_digest, AuthError,
+		AuthError, build_basic_challenge, build_digest_challenge, verify_basic, verify_digest,
 	};
 	let nonce = state.current_nonce.lock().await.clone();
 	let Some(authz) = parsed.authorization.as_deref() else {
@@ -1005,11 +1005,11 @@ async fn handle_play(
 	if let Some(slot) = state.sessions.first_video_rtp(sid) {
 		let mut found: Option<(u16, u32)> = None;
 		for _ in 0..10 {
-			if let Ok(guard) = slot.lock() {
-				if let Some(pair) = *guard {
-					found = Some(pair);
-					break;
-				}
+			if let Ok(guard) = slot.lock()
+				&& let Some(pair) = *guard
+			{
+				found = Some(pair);
+				break;
 			}
 			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 		}
@@ -1312,10 +1312,10 @@ mod tests {
 				// Parse Content-Length.
 				let mut cl = 0usize;
 				for line in head.split("\r\n") {
-					if let Some((k, v)) = line.split_once(':') {
-						if k.eq_ignore_ascii_case("Content-Length") {
-							cl = v.trim().parse().unwrap_or(0);
-						}
+					if let Some((k, v)) = line.split_once(':')
+						&& k.eq_ignore_ascii_case("Content-Length")
+					{
+						cl = v.trim().parse().unwrap_or(0);
 					}
 				}
 				let body_start = pos + 4;
@@ -1616,7 +1616,7 @@ mod tests {
 			password: "pw".into(),
 		}];
 		let (state, mut client) = make_state_with_users(provider, users);
-		use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+		use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 		let bad = B64.encode("alice:wrong");
 		let req = format!(
 			"DESCRIBE rtsp://x/cam1/main RTSP/1.0\r\nCSeq: 4\r\nAuthorization: Basic {bad}\r\n\r\n"
@@ -1634,7 +1634,7 @@ mod tests {
 			password: "pw".into(),
 		}];
 		let (state, mut client) = make_state_with_users(provider, users);
-		use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+		use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 		let tok = B64.encode("alice:pw");
 		let req = format!(
 			"DESCRIBE rtsp://x/cam1/main RTSP/1.0\r\nCSeq: 4\r\nAuthorization: Basic {tok}\r\n\r\n"
@@ -1732,7 +1732,7 @@ mod tests {
 			password: "pw".into(),
 		}];
 		let (state, mut client) = make_state_with_users(provider, users);
-		use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+		use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 		let bad = B64.encode("alice:bad");
 		let req = format!(
 			"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 5\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nAuthorization: Basic {bad}\r\n\r\n"

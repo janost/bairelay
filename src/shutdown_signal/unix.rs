@@ -1,7 +1,7 @@
 //! Unix: SIGINT (Ctrl+C) or SIGTERM.
 
 use std::future::Future;
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 pub(super) fn requested() -> impl Future<Output = &'static str> + Send + 'static {
 	// `signal()` installs each handler synchronously, replacing the

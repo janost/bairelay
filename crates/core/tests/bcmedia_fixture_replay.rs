@@ -16,8 +16,8 @@
 //!     boundaries.)
 //!   - A truncated capture returns `Err`, not `Ok` and not a panic.
 
-use bairelay_neolink_core::bcmedia::model::*;
 use bairelay_neolink_core::Error;
+use bairelay_neolink_core::bcmedia::model::*;
 use bytes::BytesMut;
 use std::io::ErrorKind;
 
@@ -60,11 +60,11 @@ fn assert_timestamps_reasonable(frames: &[BcMedia]) {
 	let mut last: Option<u32> = None;
 	for f in frames {
 		if let Some(ts) = frame_microseconds(f) {
-			if let Some(prev) = last {
-				if ts + 1_000_000 < prev {
-					// > 1 second back is a clear reset.
-					resets += 1;
-				}
+			if let Some(prev) = last
+				&& ts + 1_000_000 < prev
+			{
+				// > 1 second back is a clear reset.
+				resets += 1;
 			}
 			last = Some(ts);
 		}

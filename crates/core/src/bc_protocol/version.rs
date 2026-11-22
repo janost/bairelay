@@ -2,7 +2,7 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_xml, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_xml};
 
 impl BcCamera {
 	/// Request the [VersionInfo] xml
@@ -35,7 +35,6 @@ impl BcCamera {
 				code: modern_reply.meta.response_code,
 			});
 		}
-		let version_info;
 		match modern_reply.body {
 			BcBody::ModernMsg(ModernMsg {
 				payload:
@@ -44,18 +43,12 @@ impl BcCamera {
 						..
 					})),
 				..
-			}) => {
-				version_info = info;
-			}
-			_ => {
-				return Err(Error::UnintelligibleReply {
-					reply: std::sync::Arc::new(modern_reply),
-					why: "Expected a VersionInfo message",
-				})
-			}
+			}) => Ok(info),
+			_ => Err(Error::UnintelligibleReply {
+				reply: std::sync::Arc::new(modern_reply),
+				why: "Expected a VersionInfo message",
+			}),
 		}
-
-		Ok(version_info)
 	}
 }
 

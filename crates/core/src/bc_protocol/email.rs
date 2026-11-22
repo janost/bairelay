@@ -15,7 +15,7 @@ use crate::bc::{model::*, xml::*};
 
 #[cfg(test)]
 use crate::bc_protocol::connection::mock::{
-	reply_200_empty, reply_200_xml, reply_err_code, MockConnection,
+	MockConnection, reply_200_empty, reply_200_xml, reply_err_code,
 };
 
 impl BcCamera {

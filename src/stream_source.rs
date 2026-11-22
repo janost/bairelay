@@ -36,10 +36,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bairelay_rtsp::buffer::{LastFrameBuffer, VideoBurst};
-use bairelay_rtsp::codec::nal::{
-	detect_codec, is_decodable_nal, split_annex_b, H264NalType, H265NalType,
-};
 use bairelay_rtsp::codec::VideoCodec;
+use bairelay_rtsp::codec::nal::{
+	H264NalType, H265NalType, detect_codec, is_decodable_nal, split_annex_b,
+};
 use bairelay_rtsp::provider::Frame;
 use bairelay_rtsp::sdp::{SdpParams, VideoParams};
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
@@ -1501,7 +1501,7 @@ async fn drive_translator_loop<S: PacketSource>(args: TranslatorLoopArgs, source
 
 	// Graceful teardown: flush the capture buffer before returning so a
 	// wedged camera doesn't swallow the last few frames.
-	if let Some(ref mut d) = dumper {
+	if let Some(d) = &mut dumper {
 		d.flush();
 	}
 }
@@ -1646,7 +1646,7 @@ fn maybe_capture_packet(
 			}
 		}
 	}
-	if let Some(ref mut d) = dumper {
+	if let Some(d) = dumper {
 		d.write_frame(packet);
 	}
 }
@@ -2223,10 +2223,10 @@ fn handle_aac(
 	state: &mut StreamTranslatorState,
 	gap_state: &Mutex<GapState>,
 ) {
-	use bairelay_rtsp::codec::aac::{
-		build_audio_specific_config_hex, parse_adts, AAC_PAYLOAD_TYPE, ADTS_HEADER_LEN,
-	};
 	use bairelay_rtsp::codec::AudioCodec;
+	use bairelay_rtsp::codec::aac::{
+		AAC_PAYLOAD_TYPE, ADTS_HEADER_LEN, build_audio_specific_config_hex, parse_adts,
+	};
 	use bairelay_rtsp::provider::AudioPayload;
 	use bairelay_rtsp::sdp::AudioParams;
 
@@ -2490,8 +2490,8 @@ fn handle_adpcm(
 	state: &mut StreamTranslatorState,
 	gap_state: &Mutex<GapState>,
 ) {
-	use bairelay_rtsp::codec::g711::{encode as g711_encode, G711_PAYLOAD_TYPE};
 	use bairelay_rtsp::codec::AudioCodec;
+	use bairelay_rtsp::codec::g711::{G711_PAYLOAD_TYPE, encode as g711_encode};
 	use bairelay_rtsp::provider::AudioPayload;
 	use bairelay_rtsp::sdp::AudioParams;
 	use bairelay_rtsp::transcode::{adpcm::AdpcmDecoder, resample::decimate_16_to_8};
@@ -4264,10 +4264,11 @@ mod tests {
 	#[tokio::test]
 	async fn stream_source_await_sdp_ready_times_out_without_video() {
 		let src = StreamSource::start_inert_for_test();
-		assert!(src
-			.await_sdp_ready(Duration::from_millis(50))
-			.await
-			.is_err());
+		assert!(
+			src.await_sdp_ready(Duration::from_millis(50))
+				.await
+				.is_err()
+		);
 	}
 
 	#[tokio::test]
@@ -4288,10 +4289,11 @@ mod tests {
 			}),
 			audio: None,
 		});
-		assert!(src
-			.await_sdp_both_ready(Duration::from_millis(50))
-			.await
-			.is_err());
+		assert!(
+			src.await_sdp_both_ready(Duration::from_millis(50))
+				.await
+				.is_err()
+		);
 	}
 
 	#[tokio::test]

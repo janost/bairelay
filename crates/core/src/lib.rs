@@ -87,7 +87,7 @@ pub use bc_protocol::Error;
 
 pub(crate) use bc_protocol::{Credentials, Result};
 
-pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
+pub(crate) type NomErrorType<'a> = nom_language::error::VerboseError<&'a [u8]>;
 
 /// The unit tests' capturing `log` logger.
 #[cfg(test)]
@@ -119,11 +119,11 @@ pub mod fuzz_api {
 		crate::bc::xml::BcXml::try_parse(input)
 	}
 
-	pub use crate::bc_protocol::connection::udpsource::{UdpFlowState, REORDER_CAP};
+	pub use crate::bc_protocol::connection::udpsource::{REORDER_CAP, UdpFlowState};
 	pub use crate::bcudp::model::{UdpAck, UdpData};
 	pub use crate::ha_webhook::{
-		alarm_events_from_xml, parse_http_request, parse_webhook_body, HttpRequestError,
-		WebhookEvent, MAX_BODY_BYTES, MAX_HEADER_BYTES,
+		HttpRequestError, MAX_BODY_BYTES, MAX_HEADER_BYTES, WebhookEvent, alarm_events_from_xml,
+		parse_http_request, parse_webhook_body,
 	};
 
 	/// Drive a sequence of `UdpFlowState` operations parsed from
@@ -234,11 +234,11 @@ pub mod pcap_decode_api {
 	use crate::bc::xml::{BcPayloads, BcXml, Encryption};
 	use crate::bcudp::model::BcUdp;
 
+	pub use crate::Error;
 	pub use crate::bc::model::{Bc as BcMessage, BcMeta as BcMessageMeta};
 	pub use crate::bc::xml::BcXml as DecodedXml;
 	pub use crate::bc_protocol::Credentials;
 	pub use crate::bcudp::model::{UdpAck, UdpData, UdpDiscovery};
-	pub use crate::Error;
 
 	/// Source of a UDP datagram in a captured session.
 	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,24 +417,23 @@ pub mod pcap_decode_api {
 									..
 								}),
 						} = bc
+							&& response_code >> 8 == 0xdd
 						{
-							if response_code >> 8 == 0xdd {
-								let kind = (response_code & 0xff) as u8;
-								let new_proto = match kind {
-									0x00 => EncryptionProtocol::Unencrypted,
-									0x01 => EncryptionProtocol::BCEncrypt,
-									0x02 => EncryptionProtocol::aes(
-										self.ctx.credentials.make_aeskey(nonce),
-									),
-									0x12 => EncryptionProtocol::full_aes(
-										self.ctx.credentials.make_aeskey(nonce),
-									),
-									other => {
-										return Err(Error::UnknownEncryption(other as usize));
-									}
-								};
-								self.ctx.set_encrypted(new_proto);
-							}
+							let kind = (response_code & 0xff) as u8;
+							let new_proto = match kind {
+								0x00 => EncryptionProtocol::Unencrypted,
+								0x01 => EncryptionProtocol::BCEncrypt,
+								0x02 => {
+									EncryptionProtocol::aes(self.ctx.credentials.make_aeskey(nonce))
+								}
+								0x12 => EncryptionProtocol::full_aes(
+									self.ctx.credentials.make_aeskey(nonce),
+								),
+								other => {
+									return Err(Error::UnknownEncryption(other as usize));
+								}
+							};
+							self.ctx.set_encrypted(new_proto);
 						}
 
 						// Mirror BcCodex's binary-mode bookkeeping
@@ -462,7 +461,7 @@ pub mod pcap_decode_api {
 						let manually_decrypted_binary =
 							match (&self.ctx.encryption_protocol, &bc.body) {
 								(
-									EncryptionProtocol::FullAes { .. },
+									EncryptionProtocol::FullAes(_),
 									BcBody::ModernMsg(ModernMsg {
 										payload: Some(BcPayloads::Binary(bytes)),
 										..

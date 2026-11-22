@@ -59,16 +59,16 @@ use tokio_util::sync::CancellationToken;
 
 use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
 use bairelay_neolink_core::bc::xml::AlarmEvent;
-use bairelay_neolink_core::bc_protocol::{classify_alarm_events, MotionStatus, VisitorEdge};
+use bairelay_neolink_core::bc_protocol::{MotionStatus, VisitorEdge, classify_alarm_events};
 use bairelay_neolink_core::ha_webhook::{
-	alarm_events_from_xml, parse_http_request, parse_webhook_body, HttpRequestError, WakeReason,
-	WebhookEvent, HEADER_END, MAX_BODY_BYTES, MAX_HEADER_BYTES, TOKEN_HEX_LEN,
+	HEADER_END, HttpRequestError, MAX_BODY_BYTES, MAX_HEADER_BYTES, TOKEN_HEX_LEN, WakeReason,
+	WebhookEvent, alarm_events_from_xml, parse_http_request, parse_webhook_body,
 };
 use bairelay_wake_server::route::advertise_ip;
 
 use crate::camera::CameraHandle;
-use crate::camera_tasks::{report_alarm_update, report_doorbell_press, AiBaseline, AlarmReport};
-use crate::config::{parse_webhook_advertise, WebhookAdvertise, WebhookConfig};
+use crate::camera_tasks::{AiBaseline, AlarmReport, report_alarm_update, report_doorbell_press};
+use crate::config::{WebhookAdvertise, WebhookConfig, parse_webhook_advertise};
 use crate::status_cache::WakeSource;
 use crate::stream_source::MutexPoisonRecover as _;
 use crate::wake_events::{claim_wake, event_mqtt, motion_edge, motion_hold, spawn_wake_hold};
@@ -700,8 +700,8 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::config::test_helpers::minimal_camera_config;
 	use crate::config::CameraConfig;
+	use crate::config::test_helpers::minimal_camera_config;
 	use bairelay_mqtt::test_support::MockHandle;
 	use std::net::IpAddr;
 	use std::time::Duration;

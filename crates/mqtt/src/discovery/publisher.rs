@@ -16,10 +16,10 @@ use crate::client::SharedMqttClient;
 use crate::error::MqttError;
 
 use super::{
-	absent_hardware_retractions, build_ai_binary_sensors, build_battery, build_camera,
-	build_doorbell, build_floodlight_light, build_floodlight_tasks_switch, build_ir, build_led,
-	build_motion, build_pir, build_pt_buttons, build_ptz_presets, build_reboot, build_siren,
-	CameraCapabilitiesView, DiscoveryContext, Feature,
+	CameraCapabilitiesView, DiscoveryContext, Feature, absent_hardware_retractions,
+	build_ai_binary_sensors, build_battery, build_camera, build_doorbell, build_floodlight_light,
+	build_floodlight_tasks_switch, build_ir, build_led, build_motion, build_pir, build_pt_buttons,
+	build_ptz_presets, build_reboot, build_siren,
 };
 
 /// Per-camera enable toggles. Mirrors the binary's per-camera
@@ -432,11 +432,11 @@ impl DiscoveryPublisher {
 	/// record since `generation`: that one owns the set now.
 	fn forget_deleted(&self, camera: &str, generation: u64, deleted: &[String]) {
 		let mut guard = self.lock_last_published();
-		if let Some(entry) = guard.get_mut(camera) {
-			if entry.generation == generation {
-				for topic in deleted {
-					entry.topics.remove(topic);
-				}
+		if let Some(entry) = guard.get_mut(camera)
+			&& entry.generation == generation
+		{
+			for topic in deleted {
+				entry.topics.remove(topic);
 			}
 		}
 	}

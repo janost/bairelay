@@ -14,10 +14,10 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::WakeServerError;
 use crate::config::RuntimeConfig;
 use crate::packet::{decode_discovery, encode_discovery, random_sid};
 use crate::registry::{CameraRegistry, SessionAnchors};
-use crate::WakeServerError;
 
 const WAKE_BURST_COUNT: usize = 10;
 const WAKE_BURST_INTERVAL: Duration = Duration::from_millis(100);
@@ -253,13 +253,13 @@ async fn handle_connect(
 						}
 					}
 				});
-				if let Err(e) = burst.await {
-					if e.is_panic() {
-						warn!(
-							%cam_addr, sid, cid,
-							"wake burst task panicked; camera will not receive R2D_C — operator should check logs",
-						);
-					}
+				if let Err(e) = burst.await
+					&& e.is_panic()
+				{
+					warn!(
+						%cam_addr, sid, cid,
+						"wake burst task panicked; camera will not receive R2D_C — operator should check logs",
+					);
 				}
 			});
 

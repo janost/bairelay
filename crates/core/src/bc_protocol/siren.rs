@@ -4,7 +4,7 @@ use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_empty, reply_err_code, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty, reply_err_code};
 
 impl BcCamera {
 	/// Trigger the siren

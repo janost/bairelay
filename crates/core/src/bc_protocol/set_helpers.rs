@@ -17,8 +17,8 @@
 
 use std::time::Duration;
 
-use super::connection::BcSubscription;
 use super::Error;
+use super::connection::BcSubscription;
 use crate::Result;
 
 /// 500 ms wait for the camera's reply before treating absence as

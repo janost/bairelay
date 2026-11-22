@@ -1,12 +1,12 @@
-use super::{classify_alarm_events, AlarmUpdate, BcCamera, Error, Result};
+use super::{AlarmUpdate, BcCamera, Error, Result, classify_alarm_events};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{channel, error::TryRecvError, Receiver};
+use tokio::sync::mpsc::{Receiver, channel, error::TryRecvError};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_empty, reply_err_code, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty, reply_err_code};
 
 /// Motion Status that the callback can send
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

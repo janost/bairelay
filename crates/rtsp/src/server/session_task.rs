@@ -22,8 +22,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::sync::broadcast;
 use tokio::sync::Notify;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::LastFrameBuffer;
@@ -174,16 +174,13 @@ async fn dispatch_one(
 
 	// First video packet's (seq, rtp_ts) is recorded once for the
 	// PLAY handler's `RTP-Info:` header.
-	if let (Some(slot), TrackKind::Video) = (first_video_rtp, track.kind) {
-		if !packets.is_empty() {
-			if let Ok(mut guard) = slot.lock() {
-				if guard.is_none() {
-					if let Some(pts) = pts_for_first {
-						*guard = Some((seq_for_first, pts));
-					}
-				}
-			}
-		}
+	if let (Some(slot), TrackKind::Video) = (first_video_rtp, track.kind)
+		&& !packets.is_empty()
+		&& let Ok(mut guard) = slot.lock()
+		&& guard.is_none()
+		&& let Some(pts) = pts_for_first
+	{
+		*guard = Some((seq_for_first, pts));
 	}
 
 	Ok(())
@@ -380,14 +377,14 @@ async fn video_dispatch_loop(
 	// dispatch has already started in parallel — replay does not block
 	// audio.
 	let mut awaiting_live_keyframe = false;
-	if let Some(t) = track.as_mut() {
-		if let Some(burst) = last_frame.video_snapshot() {
-			// Only arm the keyframe gate when replay actually emitted
-			// something. An empty `iframe_nals` burst would otherwise
-			// suppress live P-frames until the camera's next IDR for
-			// nothing in return.
-			awaiting_live_keyframe = replay_burst(&burst, &t.transport, &mut t.counters).await;
-		}
+	if let Some(t) = track.as_mut()
+		&& let Some(burst) = last_frame.video_snapshot()
+	{
+		// Only arm the keyframe gate when replay actually emitted
+		// something. An empty `iframe_nals` burst would otherwise
+		// suppress live P-frames until the camera's next IDR for
+		// nothing in return.
+		awaiting_live_keyframe = replay_burst(&burst, &t.transport, &mut t.counters).await;
 	}
 
 	loop {
@@ -493,7 +490,7 @@ async fn replay_burst(
 	transport: &Arc<dyn Transport>,
 	counters: &mut RtpCounters,
 ) -> bool {
-	use crate::codec::{h264, h265, VideoCodec};
+	use crate::codec::{VideoCodec, h264, h265};
 	// Use the camera-side pts captured at burst recording time. This
 	// keeps the replay packets continuous with subsequent live-frame
 	// packets (whose pts come from the same camera clock), avoiding a

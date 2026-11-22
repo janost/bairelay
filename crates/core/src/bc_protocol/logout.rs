@@ -3,7 +3,7 @@ use crate::bc::{model::*, xml::*};
 use std::sync::atomic::Ordering;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_empty, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty};
 
 impl BcCamera {
 	/// Logout from the camera

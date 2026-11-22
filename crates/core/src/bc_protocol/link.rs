@@ -4,7 +4,7 @@ use crate::bc::{model::*, xml::*};
 #[cfg(test)]
 use crate::bc_protocol::{
 	camera_driver::CameraDriver,
-	connection::mock::{reply_200_xml, reply_err_code, MockConnection},
+	connection::mock::{MockConnection, reply_200_xml, reply_err_code},
 };
 
 impl BcCamera {

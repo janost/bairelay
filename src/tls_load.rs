@@ -8,13 +8,13 @@
 //! tried to open.
 
 use std::fs;
-use std::io::Cursor;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bairelay_rtsp::server::{ClientAuthMode, TlsConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
+use rustls::pki_types::pem::{PemObject, SectionKind};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::TlsClientAuth;
 
@@ -73,21 +73,19 @@ struct PemItems {
 fn parse_pem(pem: &[u8], label: &str) -> Result<PemItems> {
 	let mut certs = Vec::new();
 	let mut key = None;
-	for item in rustls_pemfile::read_all(&mut Cursor::new(pem)) {
-		let parsed = item.with_context(|| format!("PEM parse error in {label}"))?;
-		match parsed {
-			rustls_pemfile::Item::X509Certificate(c) => certs.push(c),
-			rustls_pemfile::Item::Pkcs1Key(k) => {
-				set_key_or_reject(&mut key, PrivateKeyDer::Pkcs1(k), label)?
+	for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
+		let (kind, der) = item.with_context(|| format!("PEM parse error in {label}"))?;
+		let new_key = match kind {
+			SectionKind::Certificate => {
+				certs.push(CertificateDer::from(der));
+				continue;
 			}
-			rustls_pemfile::Item::Pkcs8Key(k) => {
-				set_key_or_reject(&mut key, PrivateKeyDer::Pkcs8(k), label)?
-			}
-			rustls_pemfile::Item::Sec1Key(k) => {
-				set_key_or_reject(&mut key, PrivateKeyDer::Sec1(k), label)?
-			}
-			_ => {}
-		}
+			SectionKind::RsaPrivateKey => PrivateKeyDer::Pkcs1(der.into()),
+			SectionKind::PrivateKey => PrivateKeyDer::Pkcs8(der.into()),
+			SectionKind::EcPrivateKey => PrivateKeyDer::Sec1(der.into()),
+			_ => continue,
+		};
+		set_key_or_reject(&mut key, new_key, label)?;
 	}
 	Ok(PemItems { certs, key })
 }
@@ -298,11 +296,11 @@ pub(crate) mod test_pki {
 			let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
 			ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
 			ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-			let ca = ca_params.self_signed(&ca_kp).unwrap();
+			let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
 			let client_kp = KeyPair::generate().unwrap();
 			let client = CertificateParams::new(vec!["bairelay".into()])
 				.unwrap()
-				.signed_by(&client_kp, &ca, &ca_kp)
+				.signed_by(&client_kp, &ca)
 				.unwrap();
 			Pki {
 				ca_pem: ca.pem(),
@@ -528,11 +526,11 @@ mod tests {
 		let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
 		ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
 		ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-		let ca = ca_params.self_signed(&ca_kp).unwrap();
+		let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
 
 		let server_kp = KeyPair::generate().unwrap();
 		let server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
-		let server = server_params.signed_by(&server_kp, &ca, &ca_kp).unwrap();
+		let server = server_params.signed_by(&server_kp, &ca).unwrap();
 
 		let server_bundle = format!("{}{}", server.pem(), server_kp.serialize_pem());
 		let ca_pem = ca.pem();
@@ -596,10 +594,10 @@ mod tests {
 		let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
 		ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
 		ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-		let ca = ca_params.self_signed(&ca_kp).unwrap();
+		let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_kp).unwrap();
 		let server_kp = KeyPair::generate().unwrap();
 		let server_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
-		let server = server_params.signed_by(&server_kp, &ca, &ca_kp).unwrap();
+		let server = server_params.signed_by(&server_kp, &ca).unwrap();
 
 		let cert_only = server.pem();
 		let f = write_temp_pem(cert_only.as_bytes());

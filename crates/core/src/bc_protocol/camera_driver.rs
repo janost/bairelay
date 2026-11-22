@@ -339,8 +339,8 @@ mod tests {
 	//! to drive the one-line `BcCamera::xxx(self).await` body, not to
 	//! re-test the wrapped command's happy path.
 	use super::*;
-	use crate::bc_protocol::connection::mock::{reply_err_code, MockConnection};
 	use crate::bc_protocol::BcCamera;
+	use crate::bc_protocol::connection::mock::{MockConnection, reply_err_code};
 	use std::time::Duration;
 
 	/// Helper: build a BcCamera whose connection accepts every msg_id

@@ -3,7 +3,7 @@ use crate::bc::{model::*, xml::*};
 use log::*;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_xml, reply_err_code, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_xml, reply_err_code};
 
 impl BcCamera {
 	/// Get the ability info xml for the current user

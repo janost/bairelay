@@ -8,7 +8,7 @@
 //! [`crate::config::apply_cloud_auth`] + `cloud::mint_bundle`) until it lapses,
 //! at which point this is re-run.
 
-use crate::config::{Config, CLOUD_AUTH_FILE};
+use crate::config::{CLOUD_AUTH_FILE, Config};
 use crate::oneshot::classify::{EXIT_CONNECTION, EXIT_OK, EXIT_USAGE};
 use bairelay_neolink_core::cloud::{self, CloudAuth};
 use std::io::Write;

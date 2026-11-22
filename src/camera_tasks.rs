@@ -3,8 +3,8 @@
 //! Each task is spawned when a camera connects and cancelled when the
 //! connection drops (via a session-scoped `CancellationToken`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -655,8 +655,8 @@ pub async fn preview_poller(
 				// the whole point of the overlay: HA dashboards
 				// should see SLEEPING / CONNECTING on stale frames so
 				// users can tell live from stale.
-				if camera.state().is_connected() {
-					if let Some(bc) = camera.bc_camera() {
+				if camera.state().is_connected()
+					&& let Some(bc) = camera.bc_camera() {
 						let Some(snapshot) =
 							snapshot_with_retry(bc.as_ref(), &camera_name, &cancel).await
 						else {
@@ -675,7 +675,6 @@ pub async fn preview_poller(
 							}
 						}
 					}
-				}
 
 				// Publish the current cached JPEG (fresh if we just
 				// refreshed above, stale otherwise) with the overlay
@@ -1183,7 +1182,7 @@ pub(crate) fn url_host(url: &str) -> Option<&str> {
 /// prefix, or one on any host whose path is exactly a hook path (after
 /// a config or host change).
 fn is_own_stale_url(stored: &str, url: &str) -> bool {
-	use crate::webhook_listener::{is_hook_path, HOOK_PATH_PREFIX};
+	use crate::webhook_listener::{HOOK_PATH_PREFIX, is_hook_path};
 	let same_listener = url
 		.find(HOOK_PATH_PREFIX)
 		.map(|i| &url[..i + HOOK_PATH_PREFIX.len()])
@@ -3315,10 +3314,12 @@ mod tests {
 		let _ = task.await;
 		// Battery level publish must NOT have happened — the timeout
 		// branch logs and continues without publishing.
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-bt/status/battery_level"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-bt/status/battery_level")
+		);
 	}
 
 	/// `floodlight_poller` timeout branch — driver hangs past 10 s.
@@ -3345,10 +3346,12 @@ mod tests {
 		cancel.cancel();
 		let _ = task.await;
 		// Timeout branch must NOT have published anything.
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-ft/status/floodlight_tasks"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-ft/status/floodlight_tasks")
+		);
 	}
 
 	fn led_state(ir: &str, light: &str) -> bairelay_neolink_core::bc::xml::LedState {
@@ -3604,10 +3607,12 @@ mod tests {
 		));
 		tokio::time::advance(Duration::from_secs(11)).await;
 		let _ = task.await;
-		assert!(!mock
-			.published()
-			.iter()
-			.any(|(t, _, _)| t == "bairelay/cam-pst/status/pir"));
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-pst/status/pir")
+		);
 	}
 
 	// ── ha_cfg_support ───────────────────────────────────────────────

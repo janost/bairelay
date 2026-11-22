@@ -274,9 +274,10 @@ mod tests {
 	#[test]
 	fn lookup_missing_returns_none() {
 		let reg = CameraRegistry::new();
-		assert!(reg
-			.lookup_fresh("NOPE", now(), Duration::from_secs(60))
-			.is_none());
+		assert!(
+			reg.lookup_fresh("NOPE", now(), Duration::from_secs(60))
+				.is_none()
+		);
 	}
 
 	#[test]
@@ -338,9 +339,10 @@ mod tests {
 	fn lookup_by_ip_returns_none_when_no_ip_matches() {
 		let reg = CameraRegistry::new();
 		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, now());
-		assert!(reg
-			.lookup_by_ip("10.0.0.9".parse().unwrap(), now(), Duration::from_secs(60))
-			.is_none());
+		assert!(
+			reg.lookup_by_ip("10.0.0.9".parse().unwrap(), now(), Duration::from_secs(60))
+				.is_none()
+		);
 	}
 
 	#[test]
@@ -349,9 +351,10 @@ mod tests {
 		let t = now();
 		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, t);
 		let later = t + Duration::from_secs(120);
-		assert!(reg
-			.lookup_by_ip("10.0.0.1".parse().unwrap(), later, Duration::from_secs(60))
-			.is_none());
+		assert!(
+			reg.lookup_by_ip("10.0.0.1".parse().unwrap(), later, Duration::from_secs(60))
+				.is_none()
+		);
 	}
 
 	#[test]
@@ -408,9 +411,10 @@ mod tests {
 		let evicted = reg.purge_stale(later, Duration::from_secs(60));
 		assert_eq!(evicted, vec!["OLD".to_string()]);
 		assert_eq!(reg.len(), 1);
-		assert!(reg
-			.lookup_fresh("FRESH", later, Duration::from_secs(60))
-			.is_some());
+		assert!(
+			reg.lookup_fresh("FRESH", later, Duration::from_secs(60))
+				.is_some()
+		);
 	}
 
 	#[test]

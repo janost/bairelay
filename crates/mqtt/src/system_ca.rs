@@ -3,8 +3,8 @@
 //! the bundle on the same path as a `ca` file, so client certificates
 //! and validation work identically.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::error::MqttError;
 

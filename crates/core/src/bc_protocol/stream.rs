@@ -4,12 +4,12 @@ use crate::{
 	bcmedia::model::*,
 };
 use futures::stream::StreamExt;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{Receiver, channel};
 use tokio::task::{self, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use crate::bc_protocol::connection::mock::{reply_200_empty, reply_err_code, MockConnection};
+use crate::bc_protocol::connection::mock::{MockConnection, reply_200_empty, reply_err_code};
 
 /// The stream names supported by BC
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -143,10 +143,10 @@ impl BcCamera {
 		mut buffer_size: usize,
 		strict: bool,
 	) -> Result<StreamData> {
-		if let Err(e) = self.has_ability_rw("preview").await {
-			if self.has_ability_ro("streamTable").await.is_err() {
-				return Err(e);
-			}
+		if let Err(e) = self.has_ability_rw("preview").await
+			&& self.has_ability_ro("streamTable").await.is_err()
+		{
+			return Err(e);
 		}
 
 		let connection = self.get_connection();
@@ -346,10 +346,10 @@ impl BcCamera {
 
 	/// Stop a camera from sending more stream data.
 	pub async fn stop_video(&self, stream: StreamKind) -> Result<()> {
-		if let Err(e) = self.has_ability_rw("preview").await {
-			if self.has_ability_ro("streamTable").await.is_err() {
-				return Err(e);
-			}
+		if let Err(e) = self.has_ability_rw("preview").await
+			&& self.has_ability_ro("streamTable").await.is_err()
+		{
+			return Err(e);
 		}
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();

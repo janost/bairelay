@@ -1,6 +1,6 @@
 use bairelay::config::{
-	parse_config, resolve_idle_disconnect_timeout, test_helpers, validate_config, CameraConfig,
-	Config, DiscoveryMethod, MaxEncryption, MqttConfig, PauseConfig, StreamConfig, TlsClientAuth,
+	CameraConfig, Config, DiscoveryMethod, MaxEncryption, MqttConfig, PauseConfig, StreamConfig,
+	TlsClientAuth, parse_config, resolve_idle_disconnect_timeout, test_helpers, validate_config,
 };
 use bairelay_mqtt::discovery::Feature;
 
@@ -1789,8 +1789,8 @@ fn warn_wire_debug_enabled_covers_set_and_unset() {
 	};
 	cfg.cameras[0].debug = Some(true); // warns
 	cfg.cameras[1].debug = Some(false); // silent
-										// cameras[2] stays None — silent.
-										// Exercises every branch; tracing output isn't captured.
+	// cameras[2] stays None — silent.
+	// Exercises every branch; tracing output isn't captured.
 	warn_wire_debug_enabled(&cfg);
 }
 
