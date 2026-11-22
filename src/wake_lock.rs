@@ -1,13 +1,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 struct WakeLockInner {
 	count: AtomicUsize,
 	notify_release: Notify,
 	notify_acquire: Notify,
-	/// Wallclock instant of the most recent 1→0 transition. `None`
+	/// Instant of the most recent 1→0 transition (tokio's clock, so
+	/// paused-time tests can drive it). `None`
 	/// means the lock is either currently held (count > 0) or has
 	/// never been acquired in this process. Used by the watchdog to
 	/// distinguish "just-released, grace-period covers it" from

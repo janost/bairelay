@@ -163,7 +163,7 @@ A single-Notify design loses the acquire edge: a wakeup command would acquire th
 
 **`idle_since` timestamp for the watchdog gate.** `WakeLockCounter` records the wallclock instant of the most recent 1→0 release in a `Mutex<Option<Instant>>`. Cleared on the next 0→1 acquire. The watchdog reads `idle_since().elapsed() >= grace` instead of the instantaneous `is_idle()` it used to check — without the elapsed gate, the watchdog tick races every freshly-arrived `control/wakeup` MQTT publish and can tear a session down a few hundred ms before the wakeup acquire lands. With the gate, `grace_period.rs` handles the normal disconnect path and the watchdog is the safety net its docs always claimed (only fires if grace_period failed to fire, e.g. didn't get spawned or panicked).
 
-The grace period timer is reset by any new `acquire()` before its countdown expires. Default grace is 45 s, configurable via `idle_disconnect_timeout_secs`. Keep this strictly above `stream_prune_grace_secs` (default 30 s) so a cached `StreamSource` can't outlive its Baichuan session.
+The grace period timer is reset by any new `acquire()` before its countdown expires, including a brief acquire+release that falls inside the countdown: `GracePeriod::run` re-derives its deadline from `idle_since()` after each sleep, so it returns only once the lock has been idle for the full duration in one stretch. `idle_since` uses `tokio::time::Instant` so paused-time tests drive it. Default grace is 45 s, configurable via `idle_disconnect_timeout_secs`. Keep this strictly above `stream_prune_grace_secs` (default 30 s) so a cached `StreamSource` can't outlive its Baichuan session.
 
 ---
 
