@@ -15,7 +15,7 @@ use bairelay_neolink_core::bc_protocol::CameraDriver;
 
 use crate::cli::{Command, FloodlightState, OnOff, PtzCommand};
 use crate::cli_convert::{
-	clone_ptz_cmd, clone_service_action, clone_user_action, ptz_direction_to_core,
+	clone_service_action, clone_user_action, ptz_cmd_or_list, ptz_direction_to_core,
 	service_name_to_core,
 };
 use crate::oneshot::{
@@ -121,7 +121,7 @@ pub async fn dispatch_oneshot(
 			status_light::run(cam, set).await
 		}
 		Command::Ptz { cmd, .. } => {
-			let cmd = clone_ptz_cmd(cmd);
+			let cmd = ptz_cmd_or_list(cmd);
 			match cmd {
 				PtzCommand::Preset { preset_id } => ptz::preset(cam, preset_id).await,
 				PtzCommand::Assign { preset_id, name } => ptz::assign(cam, preset_id, name).await,

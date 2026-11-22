@@ -337,7 +337,7 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 			})
 			.await;
 		}
-		let cmd = crate::cli_convert::clone_command(&cli.command);
+		let cmd = cli.command.clone();
 		let json = cli.json;
 		runner::run(&cam_cfg, cancel, move |cam| {
 			async move {

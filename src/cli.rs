@@ -113,7 +113,7 @@ pub enum UserTypeArg {
 }
 
 /// Subcommands under `ptz`.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum PtzCommand {
 	#[command(about = "Move to a stored preset. Omit <id> to list presets instead")]
 	Preset { preset_id: Option<u8> },
@@ -135,7 +135,7 @@ pub enum PtzCommand {
 /// CLI parse time. Port `0` is rejected later in the dispatch path —
 /// allowing it through clap keeps the error message close to the call
 /// site instead of buried in clap's per-arg formatting.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum ServiceAction {
 	/// Print current state.
 	Get,
@@ -163,7 +163,7 @@ pub enum OnOff {
 /// (TTY, no-echo) or read from stdin. Passing it positionally still
 /// works for backward compat but exposes the value to `ps auxww` /
 /// shell history; the prompt path is the safer default.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum UserAction {
 	/// List all configured users.
 	List,
@@ -187,13 +187,13 @@ pub enum UserAction {
 }
 
 /// Arguments common to every one-shot subcommand.
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct OneShotArgs {
 	#[arg(help = "Camera name (must match a [[cameras]] entry in the config)")]
 	pub camera: String,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
 	/// Run the MQTT bridge only.
 	Mqtt,
