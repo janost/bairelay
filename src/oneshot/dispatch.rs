@@ -149,10 +149,9 @@ pub async fn dispatch_oneshot(
 			}
 		}
 		Command::Users { action, .. } => {
-			// `clone_user_action` resolves any omitted password via TTY
-			// prompt or stdin (see `oneshot::password_source`). That
-			// blocks the current task on stdin/getch, which is fine in
-			// the one-shot path — there's no concurrent work to starve.
+			// `run_oneshot_to` resolves an omitted password before
+			// connecting (`password_source::resolve_command`), so
+			// `clone_user_action` only validates it here.
 			let action = clone_user_action(action)?;
 			users::run(cam, action).await
 		}

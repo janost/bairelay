@@ -91,17 +91,15 @@ pub fn clone_service_action(a: &Option<cli::ServiceAction>) -> oneshot::services
 	}
 }
 
-/// Clone / normalise a `cli::UserAction`. An absent action defaults
-/// to `list`.
 /// Translate a CLI [`cli::UserAction`] into the oneshot
-/// [`oneshot::users::Action`].
+/// [`oneshot::users::Action`]. An absent action defaults to `list`.
 ///
-/// `Add` / `Password` carry the password as `Option<String>` to allow
-/// the operator to omit it on the command line; this function calls
-/// [`oneshot::password_source::resolve`] to fill it in via TTY prompt
-/// or stdin read. That path performs blocking I/O — fine for a one-
-/// shot CLI but worth noting for callers in test contexts (tests
-/// always pass `Some(_)` to bypass the prompt).
+/// `Add` / `Password` carry the password as `Option<String>` so the
+/// operator can omit it; [`oneshot::password_source::resolve`] then
+/// prompts (blocking TTY / stdin read). The one-shot path fills it in
+/// before connecting via
+/// [`oneshot::password_source::resolve_command`], so here it is only
+/// validated.
 pub fn clone_user_action(a: &Option<cli::UserAction>) -> anyhow::Result<oneshot::users::Action> {
 	use cli::{UserAction, UserTypeArg};
 	use oneshot::password_source::{self, PROMPT_ADD, PROMPT_PASSWORD};

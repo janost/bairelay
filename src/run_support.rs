@@ -337,7 +337,9 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 			})
 			.await;
 		}
-		let cmd = cli.command.clone();
+		let mut cmd = cli.command.clone();
+		// Prompt before connecting: the op timeout runs from connect.
+		crate::oneshot::password_source::resolve_command(&mut cmd)?;
 		let json = cli.json;
 		runner::run(&cam_cfg, cancel, move |cam| {
 			async move {
@@ -682,6 +684,28 @@ cameras = []
 		]);
 		let code = run_oneshot_to(&cli, &mut Vec::new(), &mut Vec::new()).await;
 		assert_ne!(code, classify::EXIT_OK);
+	}
+
+	/// The `users` password is checked before connecting: an empty one
+	/// is a usage error even though the camera is unreachable.
+	#[tokio::test]
+	async fn run_oneshot_resolves_the_users_password_before_connecting() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+[[cameras]]
+name = "cam0"
+address = "127.0.0.1:65502"
+username = "u"
+password = ""
+discovery = "local"
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let p = f.path().display().to_string();
+		let cli = cli_from(&["bairelay", "users", "cam0", "password", "bob", "", "-c", &p]);
+		let code = run_oneshot_to(&cli, &mut Vec::new(), &mut Vec::new()).await;
+		assert_eq!(code, classify::EXIT_USAGE);
 	}
 
 	/// `run_oneshot` dispatches to `runner::run` for the
