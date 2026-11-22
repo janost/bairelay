@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use bairelay_neolink_core::bc::xml::{AudioConfig, TalkAbility, TalkConfig};
 use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as BcError};
 
-use crate::config::{CameraConfig, TalkConfigOverride};
+use crate::config::{CameraConfig, TalkConfigOverride, validate_talk_config};
 use bairelay_rtsp::transcode::adpcm;
 use wav::MonoPcm;
 
@@ -61,7 +61,8 @@ impl TalkConfigSource {
 ///
 /// 1. the `[cameras.talk_config]` override, when present;
 /// 2. the first entry of each list in the camera's `TalkAbility`, when
-///    all three lists are non-empty;
+///    all three lists are non-empty and the entry passes the same
+///    [`validate_talk_config`] rules as the table;
 /// 3. the standard Reolink ADPCM defaults (FDX, followVideoStream,
 ///    adpcm, 16000 Hz, 16 bit, 1024, mono).
 ///
@@ -87,13 +88,32 @@ pub fn resolve_with_source(
 		ability.audio_stream_mode_list.first(),
 		ability.audio_config_list.first(),
 	) {
-		let cfg = TalkConfig {
+		let ac = &audio.audio_config;
+		let as_table = TalkConfigOverride {
 			duplex: duplex.duplex.clone(),
 			audio_stream_mode: mode.audio_stream_mode.clone(),
-			audio_config: audio.audio_config.clone(),
-			..Default::default()
+			audio_type: ac.audio_type.clone(),
+			sample_rate: ac.sample_rate,
+			sample_precision: ac.sample_precision,
+			length_per_encoder: ac.length_per_encoder,
+			sound_track: ac.sound_track.clone(),
 		};
-		return (cfg, TalkConfigSource::CameraAbility);
+		// Camera input: a reply we cannot encode (or that would panic
+		// the encoder) falls back to the defaults instead of failing.
+		match validate_talk_config(&as_table) {
+			Ok(()) => {
+				let cfg = TalkConfig {
+					duplex: duplex.duplex.clone(),
+					audio_stream_mode: mode.audio_stream_mode.clone(),
+					audio_config: ac.clone(),
+					..Default::default()
+				};
+				return (cfg, TalkConfigSource::CameraAbility);
+			}
+			Err(e) => {
+				tracing::warn!(error = %e, "talk: camera TalkAbility is unusable; using defaults");
+			}
+		}
 	}
 	(
 		from_override(&TalkConfigOverride::default()),
@@ -447,6 +467,21 @@ mod tests {
 		let mut partial = camera_ability();
 		partial.audio_config_list.clear();
 		assert_eq!(resolve_talk_config(&partial, None), defaults());
+	}
+
+	#[test]
+	fn tier2_invalid_camera_ability_falls_back_to_defaults() {
+		for bad in [
+			|a: &mut AudioConfig| a.audio_type = "aac".into(),
+			|a: &mut AudioConfig| a.sample_rate = 0,
+			|a: &mut AudioConfig| a.length_per_encoder = 0,
+		] {
+			let mut ability = camera_ability();
+			bad(&mut ability.audio_config_list[0].audio_config);
+			let (cfg, src) = resolve_with_source(&ability, None);
+			assert_eq!(src, TalkConfigSource::Defaults);
+			assert_eq!(cfg, defaults());
+		}
 	}
 
 	#[test]

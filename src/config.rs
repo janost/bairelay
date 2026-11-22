@@ -1656,12 +1656,18 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 	Ok(())
 }
 
-/// Smallest `length_per_encoder` accepted in `[cameras.talk_config]`.
+/// Smallest `length_per_encoder` accepted for talk: a 64-byte block.
 pub const MIN_TALK_LENGTH_PER_ENCODER: u16 = 120;
 
-/// Check a `[cameras.talk_config]` table against what the ADPCM talk
-/// path can encode: `adpcm`, a non-zero rate, and a block payload
+/// Check a talk `TalkConfig` (the `[cameras.talk_config]` table, or a
+/// camera's `TalkAbility` entry) against what the ADPCM talk path can
+/// encode: `adpcm`, a non-zero rate, and a block payload
 /// (`length_per_encoder / 2`) of at least 60 bytes and a multiple of 4.
+///
+/// The block rules are GStreamer `adpcmenc`'s for `layout=dvi`
+/// (`MIN_ADPCM_BLOCK_SIZE` 64, data in 4-byte words per channel). The
+/// neolink talk client encoded with it, so those are the only block
+/// shapes known to reach a camera; our encoder could do others.
 pub fn validate_talk_config(t: &TalkConfigOverride) -> Result<(), String> {
 	if t.audio_type != "adpcm" {
 		return Err(format!(

@@ -424,7 +424,10 @@ mod tests {
 			dec.extend(d.decode_block(block).unwrap());
 			end_step = d.step_index;
 		}
-		assert!(enc[ba + 2] > 0, "a loud sine must raise the carried step index");
+		assert!(
+			enc[ba + 2] > 0,
+			"a loud sine must raise the carried step index"
+		);
 		assert_eq!(dec.len(), 4 * spb);
 
 		let tail = &dec[pcm.len() + 200..];
