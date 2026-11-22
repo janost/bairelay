@@ -161,6 +161,10 @@ async fn reset_ai_objects(
 	(reset, seen_on)
 }
 
+/// How long a motion subscription must last before its failure restarts
+/// the resubscribe backoff from 1 s.
+const MOTION_STREAM_STABLE: Duration = Duration::from_secs(60);
+
 /// How long active motion holds the wake lock without a fresh Start.
 /// Cameras repeat Start in every push while motion lasts, so this much
 /// silence means the Stop was lost; without it a lost Stop would keep a
@@ -385,10 +389,10 @@ pub async fn motion_listener(
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	// Sustained network flap with N cameras × M retries/min produces a
-	// firehose of warns and pointless reconnect attempts. Use the same
-	// 1 → 60 s exponential ladder as the camera reconnect path; reset
-	// to 1 s every time we successfully subscribe so a transient blip
-	// doesn't permanently inflate the retry interval.
+	// firehose of warns and pointless reconnect attempts. Use a 1 → 60 s
+	// exponential ladder, reset only after a subscription that lasted
+	// `MOTION_STREAM_STABLE`: a stream that dies right after subscribing
+	// would otherwise resubscribe every second.
 	let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
 	// Last reported AI object states and the objects published `on`
 	// this session, both starting from the session-start reset.
@@ -405,6 +409,12 @@ pub async fn motion_listener(
 	loop {
 		let mut motion_data = match bc_camera.listen_on_motion().await {
 			Ok(md) => md,
+			Err(e @ CoreError::MissingAbility { .. }) => {
+				// Retrying can't grant the ability; same as the
+				// floodlight listener.
+				tracing::debug!(camera = %camera_name, error = %e, "Motion listener not supported");
+				return;
+			}
 			Err(e) => {
 				tracing::warn!(camera = %camera_name, error = %e, "Failed to start motion listener");
 				if !backoff.sleep_with_cancel(&cancel).await {
@@ -413,8 +423,7 @@ pub async fn motion_listener(
 				continue;
 			}
 		};
-		// Subscribed cleanly — fast retries again on the next failure.
-		backoff.reset();
+		let subscribed_at = tokio::time::Instant::now();
 		// This listener owns the press edge: `listen_on_motion` reports
 		// the raw `visitor` state. The edge starts again on each
 		// subscribe. A press published within `held_press_window` (e.g.
@@ -480,9 +489,13 @@ pub async fn motion_listener(
 			}
 		}
 
-		// Inner loop bailed (camera-side error). Re-subscribe with the
-		// same exponential ladder; `backoff` was reset on the prior
-		// successful subscribe so this is a fresh 1 s start.
+		// Inner loop bailed (camera-side error). Release the dead
+		// subscription before the backoff. A long-lived stream earns a
+		// fresh 1 s start; one that died quickly keeps climbing.
+		drop(motion_data);
+		if subscribed_at.elapsed() >= MOTION_STREAM_STABLE {
+			backoff.reset();
+		}
 		if !backoff.sleep_with_cancel(&cancel).await {
 			break;
 		}
@@ -679,7 +692,7 @@ pub async fn preview_poller(
 	cancel: CancellationToken,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
-	let overlay_cache = OverlayCache::new();
+	let overlay_cache = Arc::new(OverlayCache::new());
 	let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
 	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	// Drop the immediate first tick to avoid an unexpected burst on connect.
@@ -735,12 +748,23 @@ pub async fn preview_poller(
 				// camera PreviewState is non-Live. Gated by
 				// `pause.preview_overlay` (default true) so operators can
 				// opt out of the image/ab_glyph dependency at runtime.
-				let payload = crate::preview_overlay::rendered_preview(
-					jpeg_bytes,
-					preview_overlay_enabled,
-					*preview_state_rx.borrow_and_update(),
-					Some(&overlay_cache),
-				);
+				//
+				// The render decodes and re-encodes the JPEG, so it runs
+				// on the blocking pool rather than a runtime worker.
+				let state = *preview_state_rx.borrow_and_update();
+				let payload = if preview_overlay_enabled {
+					let cache = Arc::clone(&overlay_cache);
+					let render = tokio::task::spawn_blocking(move || cache.render(&jpeg_bytes, state));
+					match render.await {
+						Ok(rendered) => rendered,
+						Err(e) => {
+							tracing::warn!(camera = %camera_name, error = %e, "preview overlay render failed");
+							continue;
+						}
+					}
+				} else {
+					jpeg_bytes
+				};
 
 				if let Err(e) = publisher.publish_preview(&payload).await {
 					// If the broker advertises a lower MaxPacketSize the
@@ -772,6 +796,10 @@ pub async fn floodlight_poller(
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+	// As in battery_poller: keep polls a full interval apart after a
+	// stalled one, and skip the tick that lands as the session starts.
+	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	ticker.tick().await;
 
 	loop {
 		tokio::select! {
@@ -3359,6 +3387,111 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(50)).await;
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+	}
+
+	/// A camera without the motion ability is not resubscribed forever.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_returns_on_missing_ability() {
+		let fake = FakeCameraBuilder::new()
+			.with_motion_stream_error(|| {
+				bairelay_neolink_core::bc_protocol::Error::MissingAbility {
+					name: "alarm".into(),
+					requested: "read".into(),
+					actual: "none".into(),
+				}
+			})
+			.build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		tokio::time::timeout(
+			Duration::from_secs(60),
+			motion_listener(
+				"cam1".to_string(),
+				fake,
+				mqtt,
+				"bairelay".to_string(),
+				WakeLockCounter::new(),
+				CancellationToken::new(),
+				Duration::from_secs(30),
+				empty_cache(),
+				CameraCapabilities::default(),
+				None,
+			),
+		)
+		.await
+		.expect("MissingAbility must end the listener");
+	}
+
+	/// A stream that fails right after subscribing keeps climbing the
+	/// backoff (subscribes at 0, 1, 3 and 7 s) instead of resubscribing
+	/// every second.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_backs_off_a_stream_that_dies_at_once() {
+		let mut builder = FakeCameraBuilder::new();
+		let mut txs = Vec::new();
+		for _ in 0..12 {
+			let (tx, rx) = tokio::sync::mpsc::channel::<AlarmItem>(1);
+			tx.try_send(Err(bairelay_neolink_core::bc_protocol::Error::Other(
+				"dies at once",
+			)))
+			.unwrap();
+			txs.push(tx);
+			builder = builder.with_motion_stream(
+				bairelay_neolink_core::bc_protocol::MotionData::test_new_alarm(rx),
+			);
+		}
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let task = tokio::spawn(motion_listener(
+			"cam1".to_string(),
+			builder.build(),
+			mqtt,
+			"bairelay".to_string(),
+			WakeLockCounter::new(),
+			cancel.clone(),
+			Duration::from_secs(30),
+			empty_cache(),
+			CameraCapabilities::default(),
+			None,
+		));
+
+		tokio::time::sleep(Duration::from_secs(10)).await;
+		// A consumed stream's receiver is dropped when it fails.
+		let subscribes = txs.iter().filter(|tx| tx.is_closed()).count();
+		assert_eq!(subscribes, 4);
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	/// Like the battery poller, the floodlight poller skips the tick that
+	/// lands as the session starts and polls one interval later.
+	#[tokio::test(start_paused = true)]
+	async fn floodlight_poller_skips_the_session_start_tick() {
+		use std::sync::atomic::AtomicUsize;
+		let polls = Arc::new(AtomicUsize::new(0));
+		let counted = Arc::clone(&polls);
+		let fake = FakeCameraBuilder::new()
+			.with_is_floodlight_tasks_enabled(move || {
+				counted.fetch_add(1, Ordering::SeqCst);
+				Ok(true)
+			})
+			.build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let task = tokio::spawn(floodlight_poller(
+			"cam1".to_string(),
+			fake,
+			mqtt,
+			"bairelay".to_string(),
+			1_000,
+			cancel.clone(),
+			empty_cache(),
+		));
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		assert_eq!(polls.load(Ordering::SeqCst), 0);
+		tokio::time::sleep(Duration::from_millis(600)).await;
+		assert_eq!(polls.load(Ordering::SeqCst), 1);
+		cancel.cancel();
+		task.await.unwrap();
 	}
 
 	/// `floodlight_listener` with a driver that errors on
