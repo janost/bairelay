@@ -599,9 +599,10 @@ pub struct CameraConfig {
 	/// `TalkConfig` (msg 201) instead of the camera's `TalkAbility`
 	/// reply. A battery doorbell NEEDS this table, even an empty one:
 	/// it does not answer `TalkAbility` and does not advertise the
-	/// `two_way_audio` ability, so without the table the core's ability
-	/// gate refuses talk. With the table set, bairelay skips both the
-	/// `TalkAbility` query and the gate. See [`TalkConfigOverride`].
+	/// `two_way_audio` ability, so without the table `talk::play`
+	/// refuses talk. With the table set, bairelay skips both the
+	/// `TalkAbility` query and the ability check. See
+	/// [`TalkConfigOverride`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub talk_config: Option<TalkConfigOverride>,
 }

@@ -67,21 +67,15 @@ pub trait CameraDriver: Send + Sync {
 	/// Trigger the built-in siren.
 	async fn siren(&self) -> Result<()>;
 
-	/// Request the camera's two-way audio `<TalkAbility>`. With
-	/// `bypass_ability_gate`, a camera without the `two_way_audio`
-	/// ability gets an empty ability instead of `MissingAbility`.
-	async fn talk_ability(&self, bypass_ability_gate: bool) -> Result<TalkAbility>;
+	/// Request the camera's two-way audio `<TalkAbility>`. Gated on the
+	/// `two_way_audio` ability.
+	async fn talk_ability(&self) -> Result<TalkAbility>;
 	/// Send `TalkConfig` (msg 201), then play `adpcm` (DVI4 IMA ADPCM
 	/// blocks of `length_per_encoder / 2 + 4` bytes) through the
-	/// camera speaker, paced at real time, then send talk-stop.
-	/// `bypass_ability_gate` skips the `two_way_audio` check; set it
-	/// only for an operator-pinned `talk_config`.
-	async fn talk(
-		&self,
-		adpcm: &[u8],
-		talk_config: TalkConfig,
-		bypass_ability_gate: bool,
-	) -> Result<()>;
+	/// camera speaker, paced at real time, then send talk-stop. Not
+	/// gated: battery doorbells talk without advertising
+	/// `two_way_audio`, so the caller checks the ability.
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()>;
 
 	/// Read `<LedState>`: IR night-vision mode (`state`) and status LED
 	/// (`lightState`) — two unrelated features in one reply. Values for
@@ -249,16 +243,11 @@ impl CameraDriver for BcCamera {
 		BcCamera::siren(self).await
 	}
 
-	async fn talk_ability(&self, bypass_ability_gate: bool) -> Result<TalkAbility> {
-		BcCamera::talk_ability(self, bypass_ability_gate).await
+	async fn talk_ability(&self) -> Result<TalkAbility> {
+		BcCamera::talk_ability(self).await
 	}
-	async fn talk(
-		&self,
-		adpcm: &[u8],
-		talk_config: TalkConfig,
-		bypass_ability_gate: bool,
-	) -> Result<()> {
-		BcCamera::talk(self, adpcm, talk_config, bypass_ability_gate).await
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
+		BcCamera::talk(self, adpcm, talk_config).await
 	}
 
 	async fn get_ledstate(&self) -> Result<LedState> {
@@ -521,13 +510,6 @@ mod tests {
 			let cam = err_camera().await;
 			let dr: &dyn CameraDriver = &cam;
 			let _ = run(dr.siren()).await;
-		}
-		// talk_ability / talk: `two_way_audio` ability gate → Err.
-		{
-			let cam = err_camera().await;
-			let dr: &dyn CameraDriver = &cam;
-			let _ = run(dr.talk_ability(false)).await;
-			let _ = run(dr.talk(&[0u8; 516], TalkConfig::default(), false)).await;
 		}
 		// get_ledstate: no reply → timeout.
 		{

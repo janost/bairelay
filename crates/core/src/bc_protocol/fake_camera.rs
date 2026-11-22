@@ -79,9 +79,8 @@ pub struct FakeCalls {
 	pub set_onvif: Mutex<Vec<(Option<bool>, Option<u32>)>>,
 	/// Each `set_ha_cfg(cfg)` call appended.
 	pub set_ha_cfg: Mutex<Vec<HaCfg>>,
-	/// Each `talk(adpcm, cfg, bypass)` call appended as
-	/// `(adpcm bytes, cfg, bypass_ability_gate)`.
-	pub talk: Mutex<Vec<(Vec<u8>, TalkConfig, bool)>>,
+	/// Each `talk(adpcm, cfg)` call appended as `(adpcm bytes, cfg)`.
+	pub talk: Mutex<Vec<(Vec<u8>, TalkConfig)>>,
 	/// Count of `talk_ability` invocations.
 	pub talk_ability: Mutex<u32>,
 }
@@ -512,23 +511,6 @@ impl FakeCameraBuilder {
 	}
 }
 
-impl FakeCamera {
-	/// `Err(MissingAbility)` when an ability list is set and lacks
-	/// `two_way_audio`; `Ok` when no list is set (ungated fake).
-	fn talk_gate(&self) -> Result<()> {
-		match self.inner.abilities.as_ref() {
-			Some(names) if !names.iter().any(|a| a == "two_way_audio") => {
-				Err(Error::MissingAbility {
-					name: "two_way_audio".to_string(),
-					requested: "write".to_string(),
-					actual: "none".to_string(),
-				})
-			}
-			_ => Ok(()),
-		}
-	}
-}
-
 fn unset(method: &'static str) -> ! {
 	panic!("FakeCamera: {} not configured for this test", method)
 }
@@ -897,20 +879,19 @@ impl CameraDriver for FakeCamera {
 	}
 
 	/// Mirrors `BcCamera`'s `two_way_audio` gate when the test set an
-	/// ability list with [`FakeCameraBuilder::with_abilities`]: missing
-	/// → `MissingAbility` unless the caller bypasses the gate.
-	async fn talk_ability(&self, bypass_ability_gate: bool) -> Result<TalkAbility> {
+	/// ability list with [`FakeCameraBuilder::with_abilities`].
+	async fn talk_ability(&self) -> Result<TalkAbility> {
 		*self.inner.calls.talk_ability.lock().unwrap() += 1;
 		if self.inner.talk_ability_pending {
 			std::future::pending::<()>().await;
 			unreachable!()
 		}
-		if let Err(e) = self.talk_gate() {
-			return if bypass_ability_gate {
-				Ok(TalkAbility::default())
-			} else {
-				Err(e)
-			};
+		if self.ability_advertised("two_way_audio").await == Some(false) {
+			return Err(Error::MissingAbility {
+				name: "two_way_audio".to_string(),
+				requested: "read".to_string(),
+				actual: "none".to_string(),
+			});
 		}
 		match self.inner.talk_ability.as_ref() {
 			Some(f) => f(),
@@ -918,20 +899,13 @@ impl CameraDriver for FakeCamera {
 		}
 	}
 
-	async fn talk(
-		&self,
-		adpcm: &[u8],
-		talk_config: TalkConfig,
-		bypass_ability_gate: bool,
-	) -> Result<()> {
-		if !bypass_ability_gate {
-			self.talk_gate()?;
-		}
-		self.inner.calls.talk.lock().unwrap().push((
-			adpcm.to_vec(),
-			talk_config,
-			bypass_ability_gate,
-		));
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
+		self.inner
+			.calls
+			.talk
+			.lock()
+			.unwrap()
+			.push((adpcm.to_vec(), talk_config));
 		match self.inner.talk_result.as_ref() {
 			Some(f) => f(),
 			None => Ok(()),

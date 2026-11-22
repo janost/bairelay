@@ -32,7 +32,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `set_floodlight_manual(bool, u16)`    | Second arg is duration **seconds**. Use 30.               |
 | `zoom_to(u32)`                        | Pre-multiply by 1000 (`ptz::zoom_position`).              |
 | `set_ptz_preset(u8, String)`          | Preset ID + name.                                         |
-| `talk_ability(bypass)` / `talk(adpcm, cfg, bypass)` | Two-way audio. `talk` sends `TalkConfig` (msg 201), the ADPCM blocks (msg 202, paced at real time) and talk-stop (msg 11). `bypass` skips the `two_way_audio` ability gate; the binary sets it only for a camera with `[cameras.talk_config]`. Battery doorbells never answer `TalkAbility` (msg 10). |
+| `talk_ability()` / `talk(adpcm, cfg)` | Two-way audio. `talk` sends `TalkConfig` (msg 201), the ADPCM blocks (msg 202, paced at real time) and talk-stop (msg 11). Only `talk_ability` is gated on `two_way_audio` (neolink parity); `talk::play` refuses a camera that reports abilities without it, unless it has `[cameras.talk_config]`. Battery doorbells never answer `TalkAbility` (msg 10). |
 | `start_video(kind, channel, record)` / `stop_video(kind)` | Returns `StreamData`; covered by `VideoStream` trait. |
 | `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly. An Argus answers msg 109 with `400` (`CameraServiceUnavailable`) for several seconds after connect (6 s or more); startup wake and the preview poller retry through `camera_tasks::snapshot_with_retry` (2 s backoff while the next attempt starts within 12 s of the first, cancel-aware, 10 s per attempt). |
 

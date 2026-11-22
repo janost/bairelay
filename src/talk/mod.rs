@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use bairelay_neolink_core::bc::xml::{AudioConfig, TalkAbility, TalkConfig};
-use bairelay_neolink_core::bc_protocol::CameraDriver;
+use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as BcError};
 
 use crate::config::{CameraConfig, TalkConfigOverride};
 use wav::MonoPcm;
@@ -270,10 +270,10 @@ pub struct TalkSummary {
 ///
 /// A camera with a `[cameras.talk_config]` table skips the
 /// `TalkAbility` query (battery doorbells never answer message 10) and
-/// bypasses the core's `two_way_audio` ability gate: the operator
-/// pinned the parameters. Without the table, the query runs under
-/// [`ABILITY_TIMEOUT`] (falling back to the defaults) and the gate
-/// stays.
+/// the `two_way_audio` check: the operator pinned the parameters.
+/// Without the table, a camera whose ability report lacks
+/// `two_way_audio` is refused with `MissingAbility`, and the query runs
+/// under [`ABILITY_TIMEOUT`] (falling back to the defaults).
 pub async fn play(
 	cam: &dyn CameraDriver,
 	cam_cfg: &CameraConfig,
@@ -281,11 +281,20 @@ pub async fn play(
 	volume: f32,
 ) -> Result<TalkSummary> {
 	let name = cam_cfg.name.as_str();
-	let bypass_ability_gate = cam_cfg.talk_config.is_some();
-	let ability = if bypass_ability_gate {
+	let ability = if cam_cfg.talk_config.is_some() {
 		TalkAbility::default()
 	} else {
-		match tokio::time::timeout(ABILITY_TIMEOUT, cam.talk_ability(false)).await {
+		if cam.ability_advertised("two_way_audio").await == Some(false) {
+			// A bare core error, so the one-shot exit code classifier
+			// maps it to its own code.
+			return Err(BcError::MissingAbility {
+				name: "two_way_audio".to_string(),
+				requested: "write".to_string(),
+				actual: "none".to_string(),
+			}
+			.into());
+		}
+		match tokio::time::timeout(ABILITY_TIMEOUT, cam.talk_ability()).await {
 			Ok(Ok(a)) => a,
 			Ok(Err(e)) => {
 				tracing::warn!(camera = %name, error = %e, "talk: TalkAbility query failed; using fallback config");
@@ -319,10 +328,8 @@ pub async fn play(
 		duration: clip_duration(clip),
 	};
 	// `context` keeps the core error downcastable, so the one-shot exit
-	// code classifier still maps MissingAbility to its own code.
-	cam.talk(&adpcm, cfg, bypass_ability_gate)
-		.await
-		.context("talk failed")?;
+	// code classifier still maps camera errors to their own codes.
+	cam.talk(&adpcm, cfg).await.context("talk failed")?;
 	Ok(summary)
 }
 
@@ -330,7 +337,7 @@ pub async fn play(
 mod tests {
 	use super::*;
 	use bairelay_neolink_core::bc::xml::{AudioConfigList, AudioStreamModeList, DuplexList};
-	use bairelay_neolink_core::bc_protocol::{Error as BcError, FakeCameraBuilder};
+	use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 
 	fn camera_ability() -> TalkAbility {
 		TalkAbility {
@@ -464,7 +471,6 @@ mod tests {
 		let mut want = defaults();
 		want.channel_id = 2;
 		assert_eq!(calls[0].1, want);
-		assert!(!calls[0].2, "no override → gate kept");
 	}
 
 	/// No override, and the camera never answers the TalkAbility query
@@ -539,10 +545,10 @@ mod tests {
 		}
 	}
 
-	/// Override present, `two_way_audio` not advertised: the gate is
-	/// bypassed and the override's TalkConfig is played.
+	/// Override present, `two_way_audio` not advertised: no check, and
+	/// the override's TalkConfig is played.
 	#[tokio::test]
-	async fn play_with_override_bypasses_missing_ability_gate() {
+	async fn play_with_override_skips_missing_ability_check() {
 		let fake = FakeCameraBuilder::new().with_abilities(&[]).build();
 		let mut cfg = crate::config::test_helpers::minimal_camera_config("door");
 		cfg.talk_config = Some(TalkConfigOverride {
@@ -557,12 +563,11 @@ mod tests {
 		assert_eq!(s.source, TalkConfigSource::ConfigOverride);
 		let calls = fake.calls().talk.lock().unwrap();
 		assert_eq!(calls.len(), 1);
-		assert!(calls[0].2, "override → gate bypassed");
 		assert_eq!(calls[0].1.audio_config.sample_rate, 8000);
 	}
 
-	/// No override, `two_way_audio` not advertised: the gate still fails
-	/// the talk with `MissingAbility`, and nothing is played.
+	/// No override, `two_way_audio` not advertised: `MissingAbility`
+	/// before any query, and nothing is played.
 	#[tokio::test]
 	async fn play_without_override_keeps_missing_ability_gate() {
 		let fake = FakeCameraBuilder::new().with_abilities(&[]).build();
@@ -572,7 +577,11 @@ mod tests {
 			samples: vec![0; 1025],
 		};
 		let err = play(&*fake, &cfg, &clip, 1.0).await.unwrap_err();
-		assert!(format!("{err:#}").contains("two_way_audio"), "{err:#}");
+		assert!(matches!(
+			err.downcast_ref::<BcError>(),
+			Some(BcError::MissingAbility { .. })
+		));
+		assert_eq!(*fake.calls().talk_ability.lock().unwrap(), 0);
 		assert!(fake.calls().talk.lock().unwrap().is_empty());
 	}
 
