@@ -96,6 +96,10 @@ pub trait CameraDriver: Send + Sync {
 	/// no camera round trip.
 	async fn ability_advertised(&self, name: &str) -> Option<bool>;
 
+	/// Whether any login-time ability name contains `needle`, ignoring
+	/// case; `None` when that report was never received. Cached.
+	async fn ability_name_contains(&self, needle: &str) -> Option<bool>;
+
 	/// The IP of the camera this session is connected to, when the
 	/// session reaches the camera itself (direct TCP or local discovery);
 	/// `None` through remote, map or relay discovery.
@@ -264,6 +268,10 @@ impl CameraDriver for BcCamera {
 
 	async fn ability_advertised(&self, name: &str) -> Option<bool> {
 		BcCamera::ability_advertised(self, name).await
+	}
+
+	async fn ability_name_contains(&self, needle: &str) -> Option<bool> {
+		BcCamera::ability_name_contains(self, needle).await
 	}
 
 	fn camera_ip(&self) -> Option<IpAddr> {

@@ -444,7 +444,8 @@ impl FakeCameraBuilder {
 		self
 	}
 
-	/// Abilities [`CameraDriver::ability_advertised`] reports. Default:
+	/// Abilities [`CameraDriver::ability_advertised`] and
+	/// [`CameraDriver::ability_name_contains`] report. Default:
 	/// no report received (every lookup is `None`).
 	pub fn with_abilities(mut self, names: &[&str]) -> Self {
 		self.state.abilities = Some(names.iter().map(|n| n.to_string()).collect());
@@ -672,6 +673,16 @@ impl CameraDriver for FakeCamera {
 	async fn ability_advertised(&self, name: &str) -> Option<bool> {
 		let names = self.inner.abilities.as_ref()?;
 		Some(names.iter().any(|a| a == name))
+	}
+
+	async fn ability_name_contains(&self, needle: &str) -> Option<bool> {
+		let names = self.inner.abilities.as_ref()?;
+		let needle = needle.to_ascii_lowercase();
+		Some(
+			names
+				.iter()
+				.any(|a| a.to_ascii_lowercase().contains(&needle)),
+		)
 	}
 
 	fn camera_ip(&self) -> Option<IpAddr> {

@@ -115,6 +115,8 @@ pub struct BcCamera {
 	/// The camera's own IP when the session reaches it directly (TCP or
 	/// local discovery); `None` through remote, map or relay discovery.
 	camera_ip: Option<IpAddr>,
+	/// How the session reaches the camera; `None` for the test mock.
+	path: Option<SessionPath>,
 }
 
 /// Options used to construct a camera
@@ -168,16 +170,44 @@ pub enum ConnectionProtocol {
 	Udp,
 }
 
+/// How a session reaches the camera: direct TCP, or the UDP discovery
+/// method that set it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPath {
+	/// Direct TCP to the camera's address.
+	Tcp,
+	/// UDP, found by LAN broadcast; talks to the camera itself.
+	Local,
+	/// UDP, located through Reolink's P2P servers.
+	Remote,
+	/// UDP via a P2P server mapping.
+	Map,
+	/// UDP relayed through Reolink's servers.
+	Relay,
+}
+
+impl SessionPath {
+	/// Lower-case name for logs.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			SessionPath::Tcp => "tcp",
+			SessionPath::Local => "udp-local",
+			SessionPath::Remote => "udp-remote",
+			SessionPath::Map => "udp-map",
+			SessionPath::Relay => "udp-relay",
+		}
+	}
+}
+
 /// Where discovery found the camera and how the session reaches it.
 pub(crate) enum CameraLocation {
 	/// A direct TCP connection to the camera at this address.
 	Tcp(SocketAddr),
-	/// A UDP session set up by discovery.
+	/// A UDP session set up by discovery. Only `Local` talks to the
+	/// camera itself; remote, map and relay go through a server.
 	Udp {
 		result: DiscoveryResult,
-		/// The session talks to the camera itself (local discovery);
-		/// `false` for remote, map and relay discovery.
-		direct: bool,
+		path: SessionPath,
 	},
 }
 
@@ -189,11 +219,18 @@ impl CameraLocation {
 			CameraLocation::Tcp(addr) => addr,
 			CameraLocation::Udp {
 				result,
-				direct: true,
+				path: SessionPath::Local,
 			} => result.get_addr(),
-			CameraLocation::Udp { direct: false, .. } => return None,
+			CameraLocation::Udp { .. } => return None,
 		};
 		Some(addr.ip().to_canonical())
+	}
+
+	fn path(&self) -> SessionPath {
+		match self {
+			CameraLocation::Tcp(_) => SessionPath::Tcp,
+			CameraLocation::Udp { path, .. } => *path,
+		}
 	}
 }
 
@@ -202,8 +239,8 @@ impl std::fmt::Debug for CameraLocation {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			CameraLocation::Tcp(a) => write!(f, "Tcp({a})"),
-			CameraLocation::Udp { result, direct } => {
-				write!(f, "Udp({}, direct: {direct})", result.get_addr())
+			CameraLocation::Udp { result, path } => {
+				write!(f, "Udp({}, {path:?})", result.get_addr())
 			}
 		}
 	}
@@ -351,7 +388,7 @@ impl BcCamera {
 								UidTail(&uid_local),
 								disc.get_addr()
 							);
-							Ok(CameraLocation::Udp { result: disc, direct: true })
+							Ok(CameraLocation::Udp { result: disc, path: SessionPath::Local })
 						},
 						Err(e) => Err(e)
 					}
@@ -431,7 +468,7 @@ impl BcCamera {
 										UidTail(&uid_remote),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp { result: disc, direct: false })
+									Ok(CameraLocation::Udp { result: disc, path: SessionPath::Remote })
 								},
 								Err(e) => Err(e)
 							}
@@ -449,7 +486,7 @@ impl BcCamera {
 										UidTail(&uid_map),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp { result: disc, direct: false })
+									Ok(CameraLocation::Udp { result: disc, path: SessionPath::Map })
 								},
 								Err(e) => Err(e),
 							}
@@ -467,7 +504,7 @@ impl BcCamera {
 										UidTail(&uid_relay),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp { result: disc, direct: false })
+									Ok(CameraLocation::Udp { result: disc, path: SessionPath::Relay })
 								},
 								Err(e) => Err(e),
 							}
@@ -506,6 +543,7 @@ impl BcCamera {
 		let mut sigv3_handshake: Option<(i64, String)> = None;
 		let location = BcCamera::find_camera(options).await?;
 		let camera_ip = location.camera_ip();
+		let path = Some(location.path());
 		let (sink, source): (BcConnSink, BcConnSource) = {
 			match location {
 				CameraLocation::Tcp(addr) => {
@@ -555,6 +593,7 @@ impl BcCamera {
 			cloud_mfa_trust_token: options.cloud_mfa_trust_token.clone(),
 			cloud_refresh_token: options.cloud_refresh_token.clone(),
 			camera_ip,
+			path,
 		};
 		// `keepalive` registers the inbound handler. If it fails, tear
 		// the just-started BcConnection down explicitly so we don't
@@ -576,6 +615,12 @@ impl BcCamera {
 	/// `None` when it runs through remote, map or relay discovery.
 	pub fn camera_ip(&self) -> Option<IpAddr> {
 		self.camera_ip
+	}
+
+	/// How this session reaches the camera (TCP, or the UDP discovery
+	/// method); `None` only for the test mock.
+	pub fn session_path(&self) -> Option<SessionPath> {
+		self.path
 	}
 
 	fn get_connection(&self) -> Arc<BcConnection> {
@@ -607,6 +652,22 @@ impl BcCamera {
 			return None;
 		}
 		Some(!matches!(self.has_ability(name).await, ReadKind::None))
+	}
+
+	/// Whether any login-time ability name contains `needle`, ignoring
+	/// case; `None` when no `abilityInfo` report was received (see
+	/// [`Self::ability_advertised`]). Cached; no camera round trip.
+	pub async fn ability_name_contains(&self, needle: &str) -> Option<bool> {
+		let abilities = self.abilities.read().await;
+		if abilities.is_empty() {
+			return None;
+		}
+		let needle = needle.to_ascii_lowercase();
+		Some(
+			abilities
+				.keys()
+				.any(|name| name.to_ascii_lowercase().contains(&needle)),
+		)
 	}
 
 	async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
@@ -696,6 +757,7 @@ impl BcCamera {
 			cloud_mfa_trust_token: None,
 			cloud_refresh_token: None,
 			camera_ip: None,
+			path: None,
 		}
 	}
 
@@ -1139,12 +1201,12 @@ mod discoverer_fallback_tests {
 		assert_eq!(CameraLocation::Tcp(mapped).camera_ip(), want);
 		let direct = CameraLocation::Udp {
 			result: ok_discovery(mapped),
-			direct: true,
+			path: SessionPath::Local,
 		};
 		assert_eq!(direct.camera_ip(), want);
 		let relayed = CameraLocation::Udp {
 			result: ok_discovery(mapped),
-			direct: false,
+			path: SessionPath::Relay,
 		};
 		assert_eq!(relayed.camera_ip(), None);
 	}
