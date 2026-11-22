@@ -288,6 +288,9 @@ pub const REORDER_CAP: usize = 1024;
 /// packet the camera never resends stalls the stream for good.
 const GAP_SKIP_AFTER: Duration = Duration::from_millis(500);
 
+/// Max entries in an outgoing ack's truth table. See `build_send_ack`.
+const ACK_BITMAP_CAP: u32 = 200;
+
 /// Pure-state slice of the UDP send/recv flow, extracted from
 /// `UdpPayloadInner` so the per-packet decision table is unit-testable
 /// and fuzz-drivable without spinning up the async coordination tasks.
@@ -467,9 +470,9 @@ impl UdpFlowState {
 			first_missing += 1;
 		}
 		// Truth table for the ids after the ack's `packet_id`: `01`
-		// received, `00` missing, up to the last id we hold. Capped so the
-		// datagram stays small.
-		const ACK_BITMAP_CAP: u32 = (REORDER_CAP * 4) as u32;
+		// received, `00` missing, up to the last id we hold. Capped at 200
+		// entries as nodelink-js does: some cameras disconnect once it
+		// grows to ~205 bytes.
 		let end = self
 			.received
 			.keys()
@@ -1605,6 +1608,19 @@ mod tests {
 		s.drain_contiguous(now());
 		assert!(!s.handle_data(data_pkt(0xCA01_0000), now()));
 		assert!(s.build_send_ack().payload.is_empty());
+	}
+
+	#[test]
+	fn build_send_ack_caps_truth_table() {
+		let mut s = fresh();
+		s.handle_data(data_pkt(0), now());
+		s.drain_contiguous(now());
+		// Hold 2 and the window's far end: the full table would be ~1 KiB.
+		s.handle_data(data_pkt(2), now());
+		s.handle_data(data_pkt(REORDER_CAP as u32), now());
+		let ack = s.build_send_ack();
+		assert_eq!(ack.payload.len(), ACK_BITMAP_CAP as usize);
+		assert_eq!(&ack.payload[..2], &[0, 1]);
 	}
 
 	#[test]
