@@ -781,12 +781,9 @@ impl CameraHandle {
 			tokio::time::sleep(POLL_INTERVAL).await;
 		}
 
-		// Fast path: already registered.
-		{
-			let guard = self.stream_sources.read_recover();
-			if let Some(source) = guard.get(&kind) {
-				return Ok(Arc::clone(source));
-			}
+		// Fast path: already registered and its reader still running.
+		if let Some(source) = self.live_stream_source(kind) {
+			return Ok(source);
 		}
 
 		// Slow path: hold the async create-mutex across the start + insert
@@ -797,11 +794,18 @@ impl CameraHandle {
 		let _create_guard = self.stream_source_create_lock.lock().await;
 
 		// Re-check under the mutex: another caller may have just created it.
-		{
-			let guard = self.stream_sources.read_recover();
-			if let Some(source) = guard.get(&kind) {
-				return Ok(Arc::clone(source));
-			}
+		if let Some(source) = self.live_stream_source(kind) {
+			return Ok(source);
+		}
+
+		// A dead entry (start_video failed or timed out, the stream ended,
+		// the translator panicked) would only make SETUPs wait out the SDP
+		// timeout. Await its reader, so its `stop_video` can't overlap the
+		// replacement's `start_video`, then fall through to a fresh start.
+		let dead = self.stream_sources.write_recover().remove(&kind);
+		if let Some(dead) = dead {
+			tracing::info!(camera = %self.config.name, stream = ?kind, "Replacing a stream source whose reader exited");
+			self.await_stream_source_stop(kind, &dead).await;
 		}
 
 		// State re-check under the create-lock: closes the TOCTOU
@@ -872,9 +876,35 @@ impl CameraHandle {
 		// observe our entry via the re-check.
 	}
 
+	/// The registered source for `kind`, if its reader is still running.
+	fn live_stream_source(&self, kind: RtspStreamKind) -> Option<Arc<StreamSource>> {
+		self.stream_sources
+			.read_recover()
+			.get(&kind)
+			.filter(|s| s.is_alive())
+			.cloned()
+	}
+
+	/// Stop `source` and await its reader within
+	/// [`Self::STREAM_SOURCE_STOP_TIMEOUT`], warning if it overruns.
+	async fn await_stream_source_stop(&self, kind: RtspStreamKind, source: &StreamSource) {
+		if let Err(e) = source.stop_and_wait(Self::STREAM_SOURCE_STOP_TIMEOUT).await {
+			tracing::warn!(
+				camera = %self.config.name,
+				stream = ?kind,
+				error = %e,
+				"stream-source reader did not exit within budget; detached (still holds Arc<BcCamera> until it observes cancel)",
+			);
+		}
+	}
+
 	/// Remove and stop any [`StreamSource`]s whose broadcast channels have
-	/// been without subscribers for at least `grace`. Called by the
-	/// watchdog / idle sweeps.
+	/// been without subscribers for at least `grace`, and any whose
+	/// reader has exited. Called by the watchdog / idle sweeps.
+	///
+	/// Holds the create lock until every pruned reader has exited, so a
+	/// SETUP in that window waits instead of issuing `start_video` while
+	/// the old reader's `stop_video` is still in flight.
 	///
 	/// Accepts an explicit `now` and `grace`, enabling
 	/// virtual-clock unit tests for the grace window. Production callers
@@ -886,38 +916,28 @@ impl CameraHandle {
 	/// reconnect.
 	///
 	/// A `grace` of zero restores the legacy instantaneous-prune behaviour.
-	pub(crate) fn prune_idle_stream_sources_at(&self, now: Instant, grace: Duration) {
-		let mut guard = self.stream_sources.write_recover();
-		guard.retain(|_kind, source| {
-			let subs = source.subscribers();
-			let mut marker = source.last_idle_since.lock_recover();
-			if subs > 0 {
-				*marker = None;
-				return true;
-			}
-			match *marker {
-				None => {
-					*marker = Some(now);
-					// If grace is zero, expire immediately on this sweep.
-					if grace.is_zero() {
-						// Drop the marker guard before stop/remove to keep
-						// the Mutex<Option<Instant>> from being re-locked
-						// via the Drop path (belt-and-braces — `Instant` /
-						// `Option` have no custom Drop today).
-						drop(marker);
-						source.stop();
-						return false;
-					}
-					true
-				}
-				Some(since) if now.saturating_duration_since(since) >= grace => {
-					drop(marker);
-					source.stop();
+	pub(crate) async fn prune_idle_stream_sources_at(&self, now: Instant, grace: Duration) {
+		let _create_guard = self.stream_source_create_lock.lock().await;
+		let mut pruned = Vec::new();
+		self.stream_sources.write_recover().retain(|&kind, source| {
+			let expired = !source.is_alive() || {
+				let mut marker = source.last_idle_since.lock_recover();
+				if source.subscribers() > 0 {
+					*marker = None;
 					false
+				} else {
+					let since = *marker.get_or_insert(now);
+					now.saturating_duration_since(since) >= grace
 				}
-				Some(_) => true,
+			};
+			if expired {
+				pruned.push((kind, Arc::clone(source)));
 			}
+			!expired
 		});
+		for (kind, source) in pruned {
+			self.await_stream_source_stop(kind, &source).await;
+		}
 	}
 
 	/// Returns `true` if any currently-registered [`StreamSource`] for
@@ -944,22 +964,15 @@ impl CameraHandle {
 	/// gets dropped from the registry, just with a `warn` so the
 	/// operator can see the leak.
 	async fn stop_all_stream_sources(&self) {
+		// The create lock keeps a SETUP that already passed its state
+		// check from inserting a source after the drain.
+		let _create_guard = self.stream_source_create_lock.lock().await;
 		// Drain entries under the write lock; await outside the lock
 		// so we don't hold a sync `RwLockWriteGuard` across `.await`.
-		let drained: Vec<(RtspStreamKind, Arc<StreamSource>)> = {
-			let mut guard = self.stream_sources.write_recover();
-			let entries: Vec<_> = guard.drain().collect();
-			entries
-		};
+		let drained: Vec<(RtspStreamKind, Arc<StreamSource>)> =
+			self.stream_sources.write_recover().drain().collect();
 		for (kind, source) in drained {
-			if let Err(e) = source.stop_and_wait(Self::STREAM_SOURCE_STOP_TIMEOUT).await {
-				tracing::warn!(
-					camera = %self.config.name,
-					stream = ?kind,
-					error = %e,
-					"stream-source reader did not exit within budget; detached (still holds Arc<BcCamera> until it observes cancel)",
-				);
-			}
+			self.await_stream_source_stop(kind, &source).await;
 		}
 	}
 
@@ -2904,6 +2917,37 @@ mod tests {
 		assert!(Arc::ptr_eq(&got, &source));
 	}
 
+	/// A registered source whose reader exited is replaced, not handed
+	/// out: the call goes past it to the create path (which fails here
+	/// only because the fake has no concrete `BcCamera`).
+	#[tokio::test]
+	async fn stream_source_replaces_a_dead_source() {
+		use crate::config::test_helpers::minimal_camera_config;
+		use crate::stream_source::StreamSource;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam-dead"),
+			CancellationToken::new(),
+			None,
+		));
+		handle.set_driver_for_test(FakeCameraBuilder::new().build());
+		let dead = StreamSource::start_inert_for_test();
+		dead.stop();
+		handle.insert_stream_source_for_test(RtspStreamKind::Main, dead);
+
+		let err = handle
+			.stream_source(RtspStreamKind::Main)
+			.await
+			.err()
+			.expect("a dead source must not be returned");
+		assert!(
+			matches!(err, StreamError::Unavailable(ref msg) if msg.contains("not currently connected")),
+			"got {err:?}"
+		);
+		assert!(!handle.has_stream_source_for_test(RtspStreamKind::Main));
+	}
+
 	/// `is_login_failure` rejects a plain `anyhow::Error` that doesn't
 	/// match any of the three auth substrings. Guards against an
 	/// over-eager match that would short-circuit retries on e.g. a
@@ -3780,7 +3824,9 @@ mod prune_grace_tests {
 		let rx = source.subscribe_for_test();
 		drop(rx);
 
-		handle.prune_idle_stream_sources_at(Instant::now(), Duration::ZERO);
+		handle
+			.prune_idle_stream_sources_at(Instant::now(), Duration::ZERO)
+			.await;
 		assert!(!handle.has_stream_source_for_test(StreamKind::Main));
 	}
 
@@ -3795,11 +3841,13 @@ mod prune_grace_tests {
 
 		// First sweep at t0: marks `last_idle_since`, keeps the source.
 		let t0 = Instant::now();
-		handle.prune_idle_stream_sources_at(t0, GRACE);
+		handle.prune_idle_stream_sources_at(t0, GRACE).await;
 		assert!(handle.has_stream_source_for_test(StreamKind::Main));
 
 		// Halfway through the grace window: still retained.
-		handle.prune_idle_stream_sources_at(t0 + Duration::from_secs(30), GRACE);
+		handle
+			.prune_idle_stream_sources_at(t0 + Duration::from_secs(30), GRACE)
+			.await;
 		assert!(handle.has_stream_source_for_test(StreamKind::Main));
 	}
 
@@ -3811,10 +3859,32 @@ mod prune_grace_tests {
 		drop(rx);
 
 		let t0 = Instant::now();
-		handle.prune_idle_stream_sources_at(t0, GRACE);
+		handle.prune_idle_stream_sources_at(t0, GRACE).await;
 		// 61s past t0 — past the 60 s grace.
-		handle.prune_idle_stream_sources_at(t0 + Duration::from_secs(61), GRACE);
+		handle
+			.prune_idle_stream_sources_at(t0 + Duration::from_secs(61), GRACE)
+			.await;
 		assert!(!handle.has_stream_source_for_test(StreamKind::Main));
+	}
+
+	/// A dead source goes on the next sweep, subscribers and grace
+	/// notwithstanding, and the sweep returns only after its reader has
+	/// exited (the reader's sender is gone, so the channel is closed).
+	#[tokio::test]
+	async fn prune_drops_a_dead_source_and_awaits_its_reader() {
+		let handle = new_handle();
+		let source = insert_inert_source(&handle, StreamKind::Main);
+		let mut rx = source.subscribe_for_test();
+		source.stop();
+
+		handle
+			.prune_idle_stream_sources_at(Instant::now(), GRACE)
+			.await;
+		assert!(!handle.has_stream_source_for_test(StreamKind::Main));
+		assert!(matches!(
+			rx.try_recv(),
+			Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+		));
 	}
 
 	#[tokio::test]
@@ -3825,25 +3895,31 @@ mod prune_grace_tests {
 		drop(rx);
 
 		let t0 = Instant::now();
-		handle.prune_idle_stream_sources_at(t0, GRACE);
+		handle.prune_idle_stream_sources_at(t0, GRACE).await;
 
 		// A new subscriber appears well before the grace expires.
 		let rx2 = handle.subscribe_stream_for_test(StreamKind::Main);
 
 		// Next sweep observes subs > 0 — marker cleared, source retained.
-		handle.prune_idle_stream_sources_at(t0 + Duration::from_secs(30), GRACE);
+		handle
+			.prune_idle_stream_sources_at(t0 + Duration::from_secs(30), GRACE)
+			.await;
 		assert!(handle.has_stream_source_for_test(StreamKind::Main));
 
 		// Drop the new subscriber — grace countdown must restart from here,
 		// not from `t0`.
 		drop(rx2);
 		let t1 = t0 + Duration::from_secs(30);
-		handle.prune_idle_stream_sources_at(t1, GRACE);
+		handle.prune_idle_stream_sources_at(t1, GRACE).await;
 		// 59 s after t1: still within the fresh grace → retained.
-		handle.prune_idle_stream_sources_at(t1 + Duration::from_secs(59), GRACE);
+		handle
+			.prune_idle_stream_sources_at(t1 + Duration::from_secs(59), GRACE)
+			.await;
 		assert!(handle.has_stream_source_for_test(StreamKind::Main));
 		// 61 s after t1: past the fresh grace → pruned.
-		handle.prune_idle_stream_sources_at(t1 + Duration::from_secs(61), GRACE);
+		handle
+			.prune_idle_stream_sources_at(t1 + Duration::from_secs(61), GRACE)
+			.await;
 		assert!(!handle.has_stream_source_for_test(StreamKind::Main));
 	}
 }

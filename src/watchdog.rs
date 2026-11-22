@@ -45,7 +45,8 @@ impl Watchdog {
 						// teardown should already do this, so this is a
 						// safety net for anything that leaked — with a
 						// grace window that smooths rapid RTSP reconnects.
-						cam.prune_idle_stream_sources_at(Instant::now(), self.prune_grace);
+						cam.prune_idle_stream_sources_at(Instant::now(), self.prune_grace)
+							.await;
 
 						// Safety-net disconnect: only fire when the camera
 						// has been wake-lock-idle for longer than its grace

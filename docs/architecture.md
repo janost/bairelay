@@ -193,7 +193,9 @@ The watchdog also monitors wake-lock state and can force-disconnect via `request
 A tokio task that runs every 30 seconds. For each camera with `idle_disconnect` enabled:
 
 1. If connected with zero wake locks held, call `request_disconnect()` to cancel the session.
-2. If there are stream sources with no subscribers older than `stream_prune_grace_secs` (default 30), drop them. The default is intentionally ≤ each camera's `idle_disconnect_timeout_secs` (default 45) so a cached `StreamSource` can never outlive the Baichuan session that feeds it.
+2. If there are stream sources with no subscribers older than `stream_prune_grace_secs` (default 30), drop them. The default is intentionally ≤ each camera's `idle_disconnect_timeout_secs` (default 45) so a cached `StreamSource` can never outlive the Baichuan session that feeds it. Sources whose reader has exited are dropped on the same sweep. The sweep holds the per-camera create lock until each dropped reader has finished its `stop_video`, so a new SETUP can't overlap it with `start_video`.
+
+A source whose reader exits (`start_video` failed or timed out, the stream ended, the translator panicked) is marked dead. `CameraHandle::stream_source` replaces a dead entry instead of returning it, and because `StreamSource` keeps only a weak broadcast sender, the channel closes with the reader and its RTSP sessions end instead of hanging.
 
 The watchdog is a safety net, not the primary lifecycle mechanism.
 

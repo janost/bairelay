@@ -150,7 +150,10 @@ pub enum GapState {
 
 /// A live `(camera, stream_kind)` media source. See module docs.
 pub struct StreamSource {
-	tx: broadcast::Sender<Frame>,
+	/// Weak so the channel closes when the reader and pacers (the only
+	/// strong senders) exit: subscribers then see `RecvError::Closed`
+	/// instead of waiting forever on a dead source.
+	tx: broadcast::WeakSender<Frame>,
 	/// Shared last-frame buffer owned by the [`CameraHandle`]. All sources
 	/// for the same camera write into this single buffer so the MQTT
 	/// preview publisher and RTSP placeholder code see one consistent view
@@ -296,7 +299,7 @@ impl StreamSourceParts {
 
 	fn into_source(self, task: JoinHandle<()>) -> Arc<StreamSource> {
 		Arc::new(StreamSource {
-			tx: self.tx,
+			tx: self.tx.downgrade(),
 			last_frame: self.last_frame,
 			sdp_params: self.sdp_params,
 			translator_state: self.translator_state,
@@ -503,7 +506,9 @@ impl StreamSource {
 			last_emitted_pts_90khz: Arc::clone(&parts.last_emitted_pts_90khz),
 			last_emit_wallclock_at: Arc::clone(&parts.last_emit_wallclock_at),
 		};
+		let stop_on_exit = parts.cancel.clone().drop_guard();
 		let task = tokio::spawn(async move {
+			let _stop_on_exit = stop_on_exit;
 			let mut s = source;
 			drive_translator_loop(args, &mut s).await;
 		});
@@ -512,8 +517,18 @@ impl StreamSource {
 
 	/// Subscribe to the broadcast channel. Each RTSP session creates one
 	/// receiver; lagging receivers are dropped per session-task policy.
+	/// On a dead source the receiver is already closed.
 	pub fn subscribe(&self) -> broadcast::Receiver<Frame> {
-		self.tx.subscribe()
+		match self.tx.upgrade() {
+			Some(tx) => tx.subscribe(),
+			None => broadcast::channel(1).1,
+		}
+	}
+
+	/// `false` once the reader has exited or been told to stop: a dead
+	/// source never produces another frame and must be replaced.
+	pub fn is_alive(&self) -> bool {
+		!self.cancel.is_cancelled()
 	}
 
 	/// Snapshot of the current SDP parameters.
@@ -585,7 +600,7 @@ impl StreamSource {
 
 	/// Current broadcast subscriber count (excluding any senders).
 	pub fn subscribers(&self) -> usize {
-		self.tx.receiver_count()
+		self.tx.upgrade().map_or(0, |tx| tx.receiver_count())
 	}
 
 	/// Configured gap-bridging threshold for this source. Task 5 (Phase
@@ -779,7 +794,7 @@ impl StreamSource {
 	/// unit tests can drive `receiver_count()` transitions without pulling
 	/// in the full RTSP provider subscription machinery.
 	pub(crate) fn subscribe_for_test(&self) -> broadcast::Receiver<Frame> {
-		self.tx.subscribe()
+		self.subscribe()
 	}
 
 	/// Test-only: force this source's [`GapState`] without waiting for
@@ -1281,6 +1296,10 @@ async fn reader_task(args: ReaderTaskArgs) {
 		last_emitted_pts_90khz,
 		last_emit_wallclock_at,
 	} = args;
+	// Every exit path, early return or not, marks the source dead so
+	// `CameraHandle::stream_source` replaces it instead of handing out
+	// a source that will never produce a frame.
+	let _stop_on_exit = cancel.clone().drop_guard();
 	let start_video_future =
 		tokio::time::timeout(START_VIDEO_TIMEOUT, camera.start_video(core_kind, 0, false));
 	let stream_data = tokio::select! {
@@ -1353,6 +1372,9 @@ async fn reader_task(args: ReaderTaskArgs) {
 				"translator task ended unexpectedly");
 		}
 	}
+	// The stream is over however it ended: stop the pacers and mark the
+	// source dead now rather than after `stop_video`.
+	cancel.cancel();
 
 	// Graceful stop: send the explicit stop_video so the camera tears
 	// down its side of the preview. We cap with STOP_VIDEO_TIMEOUT so a
@@ -5284,6 +5306,32 @@ mod tests {
 		// SDP video is populated.
 		let sdp = src.sdp_params();
 		assert!(sdp.video.is_some());
+	}
+
+	/// A stream that ends on its own leaves a dead source: it reports
+	/// it, and its subscribers see `Closed` instead of waiting forever
+	/// (the source itself holds only a weak sender).
+	#[tokio::test]
+	async fn ended_stream_marks_the_source_dead_and_closes_subscribers() {
+		let mut queue = std::collections::VecDeque::new();
+		queue.push_back(Err(bairelay_neolink_core::Error::StreamFinished));
+		let src = StreamSource::start_with_packet_source(
+			"cam-x".to_string(),
+			RtspStreamKind::Main,
+			Arc::new(LastFrameBuffer::new()),
+			Duration::from_secs(5),
+			ScriptedSource { queue },
+		);
+		let mut rx = src.subscribe();
+		let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+			.await
+			.expect("a subscriber of a dead source must not hang");
+		assert!(matches!(got, Err(broadcast::error::RecvError::Closed)));
+		assert!(!src.is_alive());
+		assert!(matches!(
+			src.subscribe().try_recv(),
+			Err(broadcast::error::TryRecvError::Closed)
+		));
 	}
 
 	#[tokio::test]
