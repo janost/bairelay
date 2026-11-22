@@ -258,6 +258,10 @@ pub struct CameraHandle {
 	/// write of one `<LedState>` on the camera, so overlapping commands
 	/// would otherwise undo each other's field.
 	led_write_lock: tokio::sync::Mutex<()>,
+	/// Held for the whole of a `control/talk`. A second talk on the
+	/// same camera would make it reply 422, and the core's retry would
+	/// stop the first clip, so it is refused instead (`try_lock`).
+	talk_lock: tokio::sync::Mutex<()>,
 	/// Bumped by every wake motion edge from this camera (a push or a
 	/// webhook PIR wake). An edge's hold window only clears `motion` if
 	/// no later edge has arrived, so back-to-back edges don't cut each
@@ -359,6 +363,7 @@ impl CameraHandle {
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
 			led_write_lock: tokio::sync::Mutex::new(()),
+			talk_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
 			camera_ip: std::sync::RwLock::new(None),
 			webhook_token,
@@ -536,6 +541,11 @@ impl CameraHandle {
 	/// Lock held across an IR / LED read-modify-write + republish.
 	pub fn led_write_lock(&self) -> &tokio::sync::Mutex<()> {
 		&self.led_write_lock
+	}
+
+	/// One `control/talk` at a time on this camera; see the field.
+	pub fn talk_lock(&self) -> &tokio::sync::Mutex<()> {
+		&self.talk_lock
 	}
 
 	pub fn status_cache(&self) -> Arc<StatusCache> {

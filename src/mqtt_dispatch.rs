@@ -360,32 +360,6 @@ async fn wait_for_bc_camera(
 	}
 }
 
-/// Cameras with a `control/talk` in flight. A second talk on the same
-/// camera would make the camera reply 422 and the core's retry would
-/// stop the first clip, so it is refused instead.
-static TALK_BUSY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// Releases the camera's [`TALK_BUSY`] slot on drop.
-struct TalkSlot(String);
-
-impl TalkSlot {
-	fn claim(camera: &str) -> Option<Self> {
-		let mut busy = TALK_BUSY.lock().unwrap_or_else(|e| e.into_inner());
-		if busy.iter().any(|c| c == camera) {
-			return None;
-		}
-		busy.push(camera.to_string());
-		Some(TalkSlot(camera.to_string()))
-	}
-}
-
-impl Drop for TalkSlot {
-	fn drop(&mut self) {
-		let mut busy = TALK_BUSY.lock().unwrap_or_else(|e| e.into_inner());
-		busy.retain(|c| c != &self.0);
-	}
-}
-
 /// `control/talk`: play the host WAV at `path`. Publishes `playing`,
 /// then `done` or `error: <code>` on `status/talk` (codes:
 /// [`crate::talk::TalkError::code`]; never the path or OS text), and
@@ -421,7 +395,7 @@ async fn run_talk(
 		.talk_dir
 		.as_deref()
 		.ok_or(TalkError::Disabled)?;
-	let _slot = TalkSlot::claim(cam.name()).ok_or(TalkError::Busy)?;
+	let _talking = cam.talk_lock().try_lock().map_err(|_| TalkError::Busy)?;
 	let clip = crate::talk::load_clip(std::path::Path::new(path), Some(talk_dir)).await?;
 	let _guard = cam.wake_lock().acquire();
 	let bc = match cam.bc_camera() {
@@ -680,6 +654,24 @@ mod tests {
 		assert_eq!(
 			published_on(&mock, "bairelay/cam-talk-dir/status/talk"),
 			vec![b"error: outside_talk_dir".to_vec()]
+		);
+	}
+
+	/// A second talk while one holds the camera's talk lock is refused.
+	#[tokio::test]
+	async fn dispatch_talk_while_playing_reports_busy() {
+		let dir = tempfile::tempdir().unwrap();
+		let wav = dir.path().join("a.wav");
+		std::fs::write(&wav, crate::talk::wav::tests::make_wav(16000, 1, &[0; 4])).unwrap();
+		let (cameras, fake) = talk_cameras("cam-talk-busy", Some(dir.path().to_path_buf()));
+		let _playing = cameras["cam-talk-busy"].talk_lock().try_lock().unwrap();
+
+		let mock = send_talk(&cameras, "cam-talk-busy", wav.to_str().unwrap()).await;
+
+		assert!(fake.calls().talk.lock().unwrap().is_empty());
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk-busy/status/talk"),
+			vec![b"error: busy".to_vec()]
 		);
 	}
 
