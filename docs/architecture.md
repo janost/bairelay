@@ -37,7 +37,7 @@ Owns the application lifecycle:
 - `sleep_or_cancel` (`src/run_support.rs`) — shared sleep+cancel primitive used by every retry / backoff path.
 - All listener sockets bind synchronously in `main.rs` before any "started" log line; bind failures halt startup.
 - RTSP `max_connections` semaphore (default 256 in the binary) caps concurrent client handlers.
-- Graceful shutdown on Ctrl+C or SIGTERM (`src/shutdown_signal/`; SIGTERM is Unix-only) via `CancellationToken` + supervisor-orchestrated per-task join with 2 s budget. With cameras connected a clean exit takes well under 1 s; a second signal force-exits.
+- Graceful shutdown on Ctrl+C or SIGTERM (`src/shutdown_signal/`; SIGTERM is Unix-only) via `CancellationToken` + supervisor-orchestrated task joins sharing one 2 s budget. With cameras connected a clean exit takes well under 1 s; a second signal force-exits.
 
 ### `crates/core/` — `bairelay_neolink_core`
 

@@ -611,7 +611,9 @@ async fn async_main() -> Result<()> {
 			let cameras_for_wh = orchestrator.cameras_arc();
 			let mqtt_for_wh = orchestrator.mqtt_client().cloned();
 			let prefix_for_wh = orchestrator.topic_prefix().to_string();
-			let hold = std::time::Duration::from_secs_f64(wh_block.motion_wake_hold_secs);
+			let hold =
+				bairelay::webhook_listener::WebhookTarget::from_config(&wh_block, &rtsp_bind_addr)?
+					.hold();
 			sup.spawn("webhook_listener", move |cancel| async move {
 				bairelay::webhook_listener::run_with_listener(
 					listener,

@@ -44,13 +44,6 @@ impl Supervisor {
 		}
 	}
 
-	/// Borrow the supervisor's cancellation token. Useful for
-	/// services that need to share it with their own subsystems
-	/// (e.g. the orchestrator's child tasks).
-	pub fn cancel_token(&self) -> &CancellationToken {
-		&self.cancel
-	}
-
 	/// Spawn a service that gets a clone of the supervisor's cancel
 	/// token. The service body runs until the token fires or it
 	/// returns naturally.
@@ -81,18 +74,20 @@ impl Supervisor {
 	}
 
 	/// Cancel the token (if not already cancelled), then join every
-	/// service with a per-service timeout. Logs the name + exit
-	/// status of each service so a wedged subsystem is visible
-	/// without needing strace.
-	pub async fn shutdown(mut self, per_service_timeout: Duration) {
+	/// service within one shared `budget`, so N wedged services cost
+	/// `budget`, not N × `budget`. Logs the name + exit status of each
+	/// service so a wedged subsystem is visible without needing strace;
+	/// one still running at the deadline is abandoned.
+	pub async fn shutdown(mut self, budget: Duration) {
 		self.cancel.cancel();
+		let deadline = tokio::time::Instant::now() + budget;
 		for Service { name, handle } in self.services.drain(..) {
-			match tokio::time::timeout(per_service_timeout, handle).await {
+			match tokio::time::timeout_at(deadline, handle).await {
 				Ok(Ok(())) => tracing::debug!(service = %name, "service exited cleanly"),
 				Ok(Err(e)) => tracing::warn!(service = %name, error = %e, "service panicked"),
 				Err(_) => tracing::warn!(
 					service = %name,
-					timeout_secs = per_service_timeout.as_secs(),
+					budget_secs = budget.as_secs_f64(),
 					"service shutdown timed out; abandoning"
 				),
 			}
@@ -146,22 +141,24 @@ mod tests {
 		);
 	}
 
+	#[tokio::test(start_paused = true)]
+	async fn wedged_services_share_one_shutdown_budget() {
+		let mut sup = Supervisor::new(CancellationToken::new());
+		for name in ["a", "b", "c"] {
+			sup.spawn(name, move |_cancel| async move {
+				tokio::time::sleep(Duration::from_secs(86_400)).await;
+			});
+		}
+		let start = tokio::time::Instant::now();
+		sup.shutdown(Duration::from_secs(2)).await;
+		assert_eq!(start.elapsed(), Duration::from_secs(2));
+	}
+
 	#[tokio::test]
 	async fn empty_supervisor_shuts_down_immediately() {
 		let sup = Supervisor::new(CancellationToken::new());
 		assert!(sup.is_empty());
 		sup.shutdown(Duration::from_secs(1)).await;
-	}
-
-	#[test]
-	fn cancel_token_returns_underlying_token() {
-		// `cancel_token()` is the seam orchestrator code uses to share
-		// the supervisor's token with its own per-camera task tree.
-		let outer = CancellationToken::new();
-		let sup = Supervisor::new(outer.clone());
-		// Cancelling via the borrowed reference fires on the original.
-		sup.cancel_token().cancel();
-		assert!(outer.is_cancelled());
 	}
 
 	#[tokio::test]

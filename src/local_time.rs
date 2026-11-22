@@ -6,6 +6,10 @@
 //! anywhere in the program, capture the offset once via [`init`] from
 //! `main()` *before* the tokio runtime is built, then read it from the
 //! `OnceLock` everywhere else.
+//!
+//! The offset is captured once, so after a DST change the daemon's log
+//! timestamps stay on the old offset (an hour off) until it restarts.
+//! One-shots such as `set-time` are short-lived and unaffected.
 
 use std::sync::OnceLock;
 
