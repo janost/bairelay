@@ -717,8 +717,10 @@ mod tests {
 		use bairelay_neolink_core::bc_protocol::connection::mock::MockConnection;
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
-		// No "preview" ability set → start_video errors with
-		// MissingAbility, which bubbles through drain_first_iframe.
+		// Abilities reported, but no "preview" → start_video errors with
+		// MissingAbility, which bubbles through drain_first_iframe. (An
+		// empty ability map is "unknown" and lets the call through.)
+		cam.test_set_ability("unrelated", false).await;
 		let err = run(&cam, None, false, true).await.expect_err("should fail");
 		assert!(format!("{:#}", err).contains("start_video failed"));
 	}

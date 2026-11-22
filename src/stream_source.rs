@@ -1685,7 +1685,7 @@ pub fn apply_bcmedia_packet(
 		BcMedia::Iframe(iframe) => {
 			handle_iframe(iframe, tx, video_pace_tx, last_frame, sdp_params, state)
 		}
-		BcMedia::Pframe(pframe) => handle_pframe(pframe, tx, video_pace_tx, last_frame, state),
+		BcMedia::Pframe(pframe) => handle_pframe(pframe, tx, video_pace_tx, state),
 		BcMedia::Aac(aac) => {
 			handle_aac(
 				aac,
@@ -1780,7 +1780,7 @@ fn handle_iframe(
 	let reordered: Vec<&[u8]> = non_slice;
 
 	// Extract parameter sets + IDR NALs per codec.
-	let (_, iframe_nals, sps_bytes, pps_bytes, vps_bytes) = extract_iframe_parts(codec, &reordered);
+	let (iframe_nals, sps_bytes, pps_bytes, vps_bytes) = extract_iframe_parts(codec, &reordered);
 
 	// Update SDP params (briefly hold write lock). Only do this if we
 	// have both SPS and PPS; otherwise wait for a future I-frame.
@@ -1946,13 +1946,11 @@ fn extract_iframe_parts(
 	codec: VideoCodec,
 	nals: &[&[u8]],
 ) -> (
-	Vec<Vec<u8>>,    // parameter_sets
 	Vec<Vec<u8>>,    // iframe_nals
 	Option<Vec<u8>>, // sps
 	Option<Vec<u8>>, // pps
 	Option<Vec<u8>>, // vps (H.265 only)
 ) {
-	let mut parameter_sets: Vec<Vec<u8>> = Vec::new();
 	let mut iframe_nals: Vec<Vec<u8>> = Vec::new();
 	let mut sps: Option<Vec<u8>> = None;
 	let mut pps: Option<Vec<u8>> = None;
@@ -1969,11 +1967,9 @@ fn extract_iframe_parts(
 				match ty {
 					H264NalType::SPS => {
 						sps = Some(owned.clone());
-						parameter_sets.push(owned);
 					}
 					H264NalType::PPS => {
 						pps = Some(owned.clone());
-						parameter_sets.push(owned);
 					}
 					H264NalType::IDR_SLICE => {
 						iframe_nals.push(owned);
@@ -1991,15 +1987,12 @@ fn extract_iframe_parts(
 				match ty {
 					H265NalType::VPS => {
 						vps = Some(owned.clone());
-						parameter_sets.push(owned);
 					}
 					H265NalType::SPS => {
 						sps = Some(owned.clone());
-						parameter_sets.push(owned);
 					}
 					H265NalType::PPS => {
 						pps = Some(owned.clone());
-						parameter_sets.push(owned);
 					}
 					H265NalType::IDR_W_RADL
 					| H265NalType::IDR_N_LP
@@ -2013,7 +2006,7 @@ fn extract_iframe_parts(
 		}
 	}
 
-	(parameter_sets, iframe_nals, sps, pps, vps)
+	(iframe_nals, sps, pps, vps)
 }
 
 /// Returns `Some(pts_90khz)` iff a [`Frame::Video`] P-frame was
@@ -2025,7 +2018,6 @@ fn handle_pframe(
 	pframe: &BcMediaPframe,
 	tx: &broadcast::Sender<Frame>,
 	video_pace_tx: Option<&mpsc::Sender<PacedFrame>>,
-	_last_frame: &Arc<LastFrameBuffer>,
 	state: &mut StreamTranslatorState,
 ) -> Option<u32> {
 	let codec = match state.detected_codec {
@@ -2224,7 +2216,7 @@ fn handle_aac(
 ) {
 	use bairelay_rtsp::codec::AudioCodec;
 	use bairelay_rtsp::codec::aac::{
-		AAC_PAYLOAD_TYPE, ADTS_HEADER_LEN, build_audio_specific_config_hex, parse_adts,
+		AAC_PAYLOAD_TYPE, build_audio_specific_config_hex, parse_adts,
 	};
 	use bairelay_rtsp::provider::AudioPayload;
 	use bairelay_rtsp::sdp::AudioParams;
@@ -2284,10 +2276,11 @@ fn handle_aac(
 		}
 	}
 
-	// Strip ADTS header; body is what the AU-hbr packetizer expects.
-	// parse_adts accepts any frame_length ≥ some minimum, so defend
-	// against a malformed frame_length that's still < header length.
-	if aac.data.len() < ADTS_HEADER_LEN || header.frame_length < ADTS_HEADER_LEN {
+	// Strip ADTS header (7 bytes, 9 with CRC); body is what the AU-hbr
+	// packetizer expects. Defend against a malformed frame_length
+	// that's still < header length.
+	let header_len = header.header_len;
+	if aac.data.len() < header_len || header.frame_length < header_len {
 		tracing::debug!(
 			frame_length = header.frame_length,
 			data_len = aac.data.len(),
@@ -2295,16 +2288,16 @@ fn handle_aac(
 		);
 		return;
 	}
-	let payload = &aac.data[ADTS_HEADER_LEN..];
+	let payload = &aac.data[header_len..];
 	// Clamp to the ADTS header's declared frame_length — trailing
 	// bytes beyond it can appear on some firmwares.
 	let au_bytes_len = header
 		.frame_length
-		.saturating_sub(ADTS_HEADER_LEN)
+		.saturating_sub(header_len)
 		.min(payload.len());
 	if au_bytes_len == 0 {
 		// Empty AAC body (truncated packet, or frame_length exactly
-		// equal to ADTS_HEADER_LEN). Dropping is preferable to emitting
+		// equal to the header length). Dropping is preferable to emitting
 		// a zero-length AU that would become a malformed RTP packet
 		// downstream (build_au_hbr_payload on an empty slice would
 		// produce a header with size=0 and no body).
@@ -4449,9 +4442,7 @@ mod tests {
 		let sei = [0x06u8, 0x00];
 		let idr = [0x65u8, 0xAA, 0xBB];
 		let nals: Vec<&[u8]> = vec![&sps, &pps, &sei, &idr];
-		let (params, iframes, out_sps, out_pps, out_vps) =
-			extract_iframe_parts(VideoCodec::H264, &nals);
-		assert_eq!(params.len(), 2);
+		let (iframes, out_sps, out_pps, out_vps) = extract_iframe_parts(VideoCodec::H264, &nals);
 		assert_eq!(iframes.len(), 1);
 		assert!(out_sps.is_some() && out_pps.is_some() && out_vps.is_none());
 	}
@@ -4463,9 +4454,7 @@ mod tests {
 		let pps = [0x44u8, 0x01, 0xC0];
 		let idr = [0x26u8, 0x01, 0xAF];
 		let nals: Vec<&[u8]> = vec![&vps, &sps, &pps, &idr];
-		let (params, iframes, out_sps, out_pps, out_vps) =
-			extract_iframe_parts(VideoCodec::H265, &nals);
-		assert_eq!(params.len(), 3);
+		let (iframes, out_sps, out_pps, out_vps) = extract_iframe_parts(VideoCodec::H265, &nals);
 		assert_eq!(iframes.len(), 1);
 		assert!(out_vps.is_some() && out_sps.is_some() && out_pps.is_some());
 	}
@@ -4475,28 +4464,26 @@ mod tests {
 		let empty: &[u8] = &[];
 		let sps = [0x67u8, 0x42];
 		let idr = [0x65u8, 0xAA];
-		let (_, iframes, _, _, _) = extract_iframe_parts(VideoCodec::H264, &[empty, &sps, &idr]);
+		let (iframes, _, _, _) = extract_iframe_parts(VideoCodec::H264, &[empty, &sps, &idr]);
 		assert_eq!(iframes.len(), 1);
 	}
 
 	#[test]
 	fn handle_pframe_returns_none_before_first_iframe() {
 		let (tx, _rx) = broadcast::channel::<Frame>(4);
-		let last_frame = Arc::new(LastFrameBuffer::new());
 		let pframe = bairelay_neolink_core::bcmedia::model::BcMediaPframe {
 			video_type: bairelay_neolink_core::bcmedia::model::VideoType::H264,
 			microseconds: 0,
 			data: vec![0x00, 0x00, 0x01, 0x41, 0xAA],
 		};
 		let mut s = StreamTranslatorState::default();
-		let result = handle_pframe(&pframe, &tx, None, &last_frame, &mut s);
+		let result = handle_pframe(&pframe, &tx, None, &mut s);
 		assert_eq!(result, None);
 	}
 
 	#[test]
 	fn handle_pframe_returns_none_on_empty_nal_split() {
 		let (tx, _rx) = broadcast::channel::<Frame>(4);
-		let last_frame = Arc::new(LastFrameBuffer::new());
 		let pframe = bairelay_neolink_core::bcmedia::model::BcMediaPframe {
 			video_type: bairelay_neolink_core::bcmedia::model::VideoType::H264,
 			microseconds: 0,
@@ -4506,7 +4493,7 @@ mod tests {
 			detected_codec: Some(VideoCodec::H264),
 			..Default::default()
 		};
-		let result = handle_pframe(&pframe, &tx, None, &last_frame, &mut s);
+		let result = handle_pframe(&pframe, &tx, None, &mut s);
 		assert_eq!(result, None);
 	}
 
@@ -4631,7 +4618,6 @@ mod tests {
 	#[test]
 	fn handle_pframe_drops_h265_unspec62_nals() {
 		let (tx, mut rx) = broadcast::channel::<Frame>(4);
-		let last_frame = Arc::new(LastFrameBuffer::new());
 		let pframe = bairelay_neolink_core::bcmedia::model::BcMediaPframe {
 			video_type: bairelay_neolink_core::bcmedia::model::VideoType::H265,
 			microseconds: 0,
@@ -4646,7 +4632,7 @@ mod tests {
 			detected_codec: Some(VideoCodec::H265),
 			..Default::default()
 		};
-		let pts = handle_pframe(&pframe, &tx, None, &last_frame, &mut s).expect("Some");
+		let pts = handle_pframe(&pframe, &tx, None, &mut s).expect("Some");
 		let frame = rx.try_recv().expect("frame broadcast");
 		match frame {
 			Frame::Video {
@@ -4671,7 +4657,6 @@ mod tests {
 		// A P-frame containing exclusively non-decodable NALs is
 		// dropped (no broadcast, no `last_live_frame_at` update upstream).
 		let (tx, mut rx) = broadcast::channel::<Frame>(4);
-		let last_frame = Arc::new(LastFrameBuffer::new());
 		let pframe = bairelay_neolink_core::bcmedia::model::BcMediaPframe {
 			video_type: bairelay_neolink_core::bcmedia::model::VideoType::H265,
 			microseconds: 0,
@@ -4681,7 +4666,7 @@ mod tests {
 			detected_codec: Some(VideoCodec::H265),
 			..Default::default()
 		};
-		let result = handle_pframe(&pframe, &tx, None, &last_frame, &mut s);
+		let result = handle_pframe(&pframe, &tx, None, &mut s);
 		assert_eq!(result, None);
 		assert!(rx.try_recv().is_err(), "no frame should have broadcast");
 	}
@@ -4726,9 +4711,8 @@ mod tests {
 		let trail = [0x02u8, 0x01, 0x00]; // type=1 (TRAIL_N)
 		let vps = [0x40u8, 0x01, 0xaa];
 		let idr = [0x26u8, 0x01, 0xbb]; // IDR_W_RADL
-		let (params, iframes, _, _, out_vps) =
+		let (iframes, _, _, out_vps) =
 			extract_iframe_parts(VideoCodec::H265, &[empty, &trail, &vps, &idr]);
-		assert_eq!(params.len(), 1);
 		assert_eq!(iframes.len(), 1);
 		assert!(out_vps.is_some());
 	}
