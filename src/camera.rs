@@ -1511,7 +1511,7 @@ impl CameraHandle {
 			None
 		};
 
-		let mut backoff = ReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(60));
+		let mut policy = ReconnectPolicy::new();
 
 		loop {
 			if self.cancel.is_cancelled() {
@@ -1551,30 +1551,39 @@ impl CameraHandle {
 					}
 				}
 			};
-			match connect_result {
+			let delay = match connect_result {
 				Ok((camera, device_type)) => {
 					let driver: Arc<dyn CameraDriver> =
 						Arc::clone(&camera) as Arc<dyn CameraDriver>;
-					backoff.reset();
-					self.run_connected_session(
-						driver,
-						Some(Arc::clone(&camera)),
-						device_type.as_deref(),
-					)
-					.await;
+					let started = tokio::time::Instant::now();
+					let end = self
+						.run_connected_session(
+							driver,
+							Some(Arc::clone(&camera)),
+							device_type.as_deref(),
+						)
+						.await;
+					policy.after_session(end, started.elapsed())
 				}
 				Err(e) => {
-					if is_login_failure(&e) {
-						tracing::error!(camera = %self.config.name, error = %format!("{:#}", e), "Authentication failed — check credentials. Stopping retries.");
-						self.set_state(CameraState::Disconnected);
-						break;
-					}
-					tracing::warn!(camera = %self.config.name, error = %e, "Connection failed");
 					self.set_state(CameraState::Disconnected);
+					let login_failure = is_login_failure(&e);
+					let delay = policy.after_connect_error(login_failure);
+					if login_failure {
+						tracing::error!(
+							camera = %self.config.name,
+							error = %format!("{:#}", e),
+							retry_in_secs = delay.as_secs(),
+							"Authentication failed, check credentials; retrying after a long backoff"
+						);
+					} else {
+						tracing::warn!(camera = %self.config.name, error = %e, "Connection failed");
+					}
+					delay
 				}
-			}
+			};
 
-			if !backoff.sleep_with_cancel(&self.cancel).await {
+			if !crate::run_support::sleep_or_cancel(delay, &self.cancel).await {
 				break;
 			}
 		}
@@ -1588,12 +1597,10 @@ impl CameraHandle {
 		self.set_state(CameraState::Disconnected);
 
 		// Ensure no stream sources outlive the camera handle even on
-		// cancelled/early-exit paths (e.g. auth failure, cancellation
-		// during backoff sleep). `run_connected_session` already
-		// drained sources + logged out + cleared the BcCamera Arcs on
-		// every successful session; this catches the paths that
-		// bypassed `run_connected_session` entirely (auth failure,
-		// timed-out connect, cancel during backoff).
+		// cancelled paths (cancel mid-connect or during backoff).
+		// `run_connected_session` already drained sources + logged out
+		// + cleared the BcCamera Arcs on every successful session; this
+		// catches the paths that bypassed it.
 		self.stop_all_stream_sources().await;
 
 		// Camera-lifetime preview publisher: self.cancel has fired (we
@@ -1661,8 +1668,8 @@ async fn aggregate_preview_state_loop(
 	}
 }
 
-/// Check whether an error indicates a login/credential failure that
-/// should not be retried.
+/// Check whether an error indicates a login/credential failure, which
+/// is retried only on [`ReconnectPolicy`]'s long login ladder.
 ///
 /// Walks the anyhow source chain and matches typed
 /// `bairelay_neolink_core::Error::AuthFailed | CameraLoginFail`. The Debug-
@@ -1670,8 +1677,10 @@ async fn aggregate_preview_state_loop(
 /// errors used by some test paths and any future intermediate wrapper
 /// that doesn't preserve a downcastable source — keeping it as a
 /// belt-and-braces guard so a future bairelay_neolink_core error-type rename
-/// doesn't silently regress to "retry auth failures forever" — the
-/// brute-force scenario flagged during the strict-code audit.
+/// doesn't silently regress to retrying bad credentials every few
+/// seconds, the brute-force scenario flagged during the strict-code
+/// audit. An empty 200 login reply also surfaces as `AuthFailed`, so it
+/// takes the same long ladder.
 fn is_login_failure(err: &anyhow::Error) -> bool {
 	use bairelay_neolink_core::Error as CoreError;
 	for cause in err.chain() {
@@ -1725,62 +1734,47 @@ impl ReconnectBackoff {
 	}
 }
 
-/// Outcome of [`drive_reconnect_with_backoff`]: either a successful
-/// connect, a bail-out signal from the connect fn (auth failure), or
-/// cancellation.
-#[cfg(test)]
-#[derive(Debug)]
-#[allow(dead_code)] // variant payloads inspected via Debug only
-pub(crate) enum ReconnectOutcome<T> {
-	/// Connect callback returned `Ok(T)` — the caller now owns the
-	/// connected handle.
-	Connected(T),
-	/// Connect callback returned `Err` and `should_bail(err) == true`
-	/// — e.g. an auth failure that must not be retried. The original
-	/// error is returned so the caller can log it.
-	Bailed(anyhow::Error),
-	/// `cancel.cancelled()` fired while waiting for the next attempt.
-	Cancelled,
+/// Session uptime after which a lost session counts as stable: the
+/// connect ladder restarts from its floor instead of escalating.
+const STABLE_SESSION_UPTIME: Duration = Duration::from_secs(60);
+
+/// Retry timing for [`CameraHandle::run`]. Connect failures and lost
+/// sessions climb a 2 s to 60 s ladder; login failures climb a separate
+/// 5 to 30 min one, so bad credentials (or a camera locking out the
+/// account) are retried rarely instead of every few seconds, and fixing
+/// them needs no restart.
+pub(crate) struct ReconnectPolicy {
+	connect: ReconnectBackoff,
+	login: ReconnectBackoff,
 }
 
-/// Run the connect / backoff / cancel loop against an injected
-/// connect callable and clock, producing a [`ReconnectOutcome`].
-///
-/// Keeps the pure reconnect-timing logic testable independently of
-/// the camera's full [`CameraHandle`] machinery (wake lock, preview
-/// state, MQTT publish). The backoff sleep delegates to
-/// [`ReconnectBackoff::sleep_with_cancel`] — the same path
-/// `CameraHandle::run` uses — so the
-/// "sleep-then-retry-with-cancel" contract is genuinely shared.
-#[cfg(test)]
-pub(crate) async fn drive_reconnect_with_backoff<T, F, Fut>(
-	mut backoff: ReconnectBackoff,
-	cancel: CancellationToken,
-	mut connect: F,
-	should_bail: impl Fn(&anyhow::Error) -> bool,
-) -> ReconnectOutcome<T>
-where
-	F: FnMut() -> Fut,
-	Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-	loop {
-		if cancel.is_cancelled() {
-			return ReconnectOutcome::Cancelled;
+impl ReconnectPolicy {
+	pub(crate) fn new() -> Self {
+		Self {
+			connect: ReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(60)),
+			login: ReconnectBackoff::new(Duration::from_secs(5 * 60), Duration::from_secs(30 * 60)),
 		}
-		let attempt = tokio::select! {
-			_ = cancel.cancelled() => return ReconnectOutcome::Cancelled,
-			r = connect() => r,
-		};
-		match attempt {
-			Ok(value) => return ReconnectOutcome::Connected(value),
-			Err(e) => {
-				if should_bail(&e) {
-					return ReconnectOutcome::Bailed(e);
-				}
-				if !backoff.sleep_with_cancel(&cancel).await {
-					return ReconnectOutcome::Cancelled;
-				}
-			}
+	}
+
+	/// Delay after a session that lasted `uptime` and ended with `end`.
+	/// A requested end (grace period, watchdog) or a stable session
+	/// restarts the connect ladder; a session lost within
+	/// [`STABLE_SESSION_UPTIME`] escalates it, so a camera that accepts
+	/// a login and then drops can't drive a reconnect every 2 s.
+	pub(crate) fn after_session(&mut self, end: SessionEnd, uptime: Duration) -> Duration {
+		self.login.reset();
+		if end == SessionEnd::Requested || uptime >= STABLE_SESSION_UPTIME {
+			self.connect.reset();
+		}
+		self.connect.next_delay()
+	}
+
+	/// Delay after a failed connect attempt.
+	pub(crate) fn after_connect_error(&mut self, login_failure: bool) -> Duration {
+		if login_failure {
+			self.login.next_delay()
+		} else {
+			self.connect.next_delay()
 		}
 	}
 }
@@ -2319,123 +2313,55 @@ mod tests {
 		assert_eq!(b.next_delay(), Duration::from_millis(400));
 	}
 
-	// ── drive_reconnect_with_backoff ────────────────────────────────
+	// ── ReconnectPolicy ─────────────────────────────────────────────
 
-	/// After N failed attempts, the next success returns
-	/// `Connected(value)` and the virtual clock advanced by exactly
-	/// the expected sum of backoff delays. Uses tokio's paused-time
-	/// clock so the test is deterministic regardless of real time.
-	#[tokio::test(start_paused = true)]
-	async fn drive_reconnect_retries_until_success_with_doubling_backoff() {
-		use std::sync::atomic::{AtomicU32, Ordering};
+	const MIN: Duration = Duration::from_secs(60);
 
-		let calls = Arc::new(AtomicU32::new(0));
-		let calls_c = Arc::clone(&calls);
-		let backoff = ReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(60));
-		let cancel = CancellationToken::new();
+	#[test]
+	fn login_failures_climb_the_long_ladder_without_touching_connect() {
+		let mut p = ReconnectPolicy::new();
+		let login: Vec<_> = (0..5).map(|_| p.after_connect_error(true)).collect();
+		assert_eq!(login, [5 * MIN, 10 * MIN, 20 * MIN, 30 * MIN, 30 * MIN]);
+		assert_eq!(p.after_connect_error(false), Duration::from_secs(2));
+	}
 
-		let start = tokio::time::Instant::now();
-		let outcome = drive_reconnect_with_backoff::<_, _, _>(
-			backoff,
-			cancel,
-			move || {
-				let calls_c = Arc::clone(&calls_c);
-				async move {
-					let n = calls_c.fetch_add(1, Ordering::AcqRel);
-					if n < 3 {
-						Err(anyhow::anyhow!("transient failure #{n}"))
-					} else {
-						Ok::<u32, anyhow::Error>(n)
-					}
-				}
-			},
-			|_| false,
-		)
-		.await;
+	#[test]
+	fn a_session_restarts_the_login_ladder() {
+		let mut p = ReconnectPolicy::new();
+		p.after_connect_error(true);
+		p.after_connect_error(true);
+		p.after_session(SessionEnd::Requested, Duration::ZERO);
+		assert_eq!(p.after_connect_error(true), 5 * MIN);
+	}
 
-		match outcome {
-			ReconnectOutcome::Connected(n) => assert_eq!(n, 3),
-			other => panic!("expected Connected(3), got {:?}", other),
+	/// A camera that accepts a login and then drops at once must not
+	/// reconnect on the 2 s floor forever.
+	#[test]
+	fn short_lost_sessions_escalate_the_connect_ladder() {
+		let mut p = ReconnectPolicy::new();
+		let short = Duration::from_secs(5);
+		let delays: Vec<_> = (0..4)
+			.map(|_| p.after_session(SessionEnd::Lost, short))
+			.collect();
+		let secs = |n: u64| Duration::from_secs(n);
+		assert_eq!(delays, [secs(2), secs(4), secs(8), secs(16)]);
+	}
+
+	#[test]
+	fn stable_or_requested_sessions_restart_the_connect_ladder() {
+		let mut p = ReconnectPolicy::new();
+		for _ in 0..3 {
+			p.after_connect_error(false);
 		}
+		let floor = Duration::from_secs(2);
 		assert_eq!(
-			calls.load(Ordering::Acquire),
-			4,
-			"connect should be called four times (three Err, one Ok)"
+			p.after_session(SessionEnd::Lost, STABLE_SESSION_UPTIME),
+			floor
 		);
-
-		// Three failures → three sleeps: 2 + 4 + 8 = 14 s.
-		let elapsed = start.elapsed();
-		assert!(
-			elapsed >= Duration::from_secs(14) && elapsed < Duration::from_secs(15),
-			"elapsed {:?} should be ~14s (2+4+8 backoff)",
-			elapsed
-		);
-	}
-
-	/// `should_bail` returns true on the first error → the loop exits
-	/// with `Bailed(err)` without retrying. Pins the "auth failure
-	/// short-circuit" contract used by `is_login_failure` in the real
-	/// loop.
-	#[tokio::test(start_paused = true)]
-	async fn drive_reconnect_bails_on_should_bail() {
-		use std::sync::atomic::{AtomicU32, Ordering};
-
-		let calls = Arc::new(AtomicU32::new(0));
-		let calls_c = Arc::clone(&calls);
-		let backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
-		let cancel = CancellationToken::new();
-
-		let outcome = drive_reconnect_with_backoff::<(), _, _>(
-			backoff,
-			cancel,
-			move || {
-				calls_c.fetch_add(1, Ordering::AcqRel);
-				async move { Err(anyhow::anyhow!("AuthFailed")) }
-			},
-			|e| format!("{e:?}").contains("AuthFailed"),
-		)
-		.await;
-
-		assert!(
-			matches!(outcome, ReconnectOutcome::Bailed(_)),
-			"expected Bailed, got {:?}",
-			outcome
-		);
+		p.after_connect_error(false);
 		assert_eq!(
-			calls.load(Ordering::Acquire),
-			1,
-			"bail-on-auth must not retry"
-		);
-	}
-
-	/// Cancellation mid-backoff short-circuits the sleep and returns
-	/// `Cancelled` without waiting the full delay. Uses paused time so
-	/// the test exits instantly on the cancel signal.
-	#[tokio::test(start_paused = true)]
-	async fn drive_reconnect_cancels_during_backoff_sleep() {
-		let backoff = ReconnectBackoff::new(Duration::from_secs(60), Duration::from_secs(60));
-		let cancel = CancellationToken::new();
-		let cancel_c = cancel.clone();
-
-		// Trip cancel shortly after the first Err lands. Paused time
-		// means the 60 s sleep would otherwise never resolve.
-		tokio::spawn(async move {
-			tokio::time::sleep(Duration::from_millis(100)).await;
-			cancel_c.cancel();
-		});
-
-		let outcome = drive_reconnect_with_backoff::<(), _, _>(
-			backoff,
-			cancel,
-			|| async { Err(anyhow::anyhow!("transient")) },
-			|_| false,
-		)
-		.await;
-
-		assert!(
-			matches!(outcome, ReconnectOutcome::Cancelled),
-			"expected Cancelled, got {:?}",
-			outcome
+			p.after_session(SessionEnd::Requested, Duration::ZERO),
+			floor
 		);
 	}
 
@@ -2613,8 +2539,8 @@ mod tests {
 	/// `connect_result = Err` → `is_login_failure` branch (returns
 	/// false on a connection reset/timeout), logs the connect failure,
 	/// and enters the backoff sleep. We cancel before the 2s sleep
-	/// finishes so the task exits via the `sleep_with_cancel → false`
-	/// branch (line 1046 break).
+	/// finishes so the task exits via the `sleep_or_cancel → false`
+	/// branch.
 	#[tokio::test]
 	async fn run_backoffs_after_connect_failure_then_exits_on_cancel() {
 		use crate::config::test_helpers::minimal_camera_config;
@@ -2635,7 +2561,7 @@ mod tests {
 		// A refused connect on 127.0.0.1:1 fails in well under a
 		// millisecond, so by now the loop is parked in the 2 s backoff
 		// sleep and the cancel below exercises the
-		// `sleep_with_cancel → false` branch. On a heavily instrumented
+		// `sleep_or_cancel → false` branch. On a heavily instrumented
 		// runner the connect can still be in flight instead, in which
 		// case cancel breaks out of the connect `select!` — the final
 		// assertion holds either way, because `run()` guarantees

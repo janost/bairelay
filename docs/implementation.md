@@ -333,11 +333,11 @@ The session task does not emit periodic Sender Reports. The receiver falls back 
 
 ## Authentication
 
-If `login_with_maxenc()` returns an authentication error (`AuthFailed`, `CameraLoginFail`, `Credential error`), **stop the retry loop permanently**. Don't hammer the camera with bad credentials every 2 – 60 seconds forever.
+If `login_with_maxenc()` returns an authentication error (`AuthFailed`, `CameraLoginFail`, `Credential error`), retry on the long login ladder of `ReconnectPolicy` (`src/camera.rs`): 5, 10, 20, then every 30 min, each logged at `error` with `retry_in_secs`. Don't hammer the camera with bad credentials every 2 – 60 seconds, but don't stop either: a permanent stop ended the only camera loop and the daemon exited 0, which `Restart=on-failure` doesn't restart. A successful session resets the ladder.
 
 Two distinct rejection shapes hide behind that one outcome, and both log a `warn` in `crates/core/src/bc_protocol/login.rs` naming which one fired: `CameraLoginFail` (modern login answered with a non-200 `response_code` — the code is included in the warn) and `AuthFailed` (200 with an empty body, no `DeviceInfo`). The binary's `Authentication failed` error line includes the full error chain, so service logs distinguish them too. The one-shot CLI prints the chain via `error: {:#}` — `bairelay battery <cam>` is the cheapest way for an operator to surface the variant.
 
-Reconnect on transient network failures still uses `ReconnectBackoff::sleep_with_cancel` (initial 2 s, doubling, capped at 60 s) — the same path production uses and the `drive_reconnect_with_backoff` test seam exercises.
+Transient connect failures and lost sessions use the connect ladder (initial 2 s, doubling, capped at 60 s). It restarts from 2 s only after a session that stayed up `STABLE_SESSION_UPTIME` (60 s) or ended on request (grace period, watchdog, shutdown); a session lost sooner escalates it, so a camera that accepts a login and then drops can't drive a reconnect every 2 s. `Orchestrator::run` returns only after shutdown is requested.
 
 ---
 
@@ -449,14 +449,14 @@ The mock doesn't connect to a broker; `EventLoop::poll` is leaked at test constr
 | `CameraHandle::set_driver_for_test(driver)`            | Install fake driver + flip state to Connected.   |
 | `CameraHandle::run_connected_session_for_test`         | Drive `run()`'s Connected arm directly.          |
 | `StreamSource::start_with_packet_source`               | Drive translator loop with scripted `BcMedia`.   |
-| `drive_reconnect_with_backoff` + `ReconnectOutcome`    | Pure reconnect-loop timing contract.             |
+| `ReconnectPolicy`                                      | Pure reconnect-loop timing, used by `run()`.     |
 | `ScriptedDiscoverer` (`test_support` in discovery.rs)  | Script local/remote/map/relay outcomes.          |
 | `MockVideoStream`                                      | Drive `drain_first_iframe` with scripted frames. |
 | `webhook_listener` tests' `Local` harness              | Run `serve` over `tokio::io::duplex` on paused time; `Local::push` fires a push edge for the dedupe tests. |
 | `FakeCameraBuilder::with_set_ha_cfg_pending()`         | Record the HaCfg write, then pend (cancel tests). |
 | `crate::test_logs::capture_at(Level)`                  | Thread-scoped log capture for log-content asserts. |
 
-`ReconnectBackoff::sleep_with_cancel(&CancellationToken) -> bool` is shared between production `CameraHandle::run` and the test seam — the "wait for next delay, bail on cancel" contract lives in one place.
+`CameraHandle::run` takes each delay from `ReconnectPolicy` and sleeps it with `run_support::sleep_or_cancel`, so the policy tests pin the production timing.
 
 ### Hang-protection discipline
 

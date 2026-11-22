@@ -254,7 +254,9 @@ Production impls forward to the concrete types (`BcCamera`, `Discovery`, `Stream
 - **Library crates** (`core`, `rtsp`, `mqtt`, `wake-server`): use `thiserror` with typed error enums. Each crate defines its own error type.
 - **Binary crate** (`bairelay`): uses `anyhow` for top-level error propagation with context.
 - **Connection failures**: logged and retried with exponential backoff. Never crash the process.
-- **Authentication failures**: stop retrying permanently. Don't hammer the camera with bad credentials.
+- **Authentication failures**: retried on a long backoff (5, 10, 20, then every 30 min), logged at error with the retry delay. Don't hammer the camera with bad credentials, but recover without a restart once they're fixed.
+- **Reconnect backoff**: 2 s doubling to 60 s. It restarts from 2 s only after a session that stayed up 60 s or ended on request (grace period, watchdog), so a camera that drops right after login can't drive a reconnect storm.
+- **Daemon lifetime**: the orchestrator returns only once shutdown is requested, so the process never exits 0 on its own.
 - **Protocol errors**: logged at warn / error. Malformed packets from cameras are discarded, not propagated.
 - **Configuration errors**: fail fast at startup with clear messages.
 
