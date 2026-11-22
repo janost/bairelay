@@ -94,6 +94,9 @@ pub async fn handle_connection<S>(
 	let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 		Arc::new(Mutex::new(Box::new(write_half)));
 
+	// A dual-stack `[::]` listener reports IPv4 clients as `::ffff:a.b.c.d`.
+	// Canonicalise once so SDP advertises a plain IPv4 address under
+	// `IN IP4`, and UDP binds and sends use one address family.
 	let state = Arc::new(ConnectionState {
 		provider,
 		users,
@@ -101,9 +104,9 @@ pub async fn handle_connection<S>(
 		current_nonce: Mutex::new(Nonce::random()),
 		sessions: Arc::new(SessionRegistry::new()),
 		udp_pool,
-		server_bind_ip,
-		peer_ip,
-		local_ip,
+		server_bind_ip: server_bind_ip.to_canonical(),
+		peer_ip: peer_ip.to_canonical(),
+		local_ip: local_ip.to_canonical(),
 		is_tls,
 		writer: Arc::clone(&writer),
 	});
@@ -1561,22 +1564,56 @@ mod tests {
 		CancellationToken,
 		tokio::task::JoinHandle<()>,
 	) {
+		let lo = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+		spawn_connection_with_ips(provider, lo, lo)
+	}
+
+	fn spawn_connection_with_ips(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+		server_bind_ip: std::net::IpAddr,
+		local_ip: std::net::IpAddr,
+	) -> (
+		tokio::io::DuplexStream,
+		CancellationToken,
+		tokio::task::JoinHandle<()>,
+	) {
 		let (client, server) = tokio::io::duplex(256 * 1024);
 		let cancel = CancellationToken::new();
-		let lo = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
 		let task = tokio::spawn(handle_connection(
 			server,
 			provider,
 			vec![],
 			"test".into(),
 			Arc::new(crate::server::udp_pool::UdpPortPool::new()),
-			lo,
-			lo,
-			lo,
+			server_bind_ip,
+			local_ip,
+			local_ip,
 			false,
 			cancel.clone(),
 		));
 		(client, cancel, task)
+	}
+
+	#[tokio::test]
+	async fn v4_mapped_local_ip_is_advertised_as_plain_ipv4() {
+		use tokio::io::AsyncWriteExt;
+		let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+		let (mut client, cancel, task) = spawn_connection_with_ips(
+			MockProv::with_cameras(&["cam1"]),
+			std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+			mapped,
+		);
+		client
+			.write_all(b"DESCRIBE rtsp://x/cam1/main RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		let sdp = String::from_utf8(rr.body.clone()).unwrap();
+		assert!(sdp.contains("c=IN IP4 127.0.0.1\r\n"), "{sdp}");
+		cancel.cancel();
+		task.await.unwrap();
 	}
 
 	/// Reads RTSP responses off a client stream, keeping leftover bytes
@@ -1586,6 +1623,8 @@ mod tests {
 		buf: Vec<u8>,
 		/// `$` frames seen so far, as (channel, payload).
 		frames: Vec<(u8, Vec<u8>)>,
+		/// Body of the last response returned by `next`.
+		body: Vec<u8>,
 	}
 
 	impl ResponseReader {
@@ -1623,7 +1662,8 @@ mod tests {
 					let head = String::from_utf8(self.buf[..pos + 4].to_vec()).unwrap();
 					let cl = parse_content_length(head.as_bytes()).unwrap_or(0);
 					if self.buf.len() >= pos + 4 + cl {
-						self.buf.drain(..pos + 4 + cl);
+						let msg: Vec<u8> = self.buf.drain(..pos + 4 + cl).collect();
+						self.body = msg[pos + 4..].to_vec();
 						assert!(!want_frame, "expected a $ frame, got {head}");
 						return Some(head);
 					}

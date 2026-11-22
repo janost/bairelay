@@ -59,14 +59,20 @@ pub struct AudioParams {
 /// followed by optional video and audio media sections. Track IDs are
 /// assigned sequentially starting at 0 in the order `video`, `audio`.
 pub fn build(params: &SdpParams) -> String {
+	// RFC 4566 addrtype must match the address; anything that isn't an
+	// IPv6 literal (IPv4, or an unparseable placeholder) stays IP4.
+	let addrtype = match params.server_ip.parse::<std::net::IpAddr>() {
+		Ok(std::net::IpAddr::V6(_)) => "IP6",
+		_ => "IP4",
+	};
 	let mut s = String::new();
 	s.push_str("v=0\r\n");
 	s.push_str(&format!(
-		"o=- {} 1 IN IP4 {}\r\n",
+		"o=- {} 1 IN {addrtype} {}\r\n",
 		params.session_id, params.server_ip
 	));
 	s.push_str(&format!("s={}\r\n", params.session_name));
-	s.push_str(&format!("c=IN IP4 {}\r\n", params.server_ip));
+	s.push_str(&format!("c=IN {addrtype} {}\r\n", params.server_ip));
 	s.push_str("t=0 0\r\n");
 	s.push_str("a=control:*\r\n");
 	s.push_str("a=range:npt=now-\r\n");
@@ -78,7 +84,11 @@ pub fn build(params: &SdpParams) -> String {
 		track_id += 1;
 	}
 	if let Some(a) = &params.audio {
-		append_audio(&mut s, a, track_id);
+		// mpeg4-generic requires `config=`; an AAC track without an
+		// AudioSpecificConfig would be undecodable, so leave it out.
+		if a.codec != AudioCodec::Aac || a.asc_hex.is_some() {
+			append_audio(&mut s, a, track_id);
+		}
 	}
 
 	s
@@ -122,7 +132,7 @@ fn append_audio(s: &mut String, a: &AudioParams, track_id: u32) {
 				"a=rtpmap:{} mpeg4-generic/{}/{}\r\n",
 				a.payload_type, a.sample_rate, a.channels
 			));
-			let asc = a.asc_hex.as_deref().unwrap_or("");
+			let asc = a.asc_hex.as_deref().unwrap_or_default();
 			s.push_str(&format!(
 				"a=fmtp:{} streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config={}\r\n",
 				a.payload_type, asc
@@ -251,6 +261,43 @@ mod tests {
 		assert!(sdp.contains("sprop-vps="));
 		assert!(sdp.contains("sprop-sps="));
 		assert!(sdp.contains("sprop-pps="));
+	}
+
+	#[test]
+	fn ipv6_server_ip_uses_ip6_addrtype() {
+		let p = SdpParams {
+			server_ip: "fd00::5".into(),
+			session_id: "1".into(),
+			session_name: "cam1".into(),
+			video: Some(sample_video_h264()),
+			audio: None,
+		};
+		let sdp = build(&p);
+		assert!(sdp.contains("o=- 1 1 IN IP6 fd00::5\r\n"), "{sdp}");
+		assert!(sdp.contains("c=IN IP6 fd00::5\r\n"), "{sdp}");
+		Session::parse(sdp.as_bytes()).expect("valid SDP");
+		let v4 = build(&SdpParams {
+			server_ip: "10.0.0.5".into(),
+			..p
+		});
+		assert!(v4.contains("c=IN IP4 10.0.0.5\r\n"));
+	}
+
+	#[test]
+	fn aac_without_config_is_omitted() {
+		let p = SdpParams {
+			server_ip: "127.0.0.1".into(),
+			session_id: "1".into(),
+			session_name: "cam1".into(),
+			video: Some(sample_video_h264()),
+			audio: Some(AudioParams {
+				asc_hex: None,
+				..sample_audio_aac()
+			}),
+		};
+		let sdp = build(&p);
+		assert!(!sdp.contains("m=audio"), "{sdp}");
+		assert!(!sdp.contains("config="));
 	}
 
 	#[test]
