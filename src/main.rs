@@ -581,8 +581,9 @@ async fn async_main() -> Result<()> {
 			let mqtt_for_pl = orchestrator.mqtt_client().cloned();
 			let prefix_for_pl = orchestrator.topic_prefix().to_string();
 			let bind_port_log = pl_block.push_listener_port;
-			sup.spawn("push_listener", move |cancel| async move {
-				if let Err(e) = bairelay::push_listener::run_with_listener(
+			let hold_log = cfg.motion_wake_hold.as_secs_f64();
+			sup.spawn("push_listener", move |cancel| {
+				bairelay::push_listener::run_with_listener(
 					listener,
 					cfg,
 					registry_for_pl,
@@ -591,14 +592,11 @@ async fn async_main() -> Result<()> {
 					prefix_for_pl,
 					cancel,
 				)
-				.await
-				{
-					tracing::error!(error = %e, "push listener exited with error");
-				}
 			});
 			info!(
 				bind = %bind_addr,
 				port = bind_port_log,
+				motion_wake_hold_secs = hold_log,
 				"Push listener started"
 			);
 		}
