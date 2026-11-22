@@ -81,7 +81,7 @@ pub async fn camera_capabilities(
 }
 
 /// The `<Support>` item describing `channel`, if the camera sent one.
-fn channel_item(support: &Support, channel: u8) -> Option<&SupportItem> {
+pub(crate) fn channel_item(support: &Support, channel: u8) -> Option<&SupportItem> {
 	support
 		.items
 		.iter()
@@ -130,6 +130,8 @@ impl From<CameraCapabilities> for bairelay_mqtt::discovery::CameraCapabilitiesVi
 			ir_leds: caps.ir_leds,
 			ai: caps.ai,
 			doorbell: caps.doorbell,
+			// Filled from the power source by `CameraHandle`.
+			battery: Presence::Unknown,
 		}
 	}
 }

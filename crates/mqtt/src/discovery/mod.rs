@@ -101,6 +101,9 @@ pub struct CameraCapabilitiesView {
 	/// Doorbell button — gates the press event entity and the
 	/// doorbell-only AI sensors (face, package).
 	pub doorbell: Presence,
+	/// Battery — absent once the camera is known to run on mains.
+	/// Gates the battery sensor.
+	pub battery: Presence,
 }
 
 impl CameraCapabilitiesView {
@@ -121,6 +124,7 @@ impl CameraCapabilitiesView {
 			ir_leds: self.ir_leds.unknown_as_present(),
 			ai: self.ai.unknown_as_present(),
 			doorbell: self.doorbell.unknown_as_present(),
+			battery: self.battery.unknown_as_present(),
 		}
 	}
 
@@ -594,6 +598,10 @@ pub fn absent_hardware_retractions(ctx: &DiscoveryContext) -> Vec<String> {
 	if caps.doorbell.is_absent() {
 		out.push(doorbell_ids(ctx).1);
 	}
+	if caps.battery.is_absent() {
+		out.push(battery_ids(ctx).1);
+		out.push(cam_topic(ctx, "status", "battery_level"));
+	}
 	for object in AiObject::ALL {
 		if caps.retracts_ai_object(object) {
 			out.push(ai_ids(ctx, object).1);
@@ -601,6 +609,13 @@ pub fn absent_hardware_retractions(ctx: &DiscoveryContext) -> Vec<String> {
 		}
 	}
 	out
+}
+
+/// `(unique_id, config topic)` of the battery sensor.
+fn battery_ids(ctx: &DiscoveryContext) -> (String, String) {
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "battery");
+	let topic = config_topic(ctx, "sensor", &unique_id);
+	(unique_id, topic)
 }
 
 /// `(unique_id, config topic)` of the doorbell press event.
@@ -837,8 +852,11 @@ pub fn build_pt_buttons(ctx: &DiscoveryContext) -> Vec<(String, Vec<u8>)> {
 /// statistics require all three: `state_class = measurement`,
 /// `unit_of_measurement = %`, `device_class = battery`.
 pub fn build_battery(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
+	if ctx.capabilities.battery.is_absent() {
+		return None;
+	}
 	let friendly = title_case(ctx.camera_name);
-	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "battery");
+	let (unique_id, topic) = battery_ids(ctx);
 	let payload = DiscoverySensor {
 		name: "Battery".to_string(),
 		unique_id: unique_id.clone(),
@@ -850,7 +868,7 @@ pub fn build_battery(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 		unit_of_measurement: "%".to_string(),
 		device_class: Some("battery".to_string()),
 	};
-	Some((config_topic(ctx, "sensor", &unique_id), to_json(&payload)))
+	Some((topic, to_json(&payload)))
 }
 
 /// `button` entity triggering the camera's alarm siren.
@@ -1148,6 +1166,28 @@ mod tests {
 		assert!(parse(&ir).get("state_topic").is_none());
 	}
 
+	/// Mains power hides the battery sensor and retracts one published
+	/// earlier, config and state; unknown power keeps it.
+	#[test]
+	fn battery_absent_retracts_sensor_and_level() {
+		let f = Fixture::new("bairelay");
+		let mains = CameraCapabilitiesView {
+			battery: Presence::Absent,
+			..Default::default()
+		};
+		assert!(build_battery(&f.ctx(&mains)).is_none());
+		assert_eq!(
+			absent_hardware_retractions(&f.ctx(&mains)),
+			vec![
+				"homeassistant/sensor/bairelay_frontdoor_battery/config".to_string(),
+				"bairelay/frontdoor/status/battery_level".to_string(),
+			]
+		);
+		let unknown = CameraCapabilitiesView::default();
+		assert!(build_battery(&f.ctx(&unknown)).is_some());
+		assert!(absent_hardware_retractions(&f.ctx(&unknown)).is_empty());
+	}
+
 	#[test]
 	fn absent_hardware_retractions_cover_config_and_status() {
 		use Presence::*;
@@ -1226,12 +1266,13 @@ mod tests {
 			ir_leds: Absent,
 			ai: Unknown,
 			doorbell: Present,
+			battery: Unknown,
 		}
 		.unknown_as_present();
 		assert!(c.has_ptz);
 		assert_eq!(
-			(c.status_led, c.ir_leds, c.ai, c.doorbell),
-			(Present, Absent, Present, Present)
+			(c.status_led, c.ir_leds, c.ai, c.doorbell, c.battery),
+			(Present, Absent, Present, Present, Present)
 		);
 	}
 
