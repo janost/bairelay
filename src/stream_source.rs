@@ -37,15 +37,13 @@ use tokio_util::sync::CancellationToken;
 
 use bairelay_rtsp::buffer::{LastFrameBuffer, VideoBurst};
 use bairelay_rtsp::codec::VideoCodec;
-use bairelay_rtsp::codec::nal::{
-	H264NalType, H265NalType, detect_codec, is_decodable_nal, split_annex_b,
-};
+use bairelay_rtsp::codec::nal::{H264NalType, H265NalType, is_decodable_nal, split_annex_b};
 use bairelay_rtsp::provider::Frame;
 use bairelay_rtsp::sdp::{SdpParams, VideoParams};
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
 
 use bairelay_neolink_core::bc_protocol::{BcCamera, StreamKind as CoreStreamKind};
-use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe};
+use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe, VideoType};
 
 use crate::bcmedia_dump::{BcMediaDumpConfig, FrameDumper};
 
@@ -355,8 +353,8 @@ struct ReaderTaskArgs {
 /// Bundles the four `&mut` fields that `apply_bcmedia_packet` previously
 /// took individually:
 ///
-/// - `detected_codec` — H.264 vs H.265 verdict, latched on the first
-///   identifying NAL.
+/// - `detected_codec` — H.264 vs H.265 verdict: the first I-frame's
+///   BcMedia tag, replaced only by parameter-set evidence.
 /// - `aac_pts_next` — running 90 kHz-clock-independent AAC RTP timestamp
 ///   counter; advances by 1024 per AAC-LC AU (2048 for HE-AAC / HE-AACv2).
 /// - `g711_pts_next` — running 8 kHz G.711 µ-law RTP timestamp counter;
@@ -1787,22 +1785,25 @@ fn handle_iframe(
 		return None;
 	}
 
-	// Detect the codec from the first NAL that gives a verdict.
-	if state.detected_codec.is_none() {
-		for nal in &nals {
-			if let Some(c) = detect_codec(nal) {
-				state.detected_codec = Some(c);
-				break;
-			}
-		}
-	}
-	let codec = match state.detected_codec {
-		Some(c) => c,
-		None => {
-			tracing::warn!("I-frame with no detectable codec; dropping");
-			return None;
-		}
+	// The BcMedia tag names the codec; only a parameter set overrides
+	// it. Guessing from the first NAL misread an HEVC access unit led by
+	// Reolink's type-62 NAL as H.264 for the whole session.
+	let tagged = match iframe.video_type {
+		VideoType::H264 => VideoCodec::H264,
+		VideoType::H265 => VideoCodec::H265,
 	};
+	let evidence = nals.iter().find_map(|n| parameter_set_codec(n));
+	let codec = evidence.or(state.detected_codec).unwrap_or(tagged);
+	if state.detected_codec != Some(codec) {
+		if evidence.is_some_and(|c| c != tagged) {
+			tracing::warn!(
+				?tagged,
+				?codec,
+				"I-frame parameter sets contradict the BcMedia codec tag; following the parameter sets"
+			);
+		}
+		state.detected_codec = Some(codec);
+	}
 
 	// Filter NALs to the standard single-layer whitelist. Reolink Argus
 	// firmware emits HEVC NAL type 62 (UNSPEC62) inside access units;
@@ -1924,6 +1925,26 @@ fn handle_iframe(
 	let duration = video_frame_duration(state, pts_90khz);
 	dispatch_paced_video(video_pace_tx, tx, frame, duration);
 	Some(pts_90khz)
+}
+
+/// The codec a parameter-set NAL belongs to (H.264 SPS/PPS, H.265
+/// VPS/SPS/PPS with a valid second header byte); `None` for any other
+/// NAL. The H.265 types are tested first: their header bytes (0x40,
+/// 0x42, 0x44) never read as an H.264 SPS/PPS, and H.264's (0x67,
+/// 0x68 and kin) never as an H.265 parameter set.
+fn parameter_set_codec(nal: &[u8]) -> Option<VideoCodec> {
+	let &b0 = nal.first()?;
+	if b0 & 0x80 != 0 {
+		return None;
+	}
+	let h265 = H265NalType::from_header_byte(b0);
+	if matches!(h265, H265NalType::VPS | H265NalType::SPS | H265NalType::PPS)
+		&& nal.get(1).is_some_and(|b| b & 0x07 >= 1)
+	{
+		return Some(VideoCodec::H265);
+	}
+	let h264 = H264NalType::from_header_byte(b0);
+	matches!(h264, H264NalType::SPS | H264NalType::PPS).then_some(VideoCodec::H264)
 }
 
 /// Returns true if `nal` is a codec parameter-set NAL (SPS/PPS for
@@ -3222,6 +3243,55 @@ mod tests {
 		out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
 		out.extend_from_slice(&[0x26, 0x01, 0xaf, 0x08, 0x46]);
 		out
+	}
+
+	/// Detected codec after one I-frame tagged `tag` carrying `data`.
+	fn codec_after_iframe(tag: VideoType, data: Vec<u8>) -> Option<VideoCodec> {
+		let (tx, _rx) = broadcast::channel::<Frame>(4);
+		let sdp_params = Arc::new(RwLock::new(SdpParams {
+			server_ip: "0.0.0.0".to_string(),
+			session_id: "0".to_string(),
+			session_name: "unit".to_string(),
+			video: None,
+			audio: None,
+		}));
+		let mut state = StreamTranslatorState::default();
+		let iframe = BcMediaIframe {
+			video_type: tag,
+			microseconds: 0,
+			time: None,
+			data,
+		};
+		handle_iframe(
+			&iframe,
+			&tx,
+			None,
+			&Arc::new(LastFrameBuffer::new()),
+			&sdp_params,
+			&mut state,
+		);
+		state.detected_codec
+	}
+
+	/// An HEVC access unit led by Reolink's type-62 NAL (whose header
+	/// byte reads as an H.264 NAL) keeps the BcMedia tag's H.265.
+	#[test]
+	fn codec_follows_the_tag_when_a_type_62_nal_leads() {
+		let mut data = vec![0x00, 0x00, 0x00, 0x01, 0x7C, 0x01, 0xAB, 0xCD];
+		data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, 0x08]);
+		assert_eq!(
+			codec_after_iframe(VideoType::H265, data),
+			Some(VideoCodec::H265)
+		);
+	}
+
+	/// Parameter sets outrank a contradicting tag.
+	#[test]
+	fn codec_follows_parameter_sets_over_the_tag() {
+		assert_eq!(
+			codec_after_iframe(VideoType::H264, synthetic_h265_iframe_bytes()),
+			Some(VideoCodec::H265)
+		);
 	}
 
 	fn synthetic_h265_pframe_bytes() -> Vec<u8> {
