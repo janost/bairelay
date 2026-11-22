@@ -111,6 +111,32 @@ async fn publish_ai_objects(
 	}
 }
 
+/// Session teardown: publish `status/motion` and every AI object that is
+/// on as off (all retained), as the Stop that would clear them can't
+/// arrive once the session is gone. Leaves topics already off alone.
+pub(crate) async fn clear_alarm_state(
+	publisher: &StatusPublisher<'_>,
+	cache: &StatusCache,
+	caps: CameraCapabilitiesView,
+) {
+	if cache.motion() == Some(true) {
+		let _ = publisher.publish_motion(false).await;
+		cache.set_motion(false);
+	}
+	// Every cached object was published on, so its topic exists and an
+	// off may be published even where `caps` now retracts it.
+	let mut seen_on = cache.ai_objects().unwrap_or_default();
+	publish_ai_objects(
+		publisher,
+		cache,
+		caps,
+		AiBaseline::Cache,
+		&mut seen_on,
+		AiObjects::default(),
+	)
+	.await;
+}
+
 /// Session-start AI reset: publish `off` for every object whose topic
 /// `caps` keeps (retracted topics are cleared by discovery), clearing a
 /// retained `on` an earlier session or process left, and cache the
@@ -135,16 +161,24 @@ async fn reset_ai_objects(
 	(reset, seen_on)
 }
 
+/// How long active motion holds the wake lock without a fresh Start.
+/// Cameras repeat Start in every push while motion lasts, so this much
+/// silence means the Stop was lost; without it a lost Stop would keep a
+/// battery camera awake until the session ends some other way.
+pub(crate) const MOTION_START_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Wake lock the motion listener holds for motion and doorbell presses.
 ///
-/// A motion Start holds it until `hold` after the matching Stop. A press
-/// holds it for `hold` from the press, and leaves an active motion's
-/// release to its Stop. `release_at` is `Some` only inside a hold
-/// window, so a held guard with no deadline means motion is active.
+/// A motion Start holds it until `hold` after the matching Stop, or
+/// [`MOTION_START_TIMEOUT`] after the last Start if no Stop arrives. A
+/// press holds it for `hold` from the press, and leaves an active
+/// motion's release to its Stop. `motion_until` is `Some` exactly while
+/// motion is active; `release_at` only inside a hold window.
 struct EventWakeHold {
 	wake_lock: WakeLockCounter,
 	hold: Duration,
 	guard: Option<WakeLockGuard>,
+	motion_until: Option<tokio::time::Instant>,
 	release_at: Option<tokio::time::Instant>,
 }
 
@@ -154,6 +188,7 @@ impl EventWakeHold {
 			wake_lock,
 			hold,
 			guard: None,
+			motion_until: None,
 			release_at: None,
 		}
 	}
@@ -164,14 +199,22 @@ impl EventWakeHold {
 		}
 	}
 
-	/// Motion started: cancel any pending release and hold the lock.
+	/// When the lock goes next, absent new events.
+	fn deadline(&self) -> Option<tokio::time::Instant> {
+		self.motion_until.or(self.release_at)
+	}
+
+	/// Motion started (or repeated): cancel any pending release and
+	/// hold the lock, refreshing the lost-Stop deadline.
 	fn motion_start(&mut self) {
 		self.release_at = None;
+		self.motion_until = Some(tokio::time::Instant::now() + MOTION_START_TIMEOUT);
 		self.acquire();
 	}
 
 	/// Motion stopped: release `hold` from now.
 	fn motion_stop(&mut self) {
+		self.motion_until = None;
 		if self.guard.is_some() {
 			self.release_at = Some(tokio::time::Instant::now() + self.hold);
 		}
@@ -180,9 +223,8 @@ impl EventWakeHold {
 	/// Doorbell pressed: hold the lock, releasing `hold` from now unless
 	/// motion is active.
 	fn doorbell_press(&mut self) {
-		let motion_active = self.guard.is_some() && self.release_at.is_none();
 		self.acquire();
-		if !motion_active {
+		if self.motion_until.is_none() {
 			self.release_at = Some(tokio::time::Instant::now() + self.hold);
 		}
 	}
@@ -199,9 +241,10 @@ impl EventWakeHold {
 		}
 	}
 
-	/// Hold window expired: drop the lock.
+	/// Hold window expired, or active motion went silent: drop the lock.
 	fn release(&mut self) {
 		self.guard = None;
+		self.motion_until = None;
 		self.release_at = None;
 	}
 }
@@ -399,16 +442,16 @@ pub async fn motion_listener(
 			// release is scheduled, point it 24 h out as a placeholder
 			// — the `if release_at.is_some()` guard disables that arm,
 			// so the placeholder is never actually reached.
-			let release_at = wake_hold.release_at;
+			let release_at = wake_hold.deadline();
 			let release_deadline = release_at
 				.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
 
 			tokio::select! {
 				_ = cancel.cancelled() => return,
 				_ = tokio::time::sleep_until(release_deadline), if release_at.is_some() => {
-					// Hold-down expired with no new event — drop the
-					// wake-lock guard so the camera becomes eligible
-					// for idle disconnect.
+					// Hold-down expired, or motion went silent without a
+					// Stop — drop the wake-lock guard so the camera
+					// becomes eligible for idle disconnect.
 					wake_hold.release();
 				}
 				// Every update is consumed in order: `next_motion()`
@@ -2657,6 +2700,69 @@ mod tests {
 		rig.stop().await;
 	}
 
+	/// A lost Stop must not hold the wake lock for the rest of the
+	/// session: active motion with no fresh Start releases after
+	/// `MOTION_START_TIMEOUT`, and each repeated Start refreshes it.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_releases_wake_hold_when_stop_never_arrives() {
+		let rig = AlarmRig::spawn_with(
+			Duration::from_secs(30),
+			CameraCapabilities::default(),
+			empty_cache(),
+		);
+		rig.send(now_start(), None, false).await;
+		assert_eq!(rig.wake_lock.count(), 1);
+		let almost = MOTION_START_TIMEOUT - Duration::from_secs(1);
+		tokio::time::sleep(almost).await;
+		rig.send(now_start(), None, false).await;
+		tokio::time::sleep(almost).await;
+		assert_eq!(
+			rig.wake_lock.count(),
+			1,
+			"a repeated Start refreshes the deadline"
+		);
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert_eq!(rig.wake_lock.count(), 0, "silent motion releases the lock");
+		rig.stop().await;
+	}
+
+	/// Teardown clears motion and AI objects left on, once; topics
+	/// already off stay quiet.
+	#[tokio::test]
+	async fn clear_alarm_state_turns_off_what_is_on() {
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let publisher = StatusPublisher::new(&mqtt, "bairelay", "cam1");
+		let cache = empty_cache();
+		cache.set_motion(true);
+		cache.set_ai_objects([AiObject::Person].into_iter().collect());
+		let caps = CameraCapabilitiesView::from(CameraCapabilities::default());
+
+		clear_alarm_state(&publisher, &cache, caps).await;
+		clear_alarm_state(&publisher, &cache, caps).await;
+
+		let rows: Vec<_> = mock
+			.published()
+			.into_iter()
+			.map(|(t, p, r)| (t, String::from_utf8(p).unwrap(), r))
+			.collect();
+		assert_eq!(
+			rows,
+			[
+				(
+					"bairelay/cam1/status/motion".to_string(),
+					"off".to_string(),
+					true
+				),
+				(
+					"bairelay/cam1/status/ai/person".to_string(),
+					"off".to_string(),
+					true
+				),
+			]
+		);
+		assert_eq!(cache.motion(), Some(false));
+	}
+
 	/// AI confirmed absent: only an `on` (evidence) and its later `off`
 	/// publish.
 	#[tokio::test(start_paused = true)]
@@ -2896,7 +3002,7 @@ mod tests {
 		tokio::time::sleep(Duration::from_secs(20)).await;
 		rig.send(now_start(), None, false).await;
 		rig.send(now_start(), None, false).await;
-		tokio::time::sleep(Duration::from_secs(60)).await;
+		tokio::time::sleep(MOTION_START_TIMEOUT - Duration::from_secs(10)).await;
 		assert_eq!(rig.wake_lock.count(), 1, "motion active again");
 
 		rig.send(now_stop(), None, false).await;

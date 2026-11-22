@@ -1442,6 +1442,17 @@ impl CameraHandle {
 			}
 		}
 
+		// The motion listener is gone, so a pending Stop never lands:
+		// clear retained motion / AI state it would have cleared.
+		if let Some(ref mqtt) = self.mqtt_client
+			&& self.config.mqtt.enable_motion
+		{
+			let publisher =
+				bairelay_mqtt::StatusPublisher::new(mqtt, &self.topic_prefix, &self.config.name);
+			let caps = self.capabilities().unwrap_or_default().into();
+			camera_tasks::clear_alarm_state(&publisher, &self.status_cache, caps).await;
+		}
+
 		// Tear down any live stream sources before clearing the
 		// BcCamera handle — they reference the camera we are about to
 		// drop.
@@ -3077,6 +3088,9 @@ mod tests {
 			"bairelay".to_string(),
 			None,
 		));
+		// Motion left on (its Stop never arrives) must be cleared at
+		// teardown.
+		handle.status_cache().set_motion(true);
 
 		// Run the session inline under a hard real-time timeout so
 		// a regression (e.g. keepalive never exits) fails in
@@ -3113,6 +3127,11 @@ mod tests {
 			mock.published_topics()
 		);
 		assert!(conn_off, "publish_connection(false) must land at teardown");
+		assert!(
+			pubs.iter()
+				.any(|(t, p, r)| t == "bairelay/cam-sess/status/motion" && p == b"off" && *r),
+			"teardown must clear retained motion"
+		);
 
 		// publish_pir_state ran (configured enable_pir = true).
 		let pir_published = pubs
