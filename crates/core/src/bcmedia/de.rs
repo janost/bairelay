@@ -69,16 +69,6 @@ impl BcMedia {
 	/// the caller should buffer more bytes and retry. Other `Err`
 	/// variants indicate a malformed or unrecognised frame.
 	///
-	/// # Known wire-format caveat (ADPCM)
-	///
-	/// Replayers should feed raw camera-captured ADPCM bytes into this
-	/// function, not bytes produced by [`BcMedia::serialize`]. The
-	/// serializer pads based on `data.len() % 8` while this parser
-	/// pads based on `(data.len() + 4) % 8` (the 4-byte sub-header is
-	/// counted in the wire `payload_size`), so a loop that reads from
-	/// a concatenation of our own serialized ADPCM frames will desync.
-	/// Tracked for future upstream alignment.
-	///
 	/// # Examples
 	///
 	/// Streaming-loop over a framed byte buffer:

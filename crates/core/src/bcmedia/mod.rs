@@ -93,11 +93,9 @@ mod roundtrip_tests {
 
 	#[test]
 	fn deserialize_adpcm_from_real_wire_shape() {
-		// BcMedia::Adpcm does not round-trip byte-exact through our
-		// own serialize: ser pads on `data.len() % 8` while de pads on
-		// `(data.len() + 4) % 8` because the wire `payload_size`
-		// counts the 4-byte sub-header. We therefore build the raw
-		// wire bytes by hand instead of going through serialize.
+		// Wire bytes built by hand in the camera layout, independent of
+		// our serializer. Padding follows the wire `payload_size`,
+		// which counts the 4-byte sub-header.
 
 		// 4 bytes of predictor state + 1024 bytes of block samples.
 		const DATA_LEN: usize = 1028;
@@ -163,23 +161,31 @@ mod roundtrip_tests {
 		}
 	}
 
+	/// Our serializer reproduces a camera capture byte for byte (the
+	/// talk path sends serialized ADPCM to the camera), and its frames
+	/// parse back for every padding remainder.
 	#[test]
-	fn serialize_adpcm_zero_pad_branch() {
-		// ser.rs pads based on `data.len() % 8`. When len is divisible
-		// by 8 the zero-pad branch (line 85) fires. We cannot feed
-		// the resulting bytes back through our own `deserialize` loop
-		// (see the caveat doc on `BcMedia::serialize`), but we can
-		// observe that serialization succeeds and emits the expected
-		// minimum frame length: 4 magic + 8 fixed header + data bytes.
-		let data = vec![0u8; 16]; // 16 % 8 == 0 — zero pad.
-		let input = BcMedia::Adpcm(BcMediaAdpcm { data: data.clone() });
-		let bytes = input.serialize(Vec::<u8>::new()).expect("serialize");
-		assert_eq!(bytes.len(), 4 + 8 + data.len());
-		// Magic.
-		assert_eq!(
-			u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-			0x62773130
-		);
+	fn adpcm_serialize_matches_camera_capture_and_roundtrips() {
+		let sample = include_bytes!("samples/adpcm_0.raw");
+		let mut buf = BytesMut::from(&sample[..]);
+		let first = BcMedia::deserialize(&mut buf).expect("deserialize");
+		let consumed = sample.len() - buf.len();
+		let bytes = first.serialize(Vec::<u8>::new()).expect("serialize");
+		assert_eq!(bytes.len(), consumed, "padding must match the camera");
+		// Bytes 10..12 (half_block_size) differ: this capture carries
+		// data.len() / 2, we send neolink's (data.len() - 4) / 2. The
+		// parser ignores the field.
+		assert_eq!(&bytes[..10], &sample[..10]);
+		assert_eq!(&bytes[12..], &sample[12..consumed]);
+
+		// 516 = the default talk block; 8 / 12 / 16 cover the pad cases.
+		for len in [8usize, 12, 16, 244, 516] {
+			let data: Vec<u8> = (0..len as u8).collect();
+			match roundtrip(&BcMedia::Adpcm(BcMediaAdpcm { data: data.clone() })) {
+				BcMedia::Adpcm(out) => assert_eq!(out.data, data, "len {len}"),
+				other => panic!("expected Adpcm, got {other:?}"),
+			}
+		}
 	}
 
 	#[test]

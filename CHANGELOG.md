@@ -15,6 +15,7 @@ Two-way audio (talk), ported from the neolink talk client:
 - talk: WAV reader and linear resampler; DVI4 IMA ADPCM encoder in `bairelay-rtsp` next to the decoder
 - config: `[cameras.talk_config]` table and `talk_dir` (absolute, existing directory), validated by `check-config`
 - core: `talk` and `talk_stop` no longer gate on `two_way_audio` (neolink parity; the binary checks it unless `[cameras.talk_config]` is set); fix underflow on a short last talk payload and a panic on `sample_rate = 0`
+- core: pad serialized ADPCM frames on `(data.len() + 4) % 8` like the camera; talk sent 4 stray bytes after every block, and `--dump-bcmedia` captures with ADPCM desynced on replay
 - core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
 
 ## [1.1.2] — 2026-06-08

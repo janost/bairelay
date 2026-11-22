@@ -275,9 +275,9 @@ Match neolink's wire behaviour exactly:
 
 ## Wire-format gotchas
 
-### ADPCM ser/de asymmetry
+### ADPCM frame padding
 
-`BcMedia::Adpcm` does **not** round-trip byte-exact through `serialize` → `deserialize`. The serialiser pads on `data.len() % 8`; the deserialiser pads on `(data.len() + 4) % 8` (the wire `payload_size` includes the 4-byte sub-header). The capture pipeline writes raw camera-side bytes through a single `serialize` per packet, so on-disk `.bcmedia` files parse cleanly. **Do not** re-serialise captured packets to "normalise" them — the first ADPCM packet desyncs the loop.
+`BcMedia::Adpcm` frames are padded to 8 bytes on the wire `payload_size`, which counts the 4-byte sub-header: `(data.len() + 4) % 8`, as in the camera capture `crates/core/src/bcmedia/samples/adpcm_0.raw`. The serialiser and deserialiser both use it, so ADPCM round-trips byte-exact. Talk depends on it: every 516-byte talk block is sent through `serialize`. `.bcmedia` dumps written before this fix carry 4 extra pad bytes per ADPCM frame and desync the reader at the first one.
 
 ### Talk ADPCM block layout (DVI4)
 

@@ -358,16 +358,14 @@ mod tests {
 
 	#[test]
 	fn dump_frame_roundtrips_multiple_packets() {
-		// Video + InfoV1/V2 + AAC all round-trip cleanly through
-		// serialize → deserialize. ADPCM does NOT (see the separate
-		// `dump_frame_handles_audio_packets_without_panicking` test and
-		// `crates/core/src/bcmedia/ser.rs:27-36` for the asymmetry).
+		// Every packet kind round-trips through serialize → deserialize.
 		let frames = vec![
 			sample_info_v1(),
 			sample_info_v2(),
 			sample_iframe(),
 			sample_pframe(),
 			sample_aac(),
+			sample_adpcm(),
 		];
 		let mut buf: Vec<u8> = Vec::new();
 		let mut scratch: Vec<u8> = Vec::new();
@@ -424,33 +422,10 @@ mod tests {
 			}
 			_ => panic!("expected Aac at index 4"),
 		}
-	}
-
-	#[test]
-	fn dump_frame_handles_audio_packets_without_panicking() {
-		// ADPCM does not round-trip byte-exact through
-		// `BcMedia::serialize` + `BcMedia::deserialize` because the
-		// serializer pads on `data.len() % 8` while the deserializer
-		// pads on `(data.len() + 4) % 8` (the 4-byte sub-header is
-		// counted in the wire `payload_size`). See
-		// `crates/core/src/bcmedia/ser.rs:27-36` for the full note.
-		//
-		// Until the upstream wire-format alignment lands we only
-		// assert that the serialize + write path succeeds and that the
-		// bytes we emit start with the ADPCM magic header, so live
-		// fixture capture is still safe to rely on.
-		let adpcm = sample_adpcm();
-		let mut buf: Vec<u8> = Vec::new();
-		let mut scratch: Vec<u8> = Vec::new();
-		dump_frame(&mut buf, &adpcm, &mut scratch).expect("ADPCM serialize ok");
-
-		assert!(!buf.is_empty(), "ADPCM bytes should be written");
-		// MAGIC_HEADER_BCMEDIA_ADPCM = 0x62773130, little-endian.
-		assert_eq!(
-			&buf[..4],
-			&0x62773130u32.to_le_bytes(),
-			"first 4 bytes are the ADPCM magic header"
-		);
+		match (&frames[5], &recovered[5]) {
+			(BcMedia::Adpcm(a), BcMedia::Adpcm(b)) => assert_eq!(a.data, b.data),
+			_ => panic!("expected Adpcm at index 5"),
+		}
 	}
 
 	#[test]
