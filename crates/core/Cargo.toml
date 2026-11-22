@@ -31,7 +31,6 @@ nom = "8"
 nom-language = "0.1"
 quick-xml.workspace = true
 rand = "0.10"
-regex = "1"
 # Cloud bundle minting for account ("cloud") cameras: HTTPS to
 # apis.reolink.com. rustls-tls (no OpenSSL) + gzip + json.
 reqwest = { version = "0.13", default-features = false, features = [

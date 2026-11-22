@@ -306,7 +306,6 @@ dependencies = [
  "proptest",
  "quick-xml",
  "rand",
- "regex",
  "reqwest",
  "serde",
  "serde_json",

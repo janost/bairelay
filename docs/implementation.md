@@ -17,7 +17,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `BcCamera::new(&BcCameraOpt)`         | Connects via discovery. Local/direct: 2–15 s. Remote/relay registration retries 5 rounds w/ backoff, up to ~80 s for an asleep cam. |
 | `login_with_maxenc(MaxEncryption)`    | MD5 challenge-response auth.                              |
 | `logout()`                            | Concrete-only (not on `CameraDriver`); call with 5 s timeout. |
-| `get_linktype()`                      | Used for keepalive (NOT `ping()`; see "Keepalive").       |
+| `get_linktype()`                      | Used for keepalive (see "Keepalive").                     |
 | `get_support()`                       | Capability probe (PTZ, talk, etc.). Cache result.         |
 | `battery_info()`                      | Returns `BatteryInfo`. **`voltage` is i32 millivolts**, not volts. |
 | `listen_on_motion()`                  | Returns `MotionData`. `next_motion()` coalesces to the latest `MotionStatus`; `next_alarm_update()` yields every `AlarmUpdate` (motion, AI objects, doorbell press) in order. cmd 33 classification is `classify_alarm` in `bc_protocol/alarm.rs`. |
@@ -208,7 +208,7 @@ Without the separate token, per-camera teardown races the event-loop exit and hi
 
 ## Keepalive
 
-Use `BcCamera::get_linktype()`, **not** `BcCamera::ping()` — matches neolink. Some cameras return `UnintelligibleReply` for link-type queries: treat that as success (camera is alive but doesn't support the query), not failure.
+Use `BcCamera::get_linktype()`, as neolink does. Some cameras return `UnintelligibleReply` for link-type queries: treat that as success (camera is alive but doesn't support the query), not failure.
 
 Allow 5 consecutive failures before disconnecting. A single dropped packet shouldn't kill the connection.
 

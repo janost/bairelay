@@ -18,7 +18,6 @@ mod battery;
 mod camera_driver;
 pub mod connection;
 mod credentials;
-mod email;
 mod errors;
 #[cfg(any(test, feature = "test-util"))]
 mod fake_camera;
@@ -32,10 +31,8 @@ mod login_authlogin;
 mod login_sigv3;
 mod logout;
 mod motion;
-mod ping;
 mod pirstate;
 mod ptz;
-mod pushinfo;
 mod reboot;
 mod resolution;
 mod services;
@@ -43,11 +40,9 @@ mod set_helpers;
 mod siren;
 mod snap;
 mod stream;
-mod stream_info;
 mod support;
 mod talk;
 mod time;
-mod uid;
 mod users;
 mod version;
 
@@ -63,9 +58,7 @@ pub use fake_camera::{FakeCalls, FakeCamera, FakeCameraBuilder};
 pub use ledstate::LightState;
 pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
-pub use pirstate::PirState;
 pub use ptz::Direction;
-pub use pushinfo::PhoneType;
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind, VideoStream};
@@ -161,20 +154,6 @@ pub struct BcCameraOpt {
 	pub cloud_refresh_token: Option<String>,
 	/// Toggle debug print of underlying data
 	pub debug: bool,
-}
-
-/// Used to choose the print format of various status messages like battery levels
-///
-/// Currently this is just the format of battery levels but if we ever got more status
-/// messages then they will also use this information
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PrintFormat {
-	/// None, don't print
-	None,
-	/// A human readable output
-	Human,
-	/// Xml formatted
-	Xml,
 }
 
 /// Type of connection to try
@@ -1618,14 +1597,6 @@ mod bccamera_opt_tests {
 		);
 		assert!(dbg.contains("admin"), "username should still surface");
 		assert!(dbg.contains("******"), "redaction marker should surface");
-	}
-
-	#[test]
-	fn print_format_equality_and_copy() {
-		let a = PrintFormat::Human;
-		let b = a;
-		assert_eq!(a, b);
-		assert_ne!(PrintFormat::Human, PrintFormat::Xml);
 	}
 
 	#[test]

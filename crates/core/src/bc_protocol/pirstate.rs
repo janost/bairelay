@@ -128,14 +128,6 @@ impl BcCamera {
 	}
 }
 
-/// Turn PIR ON or OFF
-pub enum PirState {
-	/// Turn the PIR on
-	On,
-	/// Turn the PIR off
-	Off,
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

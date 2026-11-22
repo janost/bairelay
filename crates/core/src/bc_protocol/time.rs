@@ -1,10 +1,7 @@
 use super::{BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
-use std::convert::{TryFrom, TryInto};
-use time::{
-	Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset, Weekday, macros::date,
-	parsing::Parsed,
-};
+use std::convert::TryInto;
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset, Weekday};
 
 #[cfg(test)]
 use crate::bc_protocol::connection::mock::{
@@ -12,65 +9,6 @@ use crate::bc_protocol::connection::mock::{
 };
 
 impl BcCamera {
-	///
-	/// Get the time from the camera
-	///
-	/// # Returns
-	///
-	/// returns either an error or an option with the offsetted date time
-	///
-	pub async fn get_time(&self) -> Result<Option<OffsetDateTime>> {
-		self.has_ability_ro("general").await?;
-		let general = self.get_system_general().await?;
-
-		let (
-			Some(time_zone),
-			Some(year),
-			Some(month),
-			Some(day),
-			Some(hour),
-			Some(minute),
-			Some(second),
-		) = (
-			general.time_zone,
-			general.year,
-			general.month,
-			general.day,
-			general.hour,
-			general.minute,
-			general.second,
-		)
-		else {
-			return Err(Error::UnintelligibleXml {
-				reply: std::sync::Arc::new(BcXml {
-					system_general: Some(general),
-					..Default::default()
-				}),
-				why: "SystemGeneral reply missing one or more time fields",
-			});
-		};
-
-		let datetime = try_build_timestamp(time_zone, year, month, day, hour, minute, second)
-			.map_err(|_| Error::UnintelligibleXml {
-				reply: std::sync::Arc::new(BcXml {
-					system_general: Some(general),
-					..Default::default()
-				}),
-				why: "Could not parse date",
-			})?;
-
-		// Pre-2019 dates indicate the camera's clock was never set
-		// (factory firmware boots to e.g. 1999-01-01 or 2000-01-01).
-		// Treat as `Ok(None)` so callers can re-set rather than treat
-		// an obvious factory date as a real reading.
-		const BOUNDARY: Date = date!(2019 - 01 - 01);
-		if datetime.date() < BOUNDARY {
-			Ok(None)
-		} else {
-			Ok(Some(datetime))
-		}
-	}
-
 	/// Read the camera's daylight-saving-time configuration via
 	/// `MSG_ID_GET_DST`. The reply body is `<Dst>`; some firmwares
 	/// flag it binary (`<Extension><binaryData>1</binaryData></…>`)
@@ -143,10 +81,9 @@ impl BcCamera {
 		Ok(dst)
 	}
 
-	/// Read the full `SystemGeneral` block from the camera. Used
-	/// internally by `get_time` (for the time fields) and by
-	/// `set_time` (for the read-modify-write that preserves every
-	/// non-time field on the wire — see the comment in `set_time`).
+	/// Read the full `SystemGeneral` block from the camera, for the
+	/// read-modify-write in `set_time` that preserves every non-time field
+	/// on the wire.
 	async fn get_system_general(&self) -> Result<SystemGeneral> {
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();
@@ -438,209 +375,9 @@ fn nth_weekday_of_month(year: i32, month: Month, week_index: u8, weekday: Weekda
 	None
 }
 
-/// Decode a Reolink `SystemGeneral` payload into an `OffsetDateTime`.
-///
-/// The wire `timezone` field uses Reolink's inverted convention
-/// (positive seconds = west of UTC, negative = east) as documented in
-/// `set_time` above. We negate here so the round-trip
-/// `set_time(t)` → `get_time()` preserves the original
-/// `OffsetDateTime`. Without the negation the two functions disagree
-/// by `2 × offset` whenever the operator runs anything other than UTC.
-///
-/// `get_time` is currently only called by the Neolink CLI; bairelay's
-/// CLI has no `get-time` subcommand, so the asymmetry was invisible in
-/// production. Closing it here keeps the contract clean for any future
-/// caller (TZ-aware MQTT publish, etc.) and makes the unit-level
-/// symmetry test below load-bearing.
-fn try_build_timestamp(
-	timezone: i32,
-	year: i32,
-	month: u8,
-	day: u8,
-	hour: u8,
-	minute: u8,
-	second: u8,
-) -> std::result::Result<OffsetDateTime, crate::Error> {
-	let date = Date::try_from(
-		Parsed::new()
-			.with_year(year)
-			.ok_or(Error::TimeParse)?
-			.with_month(month.try_into()?)
-			.ok_or(Error::TimeParse)?
-			.with_day(day.try_into()?)
-			.ok_or(Error::TimeParse)?,
-	)?;
-	let time = Time::try_from(
-		Parsed::new()
-			.with_hour_24(hour)
-			.ok_or(Error::TimeParse)?
-			.with_minute(minute)
-			.ok_or(Error::TimeParse)?
-			.with_second(second)
-			.ok_or(Error::TimeParse)?,
-	)?;
-	// Negate to match `set_time`'s sign convention (Reolink wire:
-	// positive = west of UTC, negative = east).
-	let offset = UtcOffset::from_whole_seconds(-timezone)?;
-
-	Ok(PrimitiveDateTime::new(date, time).assume_offset(offset))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[tokio::test]
-	async fn get_time_happy_path_parses_reply() {
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_GET_GENERAL)
-			.reply_with(|req| {
-				reply_200_xml(
-					req,
-					BcXml {
-						system_general: Some(SystemGeneral {
-							version: "1.1".to_string(),
-							time_zone: Some(0),
-							year: Some(2026),
-							month: Some(4),
-							day: Some(23),
-							hour: Some(12),
-							minute: Some(30),
-							second: Some(45),
-							..Default::default()
-						}),
-						..Default::default()
-					},
-				)
-			})
-			.build()
-			.await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let dt = cam
-			.get_time()
-			.await
-			.expect("get_time should succeed")
-			.expect("datetime should be Some");
-		assert_eq!(dt.year(), 2026);
-		assert_eq!(dt.hour(), 12);
-	}
-
-	#[tokio::test]
-	async fn get_time_missing_ability_returns_err() {
-		let mock = MockConnection::new().build().await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_abilities_reported().await;
-		let err = cam.get_time().await.expect_err("should fail");
-		assert!(matches!(err, Error::MissingAbility { .. }));
-	}
-
-	#[tokio::test]
-	async fn get_time_non_200_returns_err() {
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_GET_GENERAL)
-			.reply_with(|req| reply_err_code(req, 500))
-			.build()
-			.await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let err = cam.get_time().await.expect_err("should fail");
-		assert!(matches!(
-			err,
-			Error::CameraServiceUnavailable { code: 500, .. }
-		));
-	}
-
-	#[tokio::test]
-	async fn get_time_pre_boundary_returns_ok_none() {
-		// Any date before 2019-01-01 → treated as "time not set".
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_GET_GENERAL)
-			.reply_with(|req| {
-				reply_200_xml(
-					req,
-					BcXml {
-						system_general: Some(SystemGeneral {
-							version: "1.1".to_string(),
-							time_zone: Some(0),
-							year: Some(1999),
-							month: Some(1),
-							day: Some(1),
-							hour: Some(0),
-							minute: Some(0),
-							second: Some(0),
-							..Default::default()
-						}),
-						..Default::default()
-					},
-				)
-			})
-			.build()
-			.await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let dt = cam.get_time().await.expect("ok");
-		assert!(dt.is_none());
-	}
-
-	#[tokio::test]
-	async fn get_time_invalid_date_returns_err() {
-		// Month 13 is invalid → try_build_timestamp fails →
-		// UnintelligibleReply.
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_GET_GENERAL)
-			.reply_with(|req| {
-				reply_200_xml(
-					req,
-					BcXml {
-						system_general: Some(SystemGeneral {
-							version: "1.1".to_string(),
-							time_zone: Some(0),
-							year: Some(2026),
-							month: Some(13),
-							day: Some(1),
-							hour: Some(0),
-							minute: Some(0),
-							second: Some(0),
-							..Default::default()
-						}),
-						..Default::default()
-					},
-				)
-			})
-			.build()
-			.await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let err = cam.get_time().await.expect_err("should fail");
-		assert!(matches!(err, Error::UnintelligibleXml { .. }));
-	}
-
-	#[tokio::test]
-	async fn get_time_missing_fields_returns_err() {
-		// 200 with SystemGeneral but year=None → pattern doesn't match
-		// → UnintelligibleReply.
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_GET_GENERAL)
-			.reply_with(|req| {
-				reply_200_xml(
-					req,
-					BcXml {
-						system_general: Some(SystemGeneral {
-							version: "1.1".to_string(),
-							..Default::default()
-						}),
-						..Default::default()
-					},
-				)
-			})
-			.build()
-			.await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let err = cam.get_time().await.expect_err("should fail");
-		assert!(matches!(err, Error::UnintelligibleXml { .. }));
-	}
 
 	/// Reply that disables DST (`<enable>0</enable>`). Used by every
 	/// non-DST-focused `set_time` test so the production code's
@@ -1082,8 +819,7 @@ mod tests {
 			.build()
 			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("general", false).await;
-		let err = cam.get_time().await.expect_err("must be error");
+		let err = cam.get_system_general().await.expect_err("must be error");
 		match err {
 			Error::UnintelligibleReply { why, .. } => {
 				assert!(
@@ -1407,72 +1143,6 @@ mod tests {
 			end_hour: Some(3),
 			end_minute: Some(0),
 			end_second: Some(0),
-		}
-	}
-
-	#[test]
-	fn try_build_timestamp_valid_ok_inverts_timezone_sign() {
-		// Wire timezone uses Reolink's inverted convention: positive =
-		// west of UTC, negative = east. Wire `+3600` therefore decodes
-		// to `UtcOffset` of `-3600` (UTC-1, "one hour west").
-		let dt = try_build_timestamp(3600, 2026, 4, 23, 12, 30, 45).expect("ok");
-		assert_eq!(dt.year(), 2026);
-		assert_eq!(dt.offset().whole_seconds(), -3600);
-	}
-
-	#[test]
-	fn try_build_timestamp_bad_month_is_err() {
-		assert!(try_build_timestamp(0, 2026, 13, 1, 0, 0, 0).is_err());
-	}
-
-	#[test]
-	fn try_build_timestamp_bad_day_is_err() {
-		assert!(try_build_timestamp(0, 2026, 2, 31, 0, 0, 0).is_err());
-	}
-
-	#[test]
-	fn try_build_timestamp_bad_hour_is_err() {
-		assert!(try_build_timestamp(0, 2026, 4, 23, 25, 0, 0).is_err());
-	}
-
-	/// Roundtrip pin: `set_time` sends `time_zone =
-	/// -offset.whole_seconds()`; `try_build_timestamp` must decode that
-	/// wire value back into the same `OffsetDateTime` the operator
-	/// passed in. Tests every offset that bairelay's actual deployments
-	/// span (UTC-12 to UTC+14 covers the full real-world range).
-	#[test]
-	fn set_time_get_time_roundtrip_preserves_offset_datetime() {
-		// Pick a deterministic wallclock so we don't depend on
-		// `OffsetDateTime::now_*` flakiness.
-		let local_date = Date::from_calendar_date(2026, time::Month::April, 23).unwrap();
-		let local_time = Time::from_hms(12, 30, 45).unwrap();
-		for offset_seconds in [-12 * 3600, -5 * 3600, -3600, 0, 3600, 5 * 3600, 14 * 3600] {
-			let original_offset = UtcOffset::from_whole_seconds(offset_seconds).unwrap();
-			let original =
-				PrimitiveDateTime::new(local_date, local_time).assume_offset(original_offset);
-
-			// `set_time` would put this on the wire:
-			let wire_time_zone = -original.offset().whole_seconds();
-
-			// `get_time` (via `try_build_timestamp`) would decode the
-			// wire value back to:
-			let decoded = try_build_timestamp(
-				wire_time_zone,
-				original.year(),
-				original.month().into(),
-				original.day(),
-				original.hour(),
-				original.minute(),
-				original.second(),
-			)
-			.expect("decode ok");
-
-			// Same instant in UTC AND same display-local components.
-			assert_eq!(
-				decoded, original,
-				"roundtrip drifted at offset {offset_seconds}s: wire={wire_time_zone}"
-			);
-			assert_eq!(decoded.offset(), original_offset);
 		}
 	}
 }
