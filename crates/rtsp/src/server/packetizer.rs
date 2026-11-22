@@ -88,13 +88,17 @@ fn dispatch_audio(payload: &AudioPayload, pts: u32, counters: &mut RtpCounters) 
 			)]
 		}
 		AudioPayload::G711Ulaw { samples } => {
+			// RFC 3551 §4.1: for audio the marker flags the first packet
+			// of a talkspurt. The camera stream is continuous (no silence
+			// suppression), so it is never set. AAC keeps M=1 because RFC
+			// 3640 §3.2.1 uses it to mark the end of an access unit.
 			let seq = counters.next_seq();
 			vec![build_packet(
 				G711_PAYLOAD_TYPE,
 				seq,
 				pts,
 				counters.ssrc,
-				true,
+				false,
 				samples,
 			)]
 		}
@@ -153,7 +157,8 @@ mod tests {
 		};
 		let packets = dispatch(&frame, &mut counters);
 		assert_eq!(packets.len(), 1);
-		assert_eq!(packets[0][1] & 0x7F, 0); // PT=0 (PCMU), marker masked off
+		// PT=0 (PCMU) and no marker on a continuous stream.
+		assert_eq!(packets[0][1], 0);
 	}
 
 	#[test]
