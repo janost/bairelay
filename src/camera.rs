@@ -874,6 +874,7 @@ impl CameraHandle {
 			self.bcmedia_dump.clone(),
 			self.audio_presence(),
 			gap_threshold,
+			Duration::from_millis(self.config.stream_latency_ms.into()),
 		);
 
 		// Insert the new source under the sync lock.

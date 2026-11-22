@@ -300,7 +300,7 @@ In addition to the whitelist, outbound `Frame::Video` strips VPS / SPS / PPS (H.
 
 ## Audio + video pacers
 
-`bairelay::stream_source::media_pacer_task(rx, broadcast, cancel, max_lead, initial_latency, snap_on_past)` is the generic pacer; `audio_pacer_task` and `video_pacer_task` are thin wrappers. Each per-source `StreamSource` spawns one of each.
+`bairelay::stream_source::media_pacer_task(rx, broadcast, cancel, max_lead, initial_latency, snap_on_past)` is the generic pacer; `audio_pacer_task` and `video_pacer_task` are thin wrappers taking a `PacerTiming`. Each per-source `StreamSource` spawns one of each, timed by the camera's `stream_latency_ms` (`PacerTiming::for_stream_latency`): video's initial latency is the value itself, audio's is capped at 500 ms, and `max_lead` is the initial latency plus 1.5 s. `stream_latency_ms = 0` spawns no pacers; the handlers then broadcast frames directly.
 
 Pacer contract:
 

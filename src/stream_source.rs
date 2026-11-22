@@ -273,10 +273,11 @@ struct ReaderTaskArgs {
 	rtsp_kind: RtspStreamKind,
 	core_kind: CoreStreamKind,
 	tx: broadcast::Sender<Frame>,
-	/// Production audio pacer. `Some` for `StreamSource::start`, `None`
-	/// for the test-only `start_with_packet_source` and inert
-	/// constructors. When `None`, audio frames bypass the pacer and go
-	/// straight to `tx` from the audio handlers.
+	/// Production audio pacer. `Some` for `StreamSource::start` unless
+	/// `stream_latency_ms = 0`; `None` also for the test-only
+	/// `start_with_packet_source` and inert constructors. When `None`,
+	/// audio frames bypass the pacer and go straight to `tx` from the
+	/// audio handlers.
 	audio_pace_tx: Option<mpsc::Sender<PacedFrame>>,
 	/// Production video pacer. Same Some/None semantics as
 	/// `audio_pace_tx`. The camera delivers video in network bursts
@@ -360,6 +361,9 @@ impl StreamSource {
 	/// `kind` is the bairelay-side stream kind (mapped to the underlying
 	/// `bairelay_neolink_core::StreamKind` internally), and `last_frame` is the
 	/// camera-scoped buffer shared across all sources for this camera.
+	/// `stream_latency` is the camera's `stream_latency_ms`: the pacers'
+	/// startup buffer, with zero disabling pacing.
+	#[allow(clippy::too_many_arguments)]
 	pub fn start(
 		camera: Arc<BcCamera>,
 		camera_name: String,
@@ -368,43 +372,39 @@ impl StreamSource {
 		bcmedia_dump: Option<Arc<BcMediaDumpConfig>>,
 		audio_presence: Arc<RwLock<crate::audio_presence::AudioPresence>>,
 		gap_threshold: Duration,
+		stream_latency: Duration,
 	) -> Arc<Self> {
 		let parts =
 			StreamSourceParts::new(&camera_name, kind, Arc::clone(&last_frame), gap_threshold);
 		let core_kind = map_stream_kind(kind);
 
-		// Spawn per-source audio + video pacers. Their broadcast clone
-		// is the same channel the rest of the pipeline emits on, so
-		// paced frames share ordering and lifetime with the source.
-		// Each pacer exits when `parts.cancel` fires or all sender
-		// clones drop.
-		let (audio_pace_tx, audio_pace_rx) = mpsc::channel::<PacedFrame>(AUDIO_PACER_QUEUE);
-		let audio_broadcast = parts.tx.clone();
-		let audio_cancel = parts.cancel.clone();
-		tokio::spawn(audio_pacer_task(
-			audio_pace_rx,
-			audio_broadcast,
-			audio_cancel,
-		));
-
-		// Per-source video pacer. Holds a 1.5 s startup buffer
-		// (`VIDEO_PACER_INITIAL_LATENCY`) so the queue stays stocked
-		// across the camera's burst-idle pattern (Argus 4 K HEVC
-		// delivers each GOP in ~900 ms then idles ~1.1 s before the
-		// next burst). Without the buffer, the receiver's playback
-		// pipeline drains during each idle and mpv flips into
-		// `(Buffering)` every ~2 s. With the pre-buffer the absolute-
-		// anchor pacing has frames to emit even when upstream falls
-		// silent briefly, so the wire cadence matches the camera's
-		// PTS rate continuously.
-		let (video_pace_tx, video_pace_rx) = mpsc::channel::<PacedFrame>(VIDEO_PACER_QUEUE);
-		let video_broadcast = parts.tx.clone();
-		let video_cancel = parts.cancel.clone();
-		tokio::spawn(video_pacer_task(
-			video_pace_rx,
-			video_broadcast,
-			video_cancel,
-		));
+		// Per-source audio + video pacers on the same broadcast channel as
+		// the rest of the pipeline, so paced frames share ordering and
+		// lifetime with the source. Each exits when `parts.cancel` fires or
+		// its sender drops. The video cushion keeps the queue stocked across
+		// the camera's burst-idle pattern (Argus 4 K HEVC delivers each GOP
+		// in ~900 ms, then idles ~1.1 s); without it mpv flips into
+		// `(Buffering)` every ~2 s.
+		let (audio_pace_tx, video_pace_tx) = match PacerTiming::for_stream_latency(stream_latency) {
+			Some((audio_timing, video_timing)) => {
+				let (audio_tx, audio_rx) = mpsc::channel::<PacedFrame>(AUDIO_PACER_QUEUE);
+				tokio::spawn(audio_pacer_task(
+					audio_rx,
+					parts.tx.clone(),
+					parts.cancel.clone(),
+					audio_timing,
+				));
+				let (video_tx, video_rx) = mpsc::channel::<PacedFrame>(VIDEO_PACER_QUEUE);
+				tokio::spawn(video_pacer_task(
+					video_rx,
+					parts.tx.clone(),
+					parts.cancel.clone(),
+					video_timing,
+				));
+				(Some(audio_tx), Some(video_tx))
+			}
+			None => (None, None),
+		};
 
 		let reader_args = ReaderTaskArgs {
 			camera: Arc::clone(&camera),
@@ -412,8 +412,8 @@ impl StreamSource {
 			rtsp_kind: kind,
 			core_kind,
 			tx: parts.tx.clone(),
-			audio_pace_tx: Some(audio_pace_tx),
-			video_pace_tx: Some(video_pace_tx),
+			audio_pace_tx,
+			video_pace_tx,
 			last_frame: Arc::clone(&parts.last_frame),
 			sdp_params: Arc::clone(&parts.sdp_params),
 			cancel: parts.cancel.clone(),
@@ -927,38 +927,52 @@ pub struct PacedFrame {
 	pub duration: Duration,
 }
 
-/// Hard cap on how far the pacer's emit cursor is allowed to drift into
-/// the future when the camera bursts. If the cursor would be pushed
-/// beyond `now + max_lead`, we re-anchor to `now`. Audio sits at 2 s so
-/// the 500 ms `AUDIO_PACER_INITIAL_LATENCY` head start can stretch up
-/// to 1.5 s under burst pressure before the future-cap trips; video
-/// sits at 3 s so the 1.5 s initial-latency cushion has the same
-/// 1.5 s of headroom.
-const AUDIO_PACER_MAX_LEAD: Duration = Duration::from_millis(2000);
-/// See [`AUDIO_PACER_MAX_LEAD`]; raised for video so the deliberate
-/// 1.5 s startup buffer doesn't hit the cap and snap forward.
-const VIDEO_PACER_MAX_LEAD: Duration = Duration::from_millis(3000);
-/// Latency injected into the audio pacer at the *first* frame so the
-/// queue accumulates ~8 packets of buffer before the first emission.
-/// In steady state the pacer drains the queue at exactly one packet
-/// per `duration` (64 ms for AAC-LC) regardless of upstream jitter:
-/// camera-side BcMedia decoder bursts arrive 100–500 ms after their
-/// "natural" 64 ms-spaced wallclock position (the same TCP stream
-/// carries 4 K HEVC keyframes that take that long to decode), and
-/// without this cushion mpv reported `audio end or underrun` every
-/// time an audio packet was delivered late, producing the audible
-/// 0.1 s glitches operators heard. 500 ms covers the worst observed
-/// jitter on real Argus hardware with margin to spare.
+/// Pacer timing for one media kind. `initial_latency` delays the first
+/// emission so the queue builds a cushion that absorbs the camera's
+/// bursty delivery; `max_lead` caps how far the emit cursor may drift
+/// into the future under burst pressure before it re-anchors to `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PacerTiming {
+	initial_latency: Duration,
+	max_lead: Duration,
+}
+
+/// How far past its initial latency a pacer cursor may run before it
+/// snaps back to `now`. The cushion may stretch by this much under burst
+/// pressure without the future-cap tripping.
+const PACER_LEAD_HEADROOM: Duration = Duration::from_millis(1500);
+
+/// Cap on the audio pacer's cushion. Camera-side BcMedia decoder bursts
+/// deliver audio 100–500 ms after its natural 64 ms-spaced position (the
+/// same TCP stream carries 4 K HEVC keyframes that take that long to
+/// decode); without a cushion mpv reported `audio end or underrun` on
+/// every late packet, the audible 0.1 s glitches operators heard. 500 ms
+/// covers the worst jitter observed on Argus hardware. Audio jitter is
+/// bounded by those decode bursts, not by the video GOP gap, so a larger
+/// `stream_latency_ms` doesn't raise it.
 const AUDIO_PACER_INITIAL_LATENCY: Duration = Duration::from_millis(500);
-/// Latency injected into the video pacer at the *first* frame so the
-/// queue holds ~1.5 s of frames in steady state. Reolink Argus delivers
-/// each GOP as a burst followed by ~1.1 s of silence; without an
-/// initial buffer the receiver's playback pipeline drains during each
-/// silence and mpv flips into `(Buffering)` every ~2 s. With 1.5 s
-/// pre-buffered the pacer always has frames to emit even when the
-/// upstream goes briefly silent, so receiver-side cadence stays
-/// continuous.
-const VIDEO_PACER_INITIAL_LATENCY: Duration = Duration::from_millis(1500);
+
+impl PacerTiming {
+	fn new(initial_latency: Duration) -> Self {
+		Self {
+			initial_latency,
+			max_lead: initial_latency + PACER_LEAD_HEADROOM,
+		}
+	}
+
+	/// `(audio, video)` timing for a camera's `stream_latency_ms`, or
+	/// `None` for zero: no pacers, frames reach subscribers as the camera
+	/// delivers them.
+	pub(crate) fn for_stream_latency(latency: Duration) -> Option<(Self, Self)> {
+		if latency.is_zero() {
+			return None;
+		}
+		Some((
+			Self::new(latency.min(AUDIO_PACER_INITIAL_LATENCY)),
+			Self::new(latency),
+		))
+	}
+}
 
 /// Per-source audio pacing task.
 ///
@@ -981,6 +995,7 @@ async fn audio_pacer_task(
 	rx: mpsc::Receiver<PacedFrame>,
 	broadcast: broadcast::Sender<Frame>,
 	cancel: CancellationToken,
+	timing: PacerTiming,
 ) {
 	// `snap_on_past = true` for audio. Argus emits AAC in GOP-aligned
 	// bursts (~30 AUs in 50 ms wallclock, then ~1.9 s of silence
@@ -999,22 +1014,22 @@ async fn audio_pacer_task(
 		rx,
 		broadcast,
 		cancel,
-		AUDIO_PACER_MAX_LEAD,
-		AUDIO_PACER_INITIAL_LATENCY,
+		timing.max_lead,
+		timing.initial_latency,
 		true,
 	)
 	.await
 }
 
-/// Per-source video pacer — same shape as `audio_pacer_task` but with
-/// a larger lead cap and a deliberate startup latency. See the
-/// `VIDEO_PACER_*` constants for details.
+/// Per-source video pacer — same shape as `audio_pacer_task`, with the
+/// camera's full `stream_latency_ms` as its startup latency.
 async fn video_pacer_task(
 	rx: mpsc::Receiver<PacedFrame>,
 	broadcast: broadcast::Sender<Frame>,
 	cancel: CancellationToken,
+	timing: PacerTiming,
 ) {
-	// `snap_on_past = false` for video — the 1.5 s initial-latency
+	// `snap_on_past = false` for video — the default 1.5 s initial-latency
 	// pre-buffer combined with the camera's natural 0.9 s GOP burst
 	// rhythm means the cursor lands in the future on the typical
 	// burst-then-idle cycle, never in the past. Burst-draining if it
@@ -1025,8 +1040,8 @@ async fn video_pacer_task(
 		rx,
 		broadcast,
 		cancel,
-		VIDEO_PACER_MAX_LEAD,
-		VIDEO_PACER_INITIAL_LATENCY,
+		timing.max_lead,
+		timing.initial_latency,
 		false,
 	)
 	.await
@@ -1112,7 +1127,7 @@ async fn media_pacer_task(
 /// of audio at the densest expected rate (G.711 µ-law: 50 packets/s);
 /// for AAC the same buffer is ~13 s. In steady state the queue should
 /// hover near 0; capacity exists only to absorb startup bursts and
-/// brief network hiccups before [`AUDIO_PACER_MAX_LEAD`] kicks in.
+/// brief network hiccups before the pacer's `max_lead` cap kicks in.
 const AUDIO_PACER_QUEUE: usize = 200;
 
 /// Bounded capacity of the per-source video pacer queue. Sized for ~10 s
@@ -2394,9 +2409,9 @@ fn handle_aac(
 	// Route through the audio pacer when one is wired in (production).
 	// The pacer holds each frame until the codec-natural slot
 	// (`pts_step / sample_rate`) elapses, capping accumulated lead time
-	// at AUDIO_PACER_MAX_LEAD. When the pacer is absent (test paths
-	// calling `apply_bcmedia_packet` directly), broadcast immediately so
-	// per-packet unit tests stay synchronous.
+	// at the pacer's `max_lead`. When the pacer is absent
+	// (`stream_latency_ms = 0`, or test paths calling
+	// `apply_bcmedia_packet` directly), broadcast immediately.
 	let duration = paced_audio_duration(pts_step, header.sample_rate);
 	dispatch_paced_audio(audio_pace_tx, tx, frame, duration);
 
@@ -2614,7 +2629,12 @@ mod tests {
 		let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<Frame>(64);
 		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
 		let cancel = CancellationToken::new();
-		let pacer = tokio::spawn(audio_pacer_task(pace_rx, broadcast_tx, cancel.clone()));
+		let pacer = tokio::spawn(audio_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerTiming::new(AUDIO_PACER_INITIAL_LATENCY),
+		));
 
 		// Push 4 frames bursty — all within the same ms in paused time.
 		for i in 0..4u32 {
@@ -2663,6 +2683,27 @@ mod tests {
 		let _ = tokio::time::timeout(Duration::from_millis(100), pacer).await;
 	}
 
+	/// The default 1500 ms reproduces the original fixed cushions (audio
+	/// 500 ms / 2 s lead, video 1.5 s / 3 s lead); lower values shrink
+	/// both; zero disables pacing.
+	#[test]
+	fn pacer_timing_follows_stream_latency() {
+		let ms = Duration::from_millis;
+		let (audio, video) = PacerTiming::for_stream_latency(ms(1500)).expect("paced");
+		assert_eq!((audio.initial_latency, audio.max_lead), (ms(500), ms(2000)));
+		assert_eq!(
+			(video.initial_latency, video.max_lead),
+			(ms(1500), ms(3000))
+		);
+		let (audio, video) = PacerTiming::for_stream_latency(ms(200)).expect("paced");
+		assert_eq!(
+			(audio.initial_latency, video.initial_latency),
+			(ms(200), ms(200))
+		);
+		assert_eq!(video.max_lead, ms(1700));
+		assert_eq!(PacerTiming::for_stream_latency(Duration::ZERO), None);
+	}
+
 	/// `cancel` must terminate the pacer task within one scheduler tick
 	/// regardless of whether items are in flight.
 	#[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2670,7 +2711,12 @@ mod tests {
 		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(4);
 		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(4);
 		let cancel = CancellationToken::new();
-		let pacer = tokio::spawn(audio_pacer_task(pace_rx, broadcast_tx, cancel.clone()));
+		let pacer = tokio::spawn(audio_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerTiming::new(AUDIO_PACER_INITIAL_LATENCY),
+		));
 		cancel.cancel();
 		drop(pace_tx);
 		tokio::time::timeout(Duration::from_secs(1), pacer)

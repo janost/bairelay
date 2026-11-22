@@ -107,6 +107,8 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
 #                                    # every *_secs setting: at most 86400 (1 day)
 # motion_wake_hold_secs = 30  # wake-lock hold after motion stops
+# stream_latency_ms = 1500    # stream startup buffer, 0..5000; battery cams need ~1500,
+#                             # steady wired cams can use 100-300, 0 disables pacing
 # enabled = true
 # permitted_users = ["me"]
 # debug = false               # trace-dump decrypted protocol payloads; logs credential hashes

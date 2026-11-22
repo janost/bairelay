@@ -524,6 +524,16 @@ pub struct CameraConfig {
 	#[serde(default = "default_motion_wake_hold_secs")]
 	pub motion_wake_hold_secs: f64,
 
+	/// Startup buffer, in milliseconds, the video pacer holds before the
+	/// first frame of a stream goes out; audio uses the same value capped
+	/// at 500 ms. Battery cameras (Argus) deliver each GOP as a ~900 ms
+	/// burst followed by ~1.1 s of silence, and the default 1500 ms keeps
+	/// playback continuous across those gaps. Cameras that stream steadily
+	/// can go much lower. `0` disables pacing: frames reach clients as the
+	/// camera delivers them. At most [`MAX_STREAM_LATENCY_MS`].
+	#[serde(default = "default_stream_latency_ms")]
+	pub stream_latency_ms: u32,
+
 	#[serde(default = "default_true", alias = "enable")]
 	pub enabled: bool,
 
@@ -684,6 +694,7 @@ impl Default for CameraConfig {
 			idle_disconnect: false,
 			idle_disconnect_timeout_secs: None,
 			motion_wake_hold_secs: default_motion_wake_hold_secs(),
+			stream_latency_ms: default_stream_latency_ms(),
 			enabled: true,
 			mqtt: MqttConfig::default(),
 			pause: PauseConfig::default(),
@@ -879,6 +890,14 @@ fn default_gap_threshold() -> f64 {
 const fn default_prune_grace_secs() -> u64 {
 	30
 }
+
+const fn default_stream_latency_ms() -> u32 {
+	1500
+}
+
+/// Upper bound on `stream_latency_ms`. The video pacer queue holds 300
+/// frames, so a longer cushion would overflow it on 60 fps streams.
+pub const MAX_STREAM_LATENCY_MS: u32 = 5000;
 
 const fn default_motion_wake_hold_secs() -> f64 {
 	30.0
@@ -1167,7 +1186,7 @@ pub fn warn_neolink_compat_fields(config: &Config) {
 		if cam.buffer_duration.is_some() {
 			tracing::warn!(
 				camera = %cam.name,
-				"config: [cameras] buffer_duration/duration/buffer is a neolink GStreamer queue knob; bairelay's audio + video pacers handle bursty delivery internally. Remove this field."
+				"config: [cameras] buffer_duration/duration/buffer is a neolink GStreamer queue knob and is ignored; bairelay's equivalent is stream_latency_ms. Remove this field."
 			);
 		}
 		if cam.use_splash.is_some() {
@@ -1526,6 +1545,12 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 		// 0 releases the wake lock as soon as motion stops.
 		cam_secs("motion_wake_hold_secs", cam.motion_wake_hold_secs, true)?;
+		if cam.stream_latency_ms > MAX_STREAM_LATENCY_MS {
+			return Err(format!(
+				"Camera '{}': stream_latency_ms must be at most {MAX_STREAM_LATENCY_MS} (got {})",
+				cam.name, cam.stream_latency_ms
+			));
+		}
 	}
 
 	// `[push_listener]` validation. The block itself is optional and the
@@ -1783,6 +1808,19 @@ mod tests {
 		};
 		config.cameras = vec![cloud, local];
 		config
+	}
+
+	#[test]
+	fn stream_latency_ms_defaults_and_bounds() {
+		let mut config = test_helpers::two_camera_config();
+		assert_eq!(config.cameras[0].stream_latency_ms, 1500);
+		for ok in [0, 200, MAX_STREAM_LATENCY_MS] {
+			config.cameras[0].stream_latency_ms = ok;
+			validate_config(&config).expect("in range");
+		}
+		config.cameras[0].stream_latency_ms = MAX_STREAM_LATENCY_MS + 1;
+		let err = validate_config(&config).expect_err("over the cap");
+		assert!(err.contains("stream_latency_ms"), "{err}");
 	}
 
 	#[test]

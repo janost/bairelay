@@ -81,6 +81,7 @@ pub fn merge_cameras(base: Vec<CameraConfig>, overlay: Vec<CameraConfig>) -> Vec
 			overlay_field!(entry, over, defs, idle_disconnect);
 			overlay_field!(entry, over, idle_disconnect_timeout_secs @opt);
 			overlay_field!(entry, over, defs, motion_wake_hold_secs);
+			overlay_field!(entry, over, defs, stream_latency_ms);
 			overlay_field!(entry, over, defs, enabled);
 			overlay_field!(entry, over, defs, webhook);
 			// Whole-struct override: relies on build_base_config leaving

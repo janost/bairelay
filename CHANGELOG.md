@@ -18,6 +18,8 @@ Two-way audio (talk), ported from the neolink talk client:
 - core: pad serialized ADPCM frames on `(data.len() + 4) % 8` like the camera; talk sent 4 stray bytes after every block, and `--dump-bcmedia` captures with ADPCM desynced on replay
 - core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
 
+Per-camera `stream_latency_ms` (default 1500): the pacer startup buffer, previously fixed at 1.5 s. Steady wired cameras can lower it to cut stream latency; `0` disables pacing.
+
 ### Toolchain and dependencies
 
 - Rust 1.100, edition 2024 (was 1.94.1 / 2021)
