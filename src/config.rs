@@ -188,7 +188,8 @@ impl Default for Config {
 /// event. Operator-side DNS hijack for `pushx.reolink.com` →
 /// `push_listener_addr` is the prerequisite. Listener doesn't
 /// terminate TLS — the connection's existence is the signal; we
-/// close immediately.
+/// close immediately. The source IP is matched against the wake
+/// server's heartbeat registry, then each camera's address.
 ///
 /// Field names are deliberately prefixed (`push_listener_addr` /
 /// `push_listener_port`) rather than `bind_addr` / `bind_port` so an
@@ -1460,15 +1461,16 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		if pl.push_listener_port == 0 {
 			return Err("[push_listener]: push_listener_port must be greater than 0".to_string());
 		}
-		// The push listener depends on the shared `CameraRegistry` being
-		// populated by the wake server's `D2R_HB` handler. Without it
-		// every `lookup_by_ip` misses silently and motion never fires.
+		// A push is attributed to a camera by source IP: the wake
+		// server's heartbeat registry, else a camera's `address` (its IP
+		// literal, or the IP a hostname resolved to on the last session).
+		// With neither, every push misses silently.
 		let wake_enabled = config.wake_server.as_ref().is_some_and(|w| w.enable);
-		if !wake_enabled {
+		if !wake_enabled && config.cameras.iter().all(|c| c.address.is_none()) {
 			return Err(
-					"[push_listener] requires [wake_server] enable = true; the push listener resolves peer IPs against the wake server's heartbeat registry"
-						.to_string(),
-				);
+				"[push_listener] can't tell which camera pushed: enable [wake_server] (matches pushes against its heartbeat registry) or give a camera an `address`"
+					.to_string(),
+			);
 		}
 	}
 

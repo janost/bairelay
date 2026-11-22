@@ -13,6 +13,11 @@
 //! registered camera's IP as a motion event, fire `status/motion=on`
 //! plus a `motion_wake_hold_secs` wake-lock, and close the socket.
 //!
+//! A camera is known by its source IP: first through the wake server's
+//! heartbeat registry, then through its address
+//! (`match_camera_by_address`), so the listener also works without
+//! the wake server.
+//!
 //! The wake-lock acquire kicks the connect loop, which uses the local
 //! BcUdp wake server to bring the camera online. Once the
 //! Baichuan session is up, the existing `motion_listener` subscribes
@@ -24,7 +29,7 @@
 //! (`wake_events::push_edge`).
 //!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
-//! the wake-server registry is treated as authentic; we have no further
+//! the wake-server registry or a camera address is treated as authentic; we have no further
 //! authentication on the TCP-accept itself (the camera's TLS handshake
 //! never completes — the cert chain is pinned to Reolink's CA). On a
 //! flat home LAN, anyone able to spoof the camera's IP can fire a fake
@@ -114,19 +119,21 @@ fn handle_push(
 	cfg: &RuntimeConfig,
 	cancel: &CancellationToken,
 ) {
-	let Some((registry_uid, _entry)) =
-		registry.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
-	else {
-		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP — no registry match");
-		return;
-	};
-
-	let Some(handle) = match_camera_by_uid(cameras, &registry_uid) else {
-		tracing::debug!(
-			peer_ip = %peer_ip,
-			registry_uid = %registry_uid,
-			"push matched registry UID but no camera handle has a matching configured UID"
-		);
+	let by_registry = registry
+		.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
+		.and_then(|(registry_uid, _entry)| {
+			let handle = match_camera_by_uid(cameras, &registry_uid);
+			if handle.is_none() {
+				tracing::debug!(
+					peer_ip = %peer_ip,
+					registry_uid = %registry_uid,
+					"push matched registry UID but no camera handle has a matching configured UID"
+				);
+			}
+			handle
+		});
+	let Some(handle) = by_registry.or_else(|| match_camera_by_address(cameras, peer_ip)) else {
+		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP; no registry or address match");
 		return;
 	};
 
@@ -174,6 +181,24 @@ pub(crate) fn match_camera_by_uid<'a>(
 		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
 }
 
+/// The camera at `peer_ip`, by the address its last direct session
+/// used ([`CameraHandle::camera_ip`]) or its literal configured
+/// `address` ([`CameraHandle::configured_ip`]). Two cameras at one IP
+/// are ambiguous, so neither matches.
+pub(crate) fn match_camera_by_address(
+	cameras: &HashMap<String, Arc<CameraHandle>>,
+	peer_ip: IpAddr,
+) -> Option<&Arc<CameraHandle>> {
+	let mut matches = cameras.values().filter(|h| {
+		[h.camera_ip(), h.configured_ip()]
+			.into_iter()
+			.flatten()
+			.any(|ip| ip.to_canonical() == peer_ip)
+	});
+	let first = matches.next()?;
+	matches.next().is_none().then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -186,6 +211,61 @@ mod tests {
 		let mut cfg = minimal_camera_config(name);
 		cfg.uid = uid.map(str::to_string);
 		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	fn handle_with_address(name: &str, address: Option<&str>) -> Arc<CameraHandle> {
+		let mut cfg = minimal_camera_config(name);
+		cfg.address = address.map(str::to_string);
+		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	#[test]
+	fn match_by_address_uses_the_literal_configured_ip() {
+		let cameras = HashMap::from([
+			(
+				"front".into(),
+				handle_with_address("front", Some("192.168.1.20:9000")),
+			),
+			(
+				"back".into(),
+				handle_with_address("back", Some("192.168.1.21")),
+			),
+			(
+				"named".into(),
+				handle_with_address("named", Some("cam.local:9000")),
+			),
+		]);
+		let at =
+			|ip: &str| match_camera_by_address(&cameras, ip.parse().unwrap()).map(|h| h.name());
+		assert_eq!(at("192.168.1.20"), Some("front"));
+		assert_eq!(at("192.168.1.21"), Some("back"));
+		assert_eq!(at("192.168.1.22"), None);
+	}
+
+	#[test]
+	fn match_by_address_uses_the_last_session_ip() {
+		// A hostname or UID camera is known by the IP it was last reached at.
+		let named = handle_with_address("named", Some("cam.local:9000"));
+		let cameras = HashMap::from([("named".into(), Arc::clone(&named))]);
+		let ip: IpAddr = "192.168.1.30".parse().unwrap();
+		assert!(match_camera_by_address(&cameras, ip).is_none());
+		named.set_camera_ip_for_test(ip);
+		assert_eq!(
+			match_camera_by_address(&cameras, ip).map(|h| h.name()),
+			Some("named")
+		);
+	}
+
+	#[test]
+	fn match_by_address_refuses_an_ambiguous_ip() {
+		let cameras = HashMap::from([
+			("a".into(), handle_with_address("a", Some("192.168.1.20"))),
+			(
+				"b".into(),
+				handle_with_address("b", Some("192.168.1.20:9000")),
+			),
+		]);
+		assert!(match_camera_by_address(&cameras, "192.168.1.20".parse().unwrap()).is_none());
 	}
 
 	/// Run the listener on `listener` with a mock MQTT client.
@@ -218,6 +298,32 @@ mod tests {
 			cancel.clone(),
 		));
 		(mock, cancel, server)
+	}
+
+	#[tokio::test]
+	async fn push_matches_by_address_without_a_registry_entry() {
+		// Wake server off: the registry stays empty and the camera is
+		// found by its configured IP.
+		let handle = handle_with_address("porch", Some("127.0.0.1:9000"));
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mock, cancel, server) = spawn_listener(
+			listener,
+			bairelay_wake_server::make_registry(),
+			HashMap::from([("porch".into(), Arc::clone(&handle))]),
+			Duration::from_secs(5),
+		);
+		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/porch/status/motion" && p == b"on"
+		})
+		.await;
+		assert!(saw_on, "{:?}", mock.published_topics());
+		assert_eq!(handle.wake_lock().count(), 1);
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 	}
 
 	#[tokio::test]

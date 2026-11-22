@@ -1880,10 +1880,8 @@ fn validate_rejects_empty_user_name() {
 // validation, so a NaN / infinite / negative value would panic later
 // inside `Duration::from_secs_f64` at startup. `bind_port = 0` is also
 // rejected: the chosen ephemeral port is never surfaced, so DNS-redirect
-// from the camera would never reach it. And push_listener requires
-// wake_server.enable=true because the shared `CameraRegistry` is only
-// populated by the wake server's `D2R_HB` handler — without it every
-// `lookup_by_ip` misses silently.
+// from the camera would never reach it. And push_listener needs a way
+// to attribute a push: the wake server's registry or a camera `address`.
 
 fn push_listener_cfg(
 	motion_wake_hold_secs: f64,
@@ -1953,31 +1951,33 @@ fn validate_rejects_push_listener_zero_port() {
 }
 
 #[test]
-fn validate_rejects_push_listener_without_wake_server() {
-	// push_listener depends on the registry being populated by the wake
-	// server's heartbeat handler. Enabling push_listener alone is a
-	// silent foot-gun — every IP lookup misses.
+fn validate_accepts_push_listener_without_wake_server_when_a_camera_has_an_address() {
+	// No heartbeat registry, but pushes match the camera's `address`.
 	let mut cfg = push_listener_cfg(30.0, 443);
 	cfg.wake_server = None;
-	let err = validate_config(&cfg).expect_err("must reject");
-	assert!(
-		err.contains("push_listener") && err.contains("wake_server"),
-		"error: {err}"
-	);
+	cfg.cameras[0].address = Some("cam.local:9000".to_string());
+	validate_config(&cfg).expect("address-matched push_listener must pass");
 }
 
 #[test]
-fn validate_rejects_push_listener_with_disabled_wake_server() {
-	let mut cfg = push_listener_cfg(30.0, 443);
-	cfg.wake_server = Some(bairelay_wake_server::WakeServerConfig {
-		enable: false,
-		..Default::default()
-	});
-	let err = validate_config(&cfg).expect_err("must reject");
-	assert!(
-		err.contains("push_listener") && err.contains("wake_server"),
-		"error: {err}"
-	);
+fn validate_rejects_push_listener_with_no_way_to_match_a_camera() {
+	for wake_server in [
+		None,
+		Some(bairelay_wake_server::WakeServerConfig {
+			enable: false,
+			..Default::default()
+		}),
+	] {
+		let mut cfg = push_listener_cfg(30.0, 443);
+		cfg.wake_server = wake_server;
+		cfg.cameras[0].address = None;
+		cfg.cameras[0].uid = Some("9527000TESTCAM00".to_string());
+		let err = validate_config(&cfg).expect_err("must reject");
+		assert!(
+			err.contains("push_listener") && err.contains("wake_server") && err.contains("address"),
+			"error: {err}"
+		);
+	}
 }
 
 #[test]
