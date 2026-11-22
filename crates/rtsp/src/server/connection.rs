@@ -10,7 +10,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -94,6 +94,9 @@ pub async fn handle_connection<S>(
 	let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 		Arc::new(Mutex::new(Box::new(write_half)));
 
+	// A dual-stack `[::]` listener reports IPv4 clients as `::ffff:a.b.c.d`.
+	// Canonicalise once so SDP advertises a plain IPv4 address under
+	// `IN IP4`, and UDP binds and sends use one address family.
 	let state = Arc::new(ConnectionState {
 		provider,
 		users,
@@ -101,9 +104,9 @@ pub async fn handle_connection<S>(
 		current_nonce: Mutex::new(Nonce::random()),
 		sessions: Arc::new(SessionRegistry::new()),
 		udp_pool,
-		server_bind_ip,
-		peer_ip,
-		local_ip,
+		server_bind_ip: server_bind_ip.to_canonical(),
+		peer_ip: peer_ip.to_canonical(),
+		local_ip: local_ip.to_canonical(),
 		is_tls,
 		writer: Arc::clone(&writer),
 	});
@@ -152,42 +155,8 @@ pub async fn handle_connection<S>(
 						break;
 					}
 					Ok(_) => {
-						// Try to parse a complete RTSP request.
-						match try_consume_request(&mut buf) {
-							Ok(Some(req_bytes)) => {
-								if let Err(e) = crate::server::connection::dispatch_request(
-									&state, &req_bytes,
-								).await {
-									tracing::warn!(error = %e, "request handler error");
-									break;
-								}
-								// Refresh the rolling deadline: the
-								// connection has shown activity, so
-								// give it another full window before
-								// the slow-loris arm can fire.
-								last_activity = tokio::time::Instant::now();
-							}
-							Ok(None) => {
-								// Need more bytes.
-								if buf.len() > MAX_REQUEST_BYTES {
-									tracing::warn!("request buffer exceeded limit, closing");
-									break;
-								}
-							}
-							Err(e) => {
-								tracing::warn!(error = %e, "malformed RTSP request, closing");
-								// Send 400 Bad Request once then close.
-								let resp = crate::rtsp::message::build_response(
-									rtsp_types::StatusCode::BadRequest,
-									0,
-									&[],
-									None,
-								);
-								let mut w = writer.lock().await;
-								let _ = w.write_all(&resp).await;
-								let _ = w.flush().await;
-								break;
-							}
+						if !process_buffered(&state, &mut buf, &mut last_activity).await {
+							break;
 						}
 					}
 					Err(e) => {
@@ -214,6 +183,90 @@ where
 	}
 	buf.extend_from_slice(&tmp[..n]);
 	Ok(n)
+}
+
+/// Consume every complete message in `buf`: a single `read()` can carry
+/// several pipelined requests, or interleaved data followed by a request.
+/// Returns `false` when the connection must close.
+async fn process_buffered(
+	state: &Arc<ConnectionState>,
+	buf: &mut Vec<u8>,
+	last_activity: &mut tokio::time::Instant,
+) -> bool {
+	loop {
+		match try_consume(buf) {
+			Ok(Some(Inbound::Interleaved)) => {
+				// RTCP receiver reports are the client's liveness signal
+				// while it streams over TCP (GStreamer and live555 send no
+				// RTSP keepalive). Sessions are per connection, so refresh
+				// them all. The pre-session slow-loris deadline is left
+				// alone: data frames without a session are noise.
+				state.sessions.touch_all();
+			}
+			Ok(Some(Inbound::Request(req_bytes))) => {
+				if let Err(e) = dispatch_request(state, &req_bytes).await {
+					tracing::warn!(error = %e, "request handler error");
+					return false;
+				}
+				// Rolling slow-loris deadline: activity buys another window.
+				*last_activity = tokio::time::Instant::now();
+			}
+			Ok(None) => {
+				// A partial `$` frame is bounded by its u16 length; only a
+				// partial request can grow without limit.
+				if buf.first() != Some(&b'$') && buf.len() > MAX_REQUEST_BYTES {
+					tracing::warn!("request buffer exceeded limit, closing");
+					return false;
+				}
+				return true;
+			}
+			Err(e) => {
+				tracing::warn!(error = %e, "malformed RTSP request, closing");
+				let resp = crate::rtsp::message::build_response(
+					rtsp_types::StatusCode::BadRequest,
+					0,
+					&[],
+					None,
+				);
+				let _ = write_response(state, &resp).await;
+				return false;
+			}
+		}
+	}
+}
+
+/// One complete message at the head of the read buffer.
+#[derive(Debug, PartialEq, Eq)]
+enum Inbound {
+	/// A client-to-server `$`-framed packet (RFC 2326 §10.12), already
+	/// drained. Its content (RTCP RR) is not parsed.
+	Interleaved,
+	/// The bytes of one RTSP request, body included.
+	Request(Vec<u8>),
+}
+
+/// Slice the next complete message off the front of `buf`; `Ok(None)` if
+/// more bytes are needed.
+fn try_consume(buf: &mut Vec<u8>) -> Result<Option<Inbound>, String> {
+	// Tolerate stray CRLFs between messages (some clients send them as a
+	// keepalive), as HTTP/1.1 servers do.
+	let blank = buf
+		.iter()
+		.take_while(|&&b| b == b'\r' || b == b'\n')
+		.count();
+	buf.drain(..blank);
+	if buf.first() == Some(&b'$') {
+		let Some(len) = buf.get(2..4) else {
+			return Ok(None);
+		};
+		let total = 4 + usize::from(u16::from_be_bytes([len[0], len[1]]));
+		if buf.len() < total {
+			return Ok(None);
+		}
+		buf.drain(..total);
+		return Ok(Some(Inbound::Interleaved));
+	}
+	try_consume_request(buf).map(|r| r.map(Inbound::Request))
 }
 
 /// Attempt to slice out exactly one RTSP request from `buf`. Returns:
@@ -274,18 +327,29 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 /// Dispatch a parsed request to the right handler.
 ///
 /// Parses `req_bytes` as a single RTSP request, then matches on
-/// [`RtspMethod`] to invoke the per-method handler. On a parse failure
-/// we emit a `400 Bad Request` with `CSeq: 0` and return an error so
-/// the connection loop closes the socket.
+/// [`RtspMethod`] to invoke the per-method handler. An unsupported method
+/// gets `501` and the connection stays up. Any other parse failure gets
+/// `400 Bad Request` with `CSeq: 0` and an error so the connection loop
+/// closes the socket.
 #[tracing::instrument(skip_all)]
 pub(crate) async fn dispatch_request(
 	state: &Arc<ConnectionState>,
 	req_bytes: &[u8],
 ) -> io::Result<()> {
-	use crate::rtsp::message::{RtspMethod, build_response, parse_request};
+	use crate::rtsp::message::{MessageError, RtspMethod, build_response, parse_request};
 
 	let parsed = match parse_request(req_bytes) {
 		Ok(p) => p,
+		Err(MessageError::UnsupportedMethod { method, cseq }) => {
+			tracing::debug!(method, "unsupported RTSP method");
+			let resp = build_response(
+				rtsp_types::StatusCode::NotImplemented,
+				cseq,
+				&[("Public", PUBLIC_METHODS.to_string())],
+				None,
+			);
+			return write_response(state, &resp).await;
+		}
 		Err(e) => {
 			let resp = build_response(rtsp_types::StatusCode::BadRequest, 0, &[], None);
 			write_response(state, &resp).await?;
@@ -314,6 +378,7 @@ pub(crate) async fn dispatch_request(
 	match parsed.method {
 		RtspMethod::Options => handle_options(state, cseq).await,
 		RtspMethod::GetParameter => handle_getparameter(state, cseq, &parsed).await,
+		RtspMethod::SetParameter => handle_setparameter(state, cseq, &parsed).await,
 		RtspMethod::Pause => handle_pause(state, cseq, &parsed).await,
 		RtspMethod::Describe => handle_describe(state, cseq, &parsed).await,
 		RtspMethod::Setup => handle_setup(state, cseq, &parsed).await,
@@ -323,23 +388,41 @@ pub(crate) async fn dispatch_request(
 }
 
 async fn write_response(state: &Arc<ConnectionState>, resp: &[u8]) -> io::Result<()> {
-	let mut w = state.writer.lock().await;
-	w.write_all(resp).await?;
-	w.flush().await?;
-	Ok(())
+	crate::server::transport::write_all_bounded(&state.writer, resp).await
 }
+
+/// `Public:` header value for OPTIONS and 501 responses.
+const PUBLIC_METHODS: &str =
+	"OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER, PAUSE";
 
 async fn handle_options(state: &Arc<ConnectionState>, cseq: u32) -> io::Result<()> {
 	let resp = crate::rtsp::message::build_response(
 		rtsp_types::StatusCode::Ok,
 		cseq,
-		&[(
-			"Public",
-			"OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, PAUSE".to_string(),
-		)],
+		&[("Public", PUBLIC_METHODS.to_string())],
 		None,
 	);
 	write_response(state, &resp).await
+}
+
+/// SET_PARAMETER with an empty body is a keepalive (the session was
+/// already touched by the dispatcher). We have no settable parameters, so
+/// a non-empty body gets 451.
+async fn handle_setparameter(
+	state: &Arc<ConnectionState>,
+	cseq: u32,
+	parsed: &crate::rtsp::message::ParsedRequest,
+) -> io::Result<()> {
+	if parsed.has_body {
+		let resp = crate::rtsp::message::build_response(
+			rtsp_types::StatusCode::ParameterNotUnderstood,
+			cseq,
+			&[],
+			None,
+		);
+		return write_response(state, &resp).await;
+	}
+	handle_getparameter(state, cseq, parsed).await
 }
 
 async fn handle_getparameter(
@@ -557,27 +640,29 @@ async fn authenticate(
 		AuthError, build_basic_challenge, build_digest_challenge, verify_basic, verify_digest,
 	};
 	let nonce = state.current_nonce.lock().await.clone();
+	// Basic sends the password in cleartext, so only offer it when TLS
+	// protects the connection. A client that sends Basic unprompted on
+	// plain TCP is still verified: the password is already on the wire
+	// and refusing it would only break preemptive-Basic clients.
+	let challenge = |nonce: &crate::rtsp::auth::Nonce, stale: bool| {
+		let mut headers = vec![(
+			"WWW-Authenticate",
+			build_digest_challenge(&state.realm, nonce, stale),
+		)];
+		if state.is_tls {
+			headers.push(("WWW-Authenticate", build_basic_challenge(&state.realm)));
+		}
+		AuthOutcome::Challenge(headers)
+	};
 	let Some(authz) = parsed.authorization.as_deref() else {
-		// No credentials provided → challenge.
-		return AuthOutcome::Challenge(vec![
-			(
-				"WWW-Authenticate",
-				build_digest_challenge(&state.realm, &nonce, false),
-			),
-			("WWW-Authenticate", build_basic_challenge(&state.realm)),
-		]);
+		return challenge(&nonce, false);
 	};
 	if authz.to_ascii_lowercase().starts_with("basic ") {
-		match verify_basic(authz, &state.users) {
-			Ok(user) => return AuthOutcome::Ok(user.to_string()),
-			Err(AuthError::BadCredentials) => return AuthOutcome::Forbidden,
-			Err(_) => {
-				return AuthOutcome::Challenge(vec![(
-					"WWW-Authenticate",
-					build_basic_challenge(&state.realm),
-				)]);
-			}
-		}
+		return match verify_basic(authz, &state.users) {
+			Ok(user) => AuthOutcome::Ok(user.to_string()),
+			Err(AuthError::BadCredentials) => AuthOutcome::Forbidden,
+			Err(_) => challenge(&nonce, false),
+		};
 	}
 	match verify_digest(
 		authz,
@@ -591,16 +676,10 @@ async fn authenticate(
 		Err(AuthError::StaleNonce) => {
 			let fresh = crate::rtsp::auth::Nonce::random();
 			*state.current_nonce.lock().await = fresh.clone();
-			AuthOutcome::Challenge(vec![(
-				"WWW-Authenticate",
-				build_digest_challenge(&state.realm, &fresh, true),
-			)])
+			challenge(&fresh, true)
 		}
 		Err(AuthError::BadCredentials) => AuthOutcome::Forbidden,
-		Err(_) => AuthOutcome::Challenge(vec![(
-			"WWW-Authenticate",
-			build_digest_challenge(&state.realm, &nonce, false),
-		)]),
+		Err(_) => challenge(&nonce, false),
 	}
 }
 
@@ -684,6 +763,29 @@ async fn handle_setup(
 		}
 	};
 
+	// A Session header must name a live session on this connection
+	// (454 otherwise; we must not mint a session under a client-chosen
+	// ID) set up for the same camera + stream (459: one session carries
+	// one presentation's wake lock and SDP). Checked before
+	// build_transport so a rejected SETUP binds no UDP ports.
+	let existing_session = match parsed.session.as_deref() {
+		None => None,
+		Some(sid) => {
+			let status = match state.sessions.path(sid) {
+				None => Some(rtsp_types::StatusCode::SessionNotFound),
+				Some(path) if path != resolved => {
+					Some(rtsp_types::StatusCode::AggregateOperationNotAllowed)
+				}
+				Some(_) => None,
+			};
+			if let Some(status) = status {
+				let resp = crate::rtsp::message::build_response(status, cseq, &[], None);
+				return write_response(state, &resp).await;
+			}
+			Some(sid.to_string())
+		}
+	};
+
 	// Per-track SSRC. Echoed in the Transport response (RFC 2326 §12.39)
 	// and threaded into the session task so RTP packets carry the same
 	// value the client was told about. A random SSRC per track keeps
@@ -710,14 +812,13 @@ async fn handle_setup(
 			}
 		};
 
-	let session_id = parsed.session.clone().unwrap_or_else(new_session_id);
 	let track_kind = if track_id_num == 0 {
 		TrackKind::Video
 	} else {
 		TrackKind::Audio
 	};
 
-	if state.sessions.contains(&session_id) {
+	if let Some(session_id) = existing_session {
 		// Append path: second (or later) SETUP on an existing session ID.
 		// Per RFC 7826 §13.3 a client may issue multiple SETUPs against
 		// the same session to negotiate additional tracks (video+audio).
@@ -737,26 +838,12 @@ async fn handle_setup(
 		// ffmpeg, HA's stream) issue all SETUPs before PLAY, which this
 		// path handles cleanly. If tightening is ever needed, add a
 		// deliverable for it to `docs/architecture.md` Phased Build Order.
-		// Derive clock rate per RFC 3550 for RTCP SR extrapolation.
-		// Video always uses 90000; audio uses the sample rate the session
-		// already advertised in its SDP (pulled from the existing
-		// subscription). If audio SDP wasn't populated (e.g. camera emits
-		// video only), fall back to 16000 — a neutral default for Argus
-		// AAC-LC. The fallback path shouldn't fire in practice: a client
-		// wouldn't SETUP audio without seeing an `m=audio` line in the
-		// DESCRIBE response.
-		let track_clock_rate = match track_kind {
-			TrackKind::Video => 90_000u32,
-			TrackKind::Audio => state
-				.sessions
-				.audio_sample_rate(&session_id)
-				.unwrap_or(16_000),
-		};
 		let track = TrackEntry {
 			kind: track_kind,
 			transport: Arc::clone(&transport_impl),
 			ssrc: track_ssrc,
-			clock_rate: track_clock_rate,
+			initial_seq: rand::random(),
+			control_uri: parsed.uri.clone(),
 		};
 		state.sessions.append_track(&session_id, track);
 		let resp = crate::rtsp::message::build_response(
@@ -771,9 +858,10 @@ async fn handle_setup(
 		return write_response(state, &resp).await;
 	}
 
-	// First SETUP for this session ID — subscribe to the camera (acquires
+	// First SETUP: mint the session ID, subscribe to the camera (acquires
 	// wake lock, waits for SDP to be ready) and spawn the session send
 	// loop.
+	let session_id = new_session_id();
 	let subscription = match subscribe_with_extern_fallback(
 		state,
 		&resolved.camera,
@@ -813,77 +901,36 @@ async fn handle_setup(
 		}
 	};
 
-	// Register the session in the registry, then spawn the send loop with
-	// handles pulled back out of the entry. `SessionEntry::new` constructs
-	// the `first_video_rtp` slot internally; we pull the `tracks` Arc and
-	// the first-video slot back out via registry getters. The send loop
-	// reads the shared `Arc<Mutex<Vec<TrackEntry>>>` on every iteration
-	// so a late SETUP that calls `append_track` becomes visible without
-	// restarting the task.
-	let cancel = CancellationToken::new();
-	let frames_rx = subscription.frames.resubscribe();
-	let last_frame = Arc::clone(&subscription.last_frame);
-	let cancel_for_task = cancel.clone();
-	let sessions_for_task = Arc::clone(&state.sessions);
-	let session_id_for_task = session_id.clone();
-
-	// Derive clock rate per RFC 3550 for RTCP SR extrapolation. See the
-	// matching comment in the append path above.
-	let first_track_clock_rate = match track_kind {
-		TrackKind::Video => 90_000u32,
-		TrackKind::Audio => subscription
-			.sdp_params
-			.audio
-			.as_ref()
-			.map(|a| a.sample_rate)
-			.unwrap_or(16_000),
-	};
+	// Register the session, then spawn its send loop. The loop shares the
+	// entry's track list (so a later SETUP's `append_track` is visible
+	// without a restart) and parks on its PLAY gate, so no RTP flows
+	// between SETUP and PLAY.
 	let first_track = TrackEntry {
 		kind: track_kind,
 		transport: Arc::clone(&transport_impl),
 		ssrc: track_ssrc,
-		clock_rate: first_track_clock_rate,
+		initial_seq: rand::random(),
+		control_uri: parsed.uri.clone(),
 	};
-	state.sessions.insert(
-		session_id.clone(),
-		crate::server::registry::SessionEntry::new(cancel, subscription, vec![first_track]),
+	let cancel = CancellationToken::new();
+	let frames_rx = subscription.frames.resubscribe();
+	let entry = crate::server::registry::SessionEntry::new(
+		cancel.clone(),
+		subscription,
+		resolved,
+		vec![first_track],
 	);
-	let session_tracks_for_task = state
-		.sessions
-		.tracks_arc(&session_id)
-		.expect("tracks arc missing immediately after insert");
-	let tracks_changed_for_task = state
-		.sessions
-		.tracks_changed_arc(&session_id)
-		.expect("tracks_changed notify missing immediately after insert");
-	// Shared slot populated by the session task on its first video packet
-	// and read by the PLAY handler to emit `RTP-Info:` (RFC 2326 §12.33).
-	let first_video_rtp_for_task = state
-		.sessions
-		.first_video_rtp(&session_id)
-		.expect("session just inserted");
-	// PLAY gate — the session task parks on this until the client
-	// issues PLAY, so no RTP flows between SETUP and PLAY.
-	let (play_signal_for_task, play_fired_for_task) = state
-		.sessions
-		.play_gate_arc(&session_id)
-		.expect("session just inserted");
-
-	tokio::spawn(async move {
-		crate::server::session_task::run(
-			frames_rx,
-			last_frame,
-			session_tracks_for_task,
-			sessions_for_task,
-			session_id_for_task,
-			first_video_rtp_for_task,
-			cancel_for_task,
-			tracks_changed_for_task,
-			play_signal_for_task,
-			play_fired_for_task,
-		)
-		.await;
-	});
+	let tracks = Arc::clone(&entry.tracks);
+	let play = Arc::clone(&entry.play);
+	state.sessions.insert(session_id.clone(), entry);
+	tokio::spawn(crate::server::session_task::run(
+		frames_rx,
+		tracks,
+		Arc::clone(&state.sessions),
+		session_id.clone(),
+		play,
+		cancel,
+	));
 
 	// Respond 200 OK with Transport and Session headers.
 	let resp = crate::rtsp::message::build_response(
@@ -919,7 +966,6 @@ async fn build_transport(
 			let t = crate::server::transport::TcpInterleavedTransport::new(
 				Arc::clone(&state.writer),
 				channel_rtp,
-				channel_rtcp,
 			);
 			let response = transport_mod::build_tcp_response(channel_rtp, channel_rtcp, track_ssrc);
 			Ok((Arc::new(t), response))
@@ -932,7 +978,6 @@ async fn build_transport(
 			// the connection was accepted (see `handle_connection`).
 			use std::net::SocketAddr;
 			let client_rtp_addr = SocketAddr::new(state.peer_ip, client_rtp_port);
-			let client_rtcp_addr = SocketAddr::new(state.peer_ip, client_rtcp_port);
 			// If the server's listener is bound to wildcard, bind the UDP
 			// sockets to the TCP connection's local IP so RTP source-IP
 			// matches the RTSP 5-tuple on multi-homed hosts. Otherwise use
@@ -946,7 +991,6 @@ async fn build_transport(
 				udp_bind_ip,
 				Arc::clone(&state.udp_pool),
 				client_rtp_addr,
-				client_rtcp_addr,
 			)
 			.await
 			.map_err(|_| rtsp_types::StatusCode::InternalServerError)?;
@@ -976,7 +1020,13 @@ async fn handle_play(
 		);
 		return write_response(state, &resp).await;
 	};
-	if !state.sessions.contains(sid) {
+	let Some((play, last_frame, tracks)) = state.sessions.with_entry(sid, |e| {
+		(
+			Arc::clone(&e.play),
+			Arc::clone(&e.subscription.last_frame),
+			Arc::clone(&e.tracks),
+		)
+	}) else {
 		let resp = crate::rtsp::message::build_response(
 			rtsp_types::StatusCode::SessionNotFound,
 			cseq,
@@ -984,50 +1034,54 @@ async fn handle_play(
 			None,
 		);
 		return write_response(state, &resp).await;
-	}
-	// Release the session send loop — RFC 2326 §10.5 PLAY starts
-	// media delivery. Must happen BEFORE we wait on first_video_rtp
-	// below, because the task is parked on play_signal and can't
-	// have sent its first video packet yet.
-	state.sessions.mark_playing(sid);
+	};
 
-	// Emit RTP-Info if the session has already sent at least one video
-	// packet (RFC 2326 §12.33). The track URI is echoed from the
-	// request-URI — real clients (VLC/ffmpeg) expect this exact value
-	// when mapping RTP-Info entries to SDP tracks. If the first packet
-	// hasn't been transmitted yet we skip the header; most clients
-	// tolerate the absence. We wait briefly (up to ~200 ms) to let the
-	// send loop record its first packet — after mark_playing the task
-	// unparks and the cached-burst replay typically completes well
-	// within that window.
 	let mut headers: Vec<(&'static str, String)> =
 		vec![("Session", sid.clone()), ("Range", "npt=now-".to_string())];
-	if let Some(slot) = state.sessions.first_video_rtp(sid) {
-		let mut found: Option<(u16, u32)> = None;
-		for _ in 0..10 {
-			if let Ok(guard) = slot.lock()
-				&& let Some(pair) = *guard
-			{
-				found = Some(pair);
-				break;
-			}
-			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-		}
-		if let Some((seq, rtptime)) = found {
-			headers.push((
-				"RTP-Info",
-				format!("url={};seq={};rtptime={}", parsed.uri, seq, rtptime),
-			));
-		} else {
-			tracing::debug!(
-				session = %sid,
-				"no video packet sent yet at PLAY time; omitting RTP-Info"
-			);
-		}
-	}
+	// A repeated PLAY on a running session: media is already flowing, so
+	// there is no "first packet" left to describe.
+	let replay = if play.is_open() {
+		None
+	} else {
+		// Snapshot the burst once: the same value is described in
+		// RTP-Info and handed to the send loop for replay.
+		let replay = last_frame
+			.video_snapshot()
+			.filter(|b| !b.iframe_nals.is_empty());
+		headers.push(("RTP-Info", rtp_info(&tracks, replay.as_ref())));
+		replay
+	};
 	let resp =
 		crate::rtsp::message::build_response(rtsp_types::StatusCode::Ok, cseq, &headers, None);
-	write_response(state, &resp).await
+	write_response(state, &resp).await?;
+	// Only now release media (RFC 2326 §10.5). ffmpeg skips `$` packets
+	// while it waits for the PLAY reply, so a replayed IDR sent earlier
+	// would be thrown away.
+	play.open(replay);
+	Ok(())
+}
+
+/// `RTP-Info` (RFC 2326 §12.33) for a PLAY that is about to start media:
+/// each track's SETUP URI and SETUP-chosen first sequence number, plus
+/// for video the replayed keyframe's timestamp when there is one. Live
+/// first-packet timestamps aren't known yet, so they are omitted.
+fn rtp_info(
+	tracks: &std::sync::Mutex<Vec<crate::server::registry::TrackEntry>>,
+	replay: Option<&crate::buffer::VideoBurst>,
+) -> String {
+	use crate::server::registry::TrackKind;
+	let tracks = tracks.lock().expect("session tracks lock poisoned");
+	tracks
+		.iter()
+		.map(|t| {
+			let mut s = format!("url={};seq={}", t.control_uri, t.initial_seq);
+			if let (TrackKind::Video, Some(b)) = (t.kind, replay) {
+				s.push_str(&format!(";rtptime={}", b.captured_pts_90khz));
+			}
+			s
+		})
+		.collect::<Vec<_>>()
+		.join(",")
 }
 
 /// Subscribe to a camera stream, transparently falling back from `Extern`
@@ -1204,6 +1258,8 @@ mod tests {
 		internal_error: std::sync::atomic::AtomicBool,
 		/// Names of known cameras.
 		known: std::sync::Mutex<Vec<String>>,
+		/// Keyframe burst seeded into each subscription's last-frame buffer.
+		burst: std::sync::Mutex<Option<crate::buffer::VideoBurst>>,
 	}
 
 	impl MockProv {
@@ -1244,6 +1300,10 @@ mod tests {
 				return Err(StreamError::Unavailable("extern-na".into()));
 			}
 			let (_tx, rx) = tokio::sync::broadcast::channel::<Frame>(16);
+			let last_frame = Arc::new(LastFrameBuffer::new());
+			if let Some(burst) = self.burst.lock().unwrap().clone() {
+				last_frame.replace_video(burst);
+			}
 			Ok(SubscriptionHandle {
 				frames: rx,
 				sdp_params: SdpParams {
@@ -1260,7 +1320,7 @@ mod tests {
 					}),
 					audio: None,
 				},
-				last_frame: Arc::new(LastFrameBuffer::new()),
+				last_frame,
 				guard: Box::new(()),
 			})
 		}
@@ -1276,6 +1336,14 @@ mod tests {
 		provider: Arc<dyn crate::provider::StreamProvider>,
 		users: Vec<UserCred>,
 	) -> (Arc<ConnectionState>, tokio::io::DuplexStream) {
+		make_state_full(provider, users, false)
+	}
+
+	fn make_state_full(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+		users: Vec<UserCred>,
+		is_tls: bool,
+	) -> (Arc<ConnectionState>, tokio::io::DuplexStream) {
 		let (client, server) = tokio::io::duplex(64 * 1024);
 		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 			Arc::new(Mutex::new(Box::new(server)));
@@ -1289,7 +1357,7 @@ mod tests {
 			server_bind_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
 			peer_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
 			local_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-			is_tls: false,
+			is_tls,
 			writer,
 		});
 		(state, client)
@@ -1487,6 +1555,247 @@ mod tests {
 		drop(client);
 	}
 
+	/// Run `handle_connection` on one end of a duplex; returns the client
+	/// end, the cancel token and the task.
+	fn spawn_connection(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+	) -> (
+		tokio::io::DuplexStream,
+		CancellationToken,
+		tokio::task::JoinHandle<()>,
+	) {
+		let lo = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+		spawn_connection_with_ips(provider, lo, lo)
+	}
+
+	fn spawn_connection_with_ips(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+		server_bind_ip: std::net::IpAddr,
+		local_ip: std::net::IpAddr,
+	) -> (
+		tokio::io::DuplexStream,
+		CancellationToken,
+		tokio::task::JoinHandle<()>,
+	) {
+		let (client, server) = tokio::io::duplex(256 * 1024);
+		let cancel = CancellationToken::new();
+		let task = tokio::spawn(handle_connection(
+			server,
+			provider,
+			vec![],
+			"test".into(),
+			Arc::new(crate::server::udp_pool::UdpPortPool::new()),
+			server_bind_ip,
+			local_ip,
+			local_ip,
+			false,
+			cancel.clone(),
+		));
+		(client, cancel, task)
+	}
+
+	#[tokio::test]
+	async fn v4_mapped_local_ip_is_advertised_as_plain_ipv4() {
+		use tokio::io::AsyncWriteExt;
+		let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+		let (mut client, cancel, task) = spawn_connection_with_ips(
+			MockProv::with_cameras(&["cam1"]),
+			std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+			mapped,
+		);
+		client
+			.write_all(b"DESCRIBE rtsp://x/cam1/main RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		let sdp = String::from_utf8(rr.body.clone()).unwrap();
+		assert!(sdp.contains("c=IN IP4 127.0.0.1\r\n"), "{sdp}");
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	/// Reads RTSP responses off a client stream, keeping leftover bytes
+	/// between calls and skipping `$`-framed media.
+	#[derive(Default)]
+	struct ResponseReader {
+		buf: Vec<u8>,
+		/// `$` frames seen so far, as (channel, payload).
+		frames: Vec<(u8, Vec<u8>)>,
+		/// Body of the last response returned by `next`.
+		body: Vec<u8>,
+	}
+
+	impl ResponseReader {
+		/// Next RTSP response head; `$` frames before it go to `frames`.
+		async fn next(&mut self, client: &mut tokio::io::DuplexStream) -> String {
+			self.read_until(client, false).await.unwrap()
+		}
+
+		/// Next `$` frame; fails if an RTSP response arrives first.
+		async fn frame(&mut self, client: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+			if self.frames.is_empty() {
+				assert!(self.read_until(client, true).await.is_none());
+			}
+			self.frames.remove(0)
+		}
+
+		async fn read_until(
+			&mut self,
+			client: &mut tokio::io::DuplexStream,
+			want_frame: bool,
+		) -> Option<String> {
+			use tokio::io::AsyncReadExt;
+			loop {
+				if self.buf.first() == Some(&b'$') && self.buf.len() >= 4 {
+					let len = usize::from(u16::from_be_bytes([self.buf[2], self.buf[3]]));
+					if self.buf.len() >= 4 + len {
+						let frame: Vec<u8> = self.buf.drain(..4 + len).collect();
+						self.frames.push((frame[1], frame[4..].to_vec()));
+						if want_frame {
+							return None;
+						}
+						continue;
+					}
+				} else if let Some(pos) = find_double_crlf(&self.buf) {
+					let head = String::from_utf8(self.buf[..pos + 4].to_vec()).unwrap();
+					let cl = parse_content_length(head.as_bytes()).unwrap_or(0);
+					if self.buf.len() >= pos + 4 + cl {
+						let msg: Vec<u8> = self.buf.drain(..pos + 4 + cl).collect();
+						self.body = msg[pos + 4..].to_vec();
+						assert!(!want_frame, "expected a $ frame, got {head}");
+						return Some(head);
+					}
+				}
+				let mut tmp = [0u8; 4096];
+				let n =
+					tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut tmp))
+						.await
+						.expect("timed out waiting for response")
+						.unwrap();
+				assert!(n > 0, "connection closed while waiting for a response");
+				self.buf.extend_from_slice(&tmp[..n]);
+			}
+		}
+	}
+
+	fn session_of(head: &str) -> String {
+		head.split("\r\n")
+			.find_map(|l| l.strip_prefix("Session: "))
+			.expect("Session header")
+			.split(';')
+			.next()
+			.unwrap()
+			.to_string()
+	}
+
+	#[tokio::test]
+	async fn pipelined_requests_in_one_read_all_get_answered() {
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		client
+			.write_all(
+				b"OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 1\r\n\r\n\
+				  OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\n\r\n",
+			)
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		assert!(rr.next(&mut client).await.contains("CSeq: 1"));
+		assert!(rr.next(&mut client).await.contains("CSeq: 2"));
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn client_interleaved_frames_are_demuxed_not_parsed_as_requests() {
+		// GStreamer/live555 send RTCP RR on the interleaved RTCP channel.
+		// The frame (split across writes, then glued to the next request)
+		// must be drained, not prepended to the request and 400'd.
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		let mut rr = ResponseReader::default();
+		client
+			.write_all(b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n")
+			.await
+			.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		let sid = session_of(&head);
+
+		let rtcp_rr = [0x81u8, 201, 0x00, 0x07, 1, 2, 3, 4];
+		let mut frame = vec![b'$', 1, 0, rtcp_rr.len() as u8];
+		frame.extend_from_slice(&rtcp_rr);
+		client.write_all(&frame[..3]).await.unwrap();
+		tokio::task::yield_now().await;
+		let mut rest = frame[3..].to_vec();
+		rest.extend_from_slice(
+			format!("GET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\nSession: {sid}\r\n\r\n")
+				.as_bytes(),
+		);
+		client.write_all(&rest).await.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200, "{head}");
+		assert!(head.contains("CSeq: 2"));
+		assert!(!task.is_finished());
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[test]
+	fn try_consume_waits_for_whole_interleaved_frame() {
+		let mut buf = vec![b'$', 1, 0, 4, 0xaa];
+		assert_eq!(try_consume(&mut buf).unwrap(), None);
+		buf.extend_from_slice(&[0xbb, 0xcc, 0xdd]);
+		buf.extend_from_slice(b"\r\nOPTIONS / RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+		assert_eq!(try_consume(&mut buf).unwrap(), Some(Inbound::Interleaved));
+		assert!(matches!(
+			try_consume(&mut buf).unwrap(),
+			Some(Inbound::Request(r)) if r.starts_with(b"OPTIONS")
+		));
+		assert!(buf.is_empty());
+	}
+
+	#[tokio::test]
+	async fn unsupported_method_gets_501_and_connection_stays_open() {
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		client
+			.write_all(
+				b"ANNOUNCE rtsp://x/cam1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 3\r\n\r\nv=0",
+			)
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 501);
+		assert!(head.contains("CSeq: 3"));
+		client
+			.write_all(b"OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+			.await
+			.unwrap();
+		assert_eq!(status_of(&rr.next(&mut client).await), 200);
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn set_parameter_empty_body_is_keepalive_and_body_gets_451() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\nSession: abc\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		assert!(head.contains("Session: abc"));
+		let req =
+			b"SET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 6\r\n\r\nfoo: 1";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 451);
+	}
+
 	#[tokio::test]
 	async fn dispatch_options_returns_200_with_public_header() {
 		let provider = MockProv::with_cameras(&["cam1"]);
@@ -1605,7 +1914,27 @@ mod tests {
 		dispatch_request(&state, req).await.unwrap();
 		let (head, _) = read_response(&mut client).await;
 		assert_eq!(status_of(&head), 401);
-		assert!(head.contains("WWW-Authenticate"));
+		assert!(head.contains("WWW-Authenticate: Digest"));
+		assert!(
+			!head.contains("Basic realm"),
+			"Basic must not be offered over plain TCP: {head}"
+		);
+	}
+
+	#[tokio::test]
+	async fn describe_challenge_offers_basic_only_over_tls() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let users = vec![UserCred {
+			name: "alice".into(),
+			password: "pw".into(),
+		}];
+		let (state, mut client) = make_state_full(provider, users, true);
+		let req = b"DESCRIBE rtsps://x/cam1/main RTSP/1.0\r\nCSeq: 4\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 401);
+		assert!(head.contains("WWW-Authenticate: Digest"));
+		assert!(head.contains("Basic realm"), "{head}");
 	}
 
 	#[tokio::test]
@@ -1937,6 +2266,97 @@ mod tests {
 		dispatch_request(&state, req.as_bytes()).await.unwrap();
 		let (head, _) = read_response(&mut client).await;
 		assert_eq!(status_of(&head), 200);
+	}
+
+	#[tokio::test]
+	async fn setup_with_unknown_session_returns_454() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 5\r\nSession: made-up\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 454);
+		assert!(
+			state.sessions.is_empty(),
+			"no session minted under a client ID"
+		);
+	}
+
+	#[tokio::test]
+	async fn setup_append_for_other_presentation_returns_459() {
+		let provider = MockProv::with_cameras(&["cam1", "cam2"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 5\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		let sid = session_of(&head);
+		for (cseq, uri) in [(6, "cam2/main"), (7, "cam1/sub")] {
+			let req = format!(
+				"SETUP rtsp://x/{uri}/trackID=1 RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {sid}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
+			);
+			dispatch_request(&state, req.as_bytes()).await.unwrap();
+			let (head, _) = read_response(&mut client).await;
+			assert_eq!(status_of(&head), 459, "{uri}");
+		}
+		let tracks = state.sessions.tracks_arc(&sid).unwrap();
+		assert_eq!(tracks.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn play_response_precedes_replay_and_rtp_info_describes_it() {
+		use tokio::io::AsyncWriteExt;
+		let provider = MockProv::with_cameras(&["cam1"]);
+		*provider.burst.lock().unwrap() = Some(crate::buffer::VideoBurst {
+			codec: crate::codec::VideoCodec::H264,
+			iframe_nals: vec![vec![0x65, 0xaa, 0xbb]],
+			captured_pts_90khz: 12_345,
+		});
+		let (mut client, cancel, task) = spawn_connection(provider);
+		let mut rr = ResponseReader::default();
+		let video_uri = "rtsp://x/cam1/main/trackID=0";
+		let audio_uri = "rtsp://x/cam1/main/trackID=1";
+		client
+			.write_all(format!("SETUP {video_uri} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		let sid = session_of(&rr.next(&mut client).await);
+		client
+			.write_all(format!("SETUP {audio_uri} RTSP/1.0\r\nCSeq: 2\r\nSession: {sid}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		assert_eq!(status_of(&rr.next(&mut client).await), 200);
+
+		client
+			.write_all(
+				format!("PLAY rtsp://x/cam1/main/ RTSP/1.0\r\nCSeq: 3\r\nSession: {sid}\r\n\r\n")
+					.as_bytes(),
+			)
+			.await
+			.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		assert!(rr.frames.is_empty(), "media arrived before the PLAY reply");
+		let rtp_info = head
+			.split("\r\n")
+			.find_map(|l| l.strip_prefix("RTP-Info: "))
+			.expect("RTP-Info");
+		let (video_info, audio_info) = rtp_info.split_once(',').unwrap();
+		assert!(video_info.starts_with(&format!("url={video_uri};seq=")));
+		assert!(video_info.ends_with(";rtptime=12345"), "{video_info}");
+		assert!(audio_info.starts_with(&format!("url={audio_uri};seq=")));
+		let seq: u16 = video_info
+			.split(';')
+			.find_map(|p| p.strip_prefix("seq="))
+			.unwrap()
+			.parse()
+			.unwrap();
+
+		let (channel, rtp) = rr.frame(&mut client).await;
+		assert_eq!(channel, 0);
+		assert_eq!(u16::from_be_bytes([rtp[2], rtp[3]]), seq);
+		assert_eq!(u32::from_be_bytes([rtp[4], rtp[5], rtp[6], rtp[7]]), 12_345);
+		cancel.cancel();
+		task.await.unwrap();
 	}
 
 	#[tokio::test]

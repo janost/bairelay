@@ -43,10 +43,7 @@ fn video_replace_snapshot(c: &mut Criterion) {
 	// for the bench; we're measuring the lock + clone cost.
 	let burst = VideoBurst {
 		codec: bairelay_rtsp::codec::VideoCodec::H264,
-		parameter_sets: vec![vec![0x67u8; 8], vec![0x68u8; 4]],
 		iframe_nals: vec![vec![0x65u8; 16 * 1024]; 4],
-		pframe_nals: vec![],
-		captured_at: std::time::Instant::now(),
 		captured_pts_90khz: 0,
 	};
 

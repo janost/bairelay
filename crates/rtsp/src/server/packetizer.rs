@@ -1,8 +1,6 @@
 //! Frame → RTP dispatch for session send loops.
 
-use crate::codec::VideoCodec;
-use crate::codec::h264::{self, DEFAULT_MTU};
-use crate::codec::h265;
+use crate::codec::{DEFAULT_MTU, VideoCodec, h264, h265};
 use crate::provider::{AudioPayload, Frame};
 use crate::rtp::RtpCounters;
 
@@ -10,8 +8,7 @@ use crate::rtp::RtpCounters;
 ///
 /// The caller picks the right counter before calling — video frames go
 /// through the video track's counter; audio frames through the audio
-/// track's. `session_task::dispatch_frame` already does this selection
-/// based on frame kind.
+/// track's.
 ///
 /// For video, emits one or more packets (FU when needed, marker on last).
 /// For audio, emits one packet per frame (AAC via RFC 3640, G.711 as
@@ -24,49 +21,52 @@ pub fn dispatch(frame: &Frame, counters: &mut RtpCounters) -> Vec<Vec<u8>> {
 			pts_90khz,
 			access_unit_end,
 			..
-		} => {
-			let mut packets = Vec::new();
-			let last_index = nals.len().saturating_sub(1);
-			for (i, nal) in nals.iter().enumerate() {
-				let marker = *access_unit_end && i == last_index;
-				let nal_bytes: &[u8] = nal.as_ref();
-				match codec {
-					VideoCodec::H264 => {
-						if nal_bytes.len() + 12 <= DEFAULT_MTU {
-							packets.push(h264::packetize_single(
-								nal_bytes, counters, *pts_90khz, marker,
-							));
-						} else {
-							packets.extend(h264::packetize_fu_a(
-								nal_bytes,
-								counters,
-								*pts_90khz,
-								marker,
-								DEFAULT_MTU,
-							));
-						}
-					}
-					VideoCodec::H265 => {
-						if nal_bytes.len() + 12 <= DEFAULT_MTU {
-							packets.push(h265::packetize_single(
-								nal_bytes, counters, *pts_90khz, marker,
-							));
-						} else {
-							packets.extend(h265::packetize_fu(
-								nal_bytes,
-								counters,
-								*pts_90khz,
-								marker,
-								DEFAULT_MTU,
-							));
-						}
-					}
-				}
-			}
-			packets
-		}
+		} => packetize_video(*codec, nals, *pts_90khz, *access_unit_end, counters),
 		Frame::Audio { payload, pts } => dispatch_audio(payload, *pts, counters),
 	}
+}
+
+/// Packetize one access unit's NALs: single-NAL packets when they fit in
+/// [`DEFAULT_MTU`], FU fragments otherwise. The marker bit lands on the
+/// last packet of the last NAL when `access_unit_end` is set (RFC 3550
+/// §5.1); without it ffmpeg never flushes the frame to its muxer.
+pub(crate) fn packetize_video<N: AsRef<[u8]>>(
+	codec: VideoCodec,
+	nals: &[N],
+	pts_90khz: u32,
+	access_unit_end: bool,
+	counters: &mut RtpCounters,
+) -> Vec<Vec<u8>> {
+	let mut packets = Vec::new();
+	let last_index = nals.len().saturating_sub(1);
+	for (i, nal) in nals.iter().enumerate() {
+		let marker = access_unit_end && i == last_index;
+		let nal = nal.as_ref();
+		let fits = nal.len() + 12 <= DEFAULT_MTU;
+		match (codec, fits) {
+			(VideoCodec::H264, true) => {
+				packets.push(h264::packetize_single(nal, counters, pts_90khz, marker));
+			}
+			(VideoCodec::H264, false) => packets.extend(h264::packetize_fu_a(
+				nal,
+				counters,
+				pts_90khz,
+				marker,
+				DEFAULT_MTU,
+			)),
+			(VideoCodec::H265, true) => {
+				packets.push(h265::packetize_single(nal, counters, pts_90khz, marker));
+			}
+			(VideoCodec::H265, false) => packets.extend(h265::packetize_fu(
+				nal,
+				counters,
+				pts_90khz,
+				marker,
+				DEFAULT_MTU,
+			)),
+		}
+	}
+	packets
 }
 
 fn dispatch_audio(payload: &AudioPayload, pts: u32, counters: &mut RtpCounters) -> Vec<Vec<u8>> {
@@ -88,13 +88,17 @@ fn dispatch_audio(payload: &AudioPayload, pts: u32, counters: &mut RtpCounters) 
 			)]
 		}
 		AudioPayload::G711Ulaw { samples } => {
+			// RFC 3551 §4.1: for audio the marker flags the first packet
+			// of a talkspurt. The camera stream is continuous (no silence
+			// suppression), so it is never set. AAC keeps M=1 because RFC
+			// 3640 §3.2.1 uses it to mark the end of an access unit.
 			let seq = counters.next_seq();
 			vec![build_packet(
 				G711_PAYLOAD_TYPE,
 				seq,
 				pts,
 				counters.ssrc,
-				true,
+				false,
 				samples,
 			)]
 		}
@@ -153,7 +157,8 @@ mod tests {
 		};
 		let packets = dispatch(&frame, &mut counters);
 		assert_eq!(packets.len(), 1);
-		assert_eq!(packets[0][1] & 0x7F, 0); // PT=0 (PCMU), marker masked off
+		// PT=0 (PCMU) and no marker on a continuous stream.
+		assert_eq!(packets[0][1], 0);
 	}
 
 	#[test]

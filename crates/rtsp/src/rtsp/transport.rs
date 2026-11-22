@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use super::strip_prefix_ignore_case;
+
 /// Parsed representation of a client-requested `Transport:` header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportSpec {
@@ -63,10 +65,10 @@ pub fn parse(value: &str) -> Result<TransportSpec, TransportError> {
 			cast = Some("unicast");
 		} else if part.eq_ignore_ascii_case("multicast") {
 			return Err(TransportError::Unsupported("multicast".into()));
-		} else if let Some(rest) = part.strip_prefix_ignore_case("interleaved=") {
+		} else if let Some(rest) = strip_prefix_ignore_case(part, "interleaved=") {
 			let (a, b) = parse_range_u8(rest)?;
 			interleaved = Some((a, b));
-		} else if let Some(rest) = part.strip_prefix_ignore_case("client_port=") {
+		} else if let Some(rest) = strip_prefix_ignore_case(part, "client_port=") {
 			let (a, b) = parse_range_u16(rest)?;
 			client_port = Some((a, b));
 		}
@@ -149,20 +151,6 @@ fn parse_range_u16(s: &str) -> Result<(u16, u16), TransportError> {
 		.parse()
 		.map_err(|e| TransportError::Malformed(format!("bad u16: {e}")))?;
 	Ok((a, b))
-}
-
-trait StrExt {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str>;
-}
-
-impl StrExt for str {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str> {
-		if self.len() >= prefix.len() && self[..prefix.len()].eq_ignore_ascii_case(prefix) {
-			Some(&self[prefix.len()..])
-		} else {
-			None
-		}
-	}
 }
 
 #[cfg(test)]

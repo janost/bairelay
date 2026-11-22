@@ -18,8 +18,6 @@ use crate::rtp::{RtpCounters, build_packet};
 pub const H265_PAYLOAD_TYPE: u8 = 96;
 /// RTP timestamp clock rate for H.265: 90 kHz (shared with H.264 / MPEG-TS).
 pub const H265_CLOCK_HZ: u32 = 90_000;
-/// Default MTU used to size FU-A fragments; conservative for typical Ethernet links.
-pub const DEFAULT_MTU: usize = 1400;
 
 const FU_TYPE: u8 = 49;
 

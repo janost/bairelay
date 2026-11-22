@@ -40,7 +40,6 @@ use bairelay_rtsp::provider::{
 };
 use bairelay_rtsp::rtsp::auth::UserCred;
 use bairelay_rtsp::sdp::SdpParams;
-use bairelay_rtsp::server::rtcp::SR_INTERVAL;
 use bairelay_rtsp::server::{RtspServer, ServerConfig};
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
 
@@ -51,6 +50,10 @@ use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPfram
 /// (`BROADCAST_CAPACITY` in `src/stream_source.rs`) so backpressure
 /// behaviour is realistic.
 const REPLAY_BROADCAST_CAPACITY: usize = 64;
+
+/// Read-window anchor for the multi-track test. The server never emits
+/// RTCP SRs; this was the old SR period.
+const SR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Hard cap on bytes slurped from a `.bcmedia` file during a pre-scan or
 /// replay. Real fixtures are hand-captured and small; anything over this

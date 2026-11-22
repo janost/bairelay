@@ -17,9 +17,6 @@ pub const H264_PAYLOAD_TYPE: u8 = 96;
 /// RTP clock rate for H.264 (always 90 kHz).
 pub const H264_CLOCK_HZ: u32 = 90_000;
 
-/// Maximum MTU we target for RTP payloads over UDP/TCP-interleaved.
-pub const DEFAULT_MTU: usize = 1400;
-
 /// Packetize a single NAL unit smaller than the MTU into one RTP packet.
 ///
 /// Returns the serialized RTP packet.
@@ -78,7 +75,8 @@ pub fn packetize_fu_a(
 	}
 
 	let nal_header = nal[0];
-	let nri = nal_header & 0x60;
+	// FU indicator keeps the original F and NRI bits (RFC 6184 §5.8).
+	let f_nri = nal_header & 0xE0;
 	let nal_type = nal_header & 0x1F;
 	let body = &nal[1..];
 
@@ -92,7 +90,7 @@ pub fn packetize_fu_a(
 		let is_first = offset == 0;
 		let is_last = end == total;
 
-		let fu_indicator = nri | FU_A_TYPE;
+		let fu_indicator = f_nri | FU_A_TYPE;
 		let mut fu_header = nal_type;
 		if is_first {
 			fu_header |= 0x80;
@@ -124,6 +122,19 @@ pub fn packetize_fu_a(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn fu_indicator_preserves_forbidden_and_nri_bits() {
+		// F=1 (a NAL a middlebox flagged as damaged), NRI=3, type 5.
+		let mut nal = vec![0xE5u8];
+		nal.extend(vec![0xCC; 100]);
+		let mut c = RtpCounters { ssrc: 1, seq: 0 };
+		let pkts = packetize_fu_a(&nal, &mut c, 0, true, 64);
+		for p in &pkts {
+			assert_eq!(p[12], 0xE0 | 28, "FU indicator");
+			assert_eq!(p[13] & 0x1F, 5, "FU header type");
+		}
+	}
 
 	#[test]
 	fn packetize_fu_a_emits_exact_count_at_mtu_boundary() {

@@ -4,6 +4,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use thiserror::Error;
 
+use super::strip_prefix_ignore_case;
+
 /// Errors produced while validating an `Authorization` header.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
@@ -38,34 +40,25 @@ pub struct UserCred {
 /// Expects value formatted as `Basic <base64>`. Returns the username on
 /// success.
 pub fn verify_basic<'a>(authz: &str, users: &'a [UserCred]) -> Result<&'a str, AuthError> {
-	let rest = authz
-		.strip_prefix_ignore_case("Basic ")
-		.ok_or(AuthError::UnknownScheme)?;
+	let rest = strip_prefix_ignore_case(authz, "Basic ").ok_or(AuthError::UnknownScheme)?;
 	let decoded = BASE64
 		.decode(rest.trim())
 		.map_err(|_| AuthError::Malformed)?;
 	let s = std::str::from_utf8(&decoded).map_err(|_| AuthError::Malformed)?;
 	let (user, pass) = s.split_once(':').ok_or(AuthError::Malformed)?;
 	for u in users {
-		if u.name == user && u.password == pass {
+		if u.name == user && ct_eq(&u.password, pass) {
 			return Ok(&u.name);
 		}
 	}
 	Err(AuthError::BadCredentials)
 }
 
-trait StrExt {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str>;
-}
-
-impl StrExt for str {
-	fn strip_prefix_ignore_case<'a>(&'a self, prefix: &str) -> Option<&'a str> {
-		if self.len() >= prefix.len() && self[..prefix.len()].eq_ignore_ascii_case(prefix) {
-			Some(&self[prefix.len()..])
-		} else {
-			None
-		}
-	}
+/// Constant-time string equality for secrets, so response timing does not
+/// leak how many leading bytes of a guess were right.
+fn ct_eq(a: &str, b: &str) -> bool {
+	use subtle::ConstantTimeEq as _;
+	a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Build a Basic challenge header value for a `WWW-Authenticate:` response.
@@ -121,6 +114,24 @@ pub fn digest_response(
 	md5_hex(format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes())
 }
 
+/// Compute the MD5 Digest response for a client that sent no `qop`
+/// (RFC 2069 compatibility, RFC 2617 §3.2.2.1). live555-based clients
+/// (VLC, openRTSP) always use this form.
+///
+/// `response = MD5(HA1:nonce:HA2)`
+pub fn digest_response_no_qop(
+	username: &str,
+	realm: &str,
+	password: &str,
+	method: &str,
+	uri: &str,
+	nonce: &str,
+) -> String {
+	let ha1 = md5_hex(format!("{username}:{realm}:{password}").as_bytes());
+	let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
+	md5_hex(format!("{ha1}:{nonce}:{ha2}").as_bytes())
+}
+
 /// Hex-encode the MD5 digest of `input`.
 fn md5_hex(input: &[u8]) -> String {
 	let digest = md5::compute(input);
@@ -140,9 +151,7 @@ pub fn build_digest_challenge(realm: &str, nonce: &Nonce, stale: bool) -> String
 pub fn parse_digest_params(
 	value: &str,
 ) -> Result<std::collections::HashMap<String, String>, AuthError> {
-	let rest = value
-		.strip_prefix_ignore_case("Digest ")
-		.ok_or(AuthError::UnknownScheme)?;
+	let rest = strip_prefix_ignore_case(value, "Digest ").ok_or(AuthError::UnknownScheme)?;
 	let mut map = std::collections::HashMap::new();
 	for part in split_digest_params(rest) {
 		let (k, v) = part.split_once('=').ok_or(AuthError::Malformed)?;
@@ -225,9 +234,13 @@ where
 	let nonce = params.get("nonce").ok_or(AuthError::Malformed)?;
 	let uri = params.get("uri").ok_or(AuthError::Malformed)?;
 	let response = params.get("response").ok_or(AuthError::Malformed)?;
-	let qop = params.get("qop").cloned().unwrap_or_default();
-	let nc = params.get("nc").cloned().unwrap_or_default();
-	let cnonce = params.get("cnonce").cloned().unwrap_or_default();
+	// We only offer qop="auth"; anything else (auth-int) is unsupported.
+	let qop = params.get("qop").map(String::as_str);
+	if qop.is_some_and(|q| !q.eq_ignore_ascii_case("auth")) {
+		return Err(AuthError::Malformed);
+	}
+	let nc = params.get("nc").map(String::as_str).unwrap_or_default();
+	let cnonce = params.get("cnonce").map(String::as_str).unwrap_or_default();
 
 	if !nonce_ok(nonce) {
 		return Err(AuthError::StaleNonce);
@@ -247,20 +260,28 @@ where
 		return Err(AuthError::BadCredentials);
 	}
 
+	// Our hex digests are lowercase; normalise the client's before the
+	// constant-time compare.
+	let response = response.to_ascii_lowercase();
 	for user in users {
 		if &user.name == username {
-			let expected = digest_response(
-				&user.name,
-				realm,
-				&user.password,
-				method,
-				uri,
-				nonce,
-				&nc,
-				&cnonce,
-				&qop,
-			);
-			if expected.eq_ignore_ascii_case(response) {
+			let expected = match qop {
+				Some(qop) => digest_response(
+					&user.name,
+					realm,
+					&user.password,
+					method,
+					uri,
+					nonce,
+					nc,
+					cnonce,
+					qop,
+				),
+				None => {
+					digest_response_no_qop(&user.name, realm, &user.password, method, uri, nonce)
+				}
+			};
+			if ct_eq(&expected, &response) {
 				return Ok(&user.name);
 			}
 		}
@@ -347,6 +368,47 @@ mod digest_tests {
 			"auth",
 		);
 		assert_eq!(resp, "8ca523f5e9506fed4657c9700eebdbec");
+	}
+
+	#[test]
+	fn digest_response_no_qop_matches_rfc2069_example() {
+		// RFC 2069 §2.4.
+		let resp = digest_response_no_qop(
+			"Mufasa",
+			"testrealm@host.com",
+			"CircleOfLife",
+			"GET",
+			"/dir/index.html",
+			"dcd98b7102dd2f0e8b11d0f600bfb0c093",
+		);
+		assert_eq!(resp, "1949323746fe6a43ef61f9606e7febea");
+	}
+
+	#[test]
+	fn verify_accepts_live555_style_no_qop_digest() {
+		// live555 (VLC, openRTSP) omits qop/nc/cnonce even when the
+		// challenge offers qop="auth". Uppercase hex must also match.
+		let users = vec![UserCred {
+			name: "alice".into(),
+			password: "wonderland".into(),
+		}];
+		let uri = "rtsp://host/cam1/main";
+		let resp = digest_response_no_qop("alice", "bairelay", "wonderland", "DESCRIBE", uri, "n1")
+			.to_ascii_uppercase();
+		let authz = format!(
+			r#"Digest username="alice", realm="bairelay", nonce="n1", uri="{uri}", response="{resp}""#
+		);
+		let got = verify_digest(&authz, "DESCRIBE", uri, &users, "bairelay", |n| n == "n1");
+		assert_eq!(got, Ok("alice"));
+	}
+
+	#[test]
+	fn verify_rejects_unsupported_qop() {
+		let authz = r#"Digest username="alice", realm="bairelay", nonce="n", uri="/", response="x", qop=auth-int, nc=00000001, cnonce="c""#;
+		assert_eq!(
+			verify_digest(authz, "OPTIONS", "/", &alice(), "bairelay", |_| true).err(),
+			Some(AuthError::Malformed)
+		);
 	}
 
 	#[test]

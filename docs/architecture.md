@@ -61,8 +61,10 @@ Pure-Rust RTSP server:
 - H.265 RTP packetisation per RFC 7798 (FU fragmentation, VPS/SPS/PPS handling).
 - AAC (RFC 3640 AU-hbr) and G.711 µ-law (RFC 3551 PT 0) audio.
 - ADPCM → G.711 transcode with 16 → 8 kHz resample.
-- TCP-interleaved transport (RTP-over-RTSP) and UDP-unicast transport.
-- Per-session keepalive watchdog; digest auth with 5 min nonce TTL + RFC 7616 §3.4 URI binding; basic auth on plain transport for drop-in compat.
+- TCP-interleaved transport (RTP-over-RTSP) and UDP-unicast transport. Client `$` frames (RTCP RR) are drained and count as session keepalive; pipelined requests are all answered. Every TCP write is capped at 5 s so a client that stops reading can't pin a session.
+- PLAY writes its response (with `RTP-Info` built from the SETUP-chosen first seq, the replayed keyframe's timestamp and each track's SETUP URL) before releasing media.
+- Unsupported methods get 501 and keep the connection; empty-body SET_PARAMETER is a keepalive.
+- Per-session keepalive watchdog; digest auth (qop=auth and RFC 2069 no-qop for live555 clients) with 5 min nonce TTL + RFC 7616 §3.4 URI binding; Basic challenge offered only over TLS (preemptive Basic on plain TCP is still verified).
 - 30 s slow-loris timer on every fresh connection (disarmed once a complete request dispatches).
 - `max_connections` semaphore (default unlimited at the crate boundary, `Some(256)` set by the binary) caps concurrent client handlers.
 - `Content-Length` capped at the request buffer maximum (64 KiB) with `checked_add` arithmetic.
