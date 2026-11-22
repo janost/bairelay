@@ -19,7 +19,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use bairelay_neolink_core::bcmedia::model::BcMedia;
 use bairelay_rtsp::url::StreamKind as RtspStreamKind;
@@ -251,50 +251,14 @@ pub(crate) fn write_meta_sidecar(
 	Ok(())
 }
 
-/// Hand-rolled UTC ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`) from a [`SystemTime`].
-///
-/// We intentionally avoid pulling in `chrono` / `time` as a direct dep for
-/// one format string. The algorithm below is the Howard Hinnant civil-date
-/// conversion (public domain): given days since 1970-01-01 it produces the
-/// civil (Y, M, D) triple without any lookup tables.
+/// UTC RFC 3339 timestamp at second precision
+/// (`2024-04-19T12:30:45Z`); empty if the year is outside 0..=9999.
 pub(crate) fn format_utc_iso8601(now: SystemTime) -> String {
-	let secs = match now.duration_since(UNIX_EPOCH) {
-		Ok(d) => d.as_secs() as i64,
-		// Before the epoch — vanishingly unlikely in practice, but don't panic.
-		Err(e) => -(e.duration().as_secs() as i64),
-	};
-
-	let days = secs.div_euclid(86_400);
-	let time_of_day = secs.rem_euclid(86_400) as u32;
-	let hour = time_of_day / 3600;
-	let minute = (time_of_day % 3600) / 60;
-	let second = time_of_day % 60;
-
-	let (year, month, day) = civil_from_days(days);
-	format!(
-		"{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-		year, month, day, hour, minute, second
-	)
-}
-
-/// Howard Hinnant's `civil_from_days`, adapted for `i64` input. Returns
-/// `(year, month, day)` with month in `1..=12` and day in `1..=31`.
-///
-/// Source: <http://howardhinnant.github.io/date_algorithms.html#civil_from_days>.
-/// The algorithm is valid for the entire proleptic Gregorian range
-/// representable by `i64` days.
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-	let z = z + 719_468;
-	let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-	let doe = (z - era * 146_097) as u32; // [0, 146096]
-	let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-	let y = yoe as i64 + era * 400;
-	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-	let mp = (5 * doy + 2) / 153; // [0, 11]
-	let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-	let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-	let y = if m <= 2 { y + 1 } else { y };
-	(y as i32, m, d)
+	let utc = time::OffsetDateTime::from(now);
+	utc.replace_nanosecond(0)
+		.unwrap_or(utc)
+		.format(&time::format_description::well_known::Rfc3339)
+		.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -307,6 +271,7 @@ mod tests {
 	use std::io::Cursor;
 	use std::sync::Arc;
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::time::UNIX_EPOCH;
 
 	fn sample_iframe() -> BcMedia {
 		BcMedia::Iframe(BcMediaIframe {
@@ -738,6 +703,9 @@ mod tests {
 		// A value with non-zero time-of-day.
 		let ts = UNIX_EPOCH + std::time::Duration::from_secs(1_713_529_845);
 		// 2024-04-19 at 12:30:45 UTC.
+		assert_eq!(format_utc_iso8601(ts), "2024-04-19T12:30:45Z");
+		// Sub-second precision is dropped.
+		let ts = ts + std::time::Duration::from_millis(500);
 		assert_eq!(format_utc_iso8601(ts), "2024-04-19T12:30:45Z");
 	}
 
