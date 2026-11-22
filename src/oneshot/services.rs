@@ -65,14 +65,15 @@ pub async fn run(cam: &dyn CameraDriver, service: Service, action: Action) -> Re
 	})
 }
 
-/// Per-RPC timeout for `run_all`'s six sequential reads. The outer
-/// `runner::OP_TIMEOUT = 30 s` covers the whole call; without an
-/// inner cap a single hung RPC consumes the entire budget and the
-/// operator gets zero partial results. 8 s × 6 = 48 s worst case,
-/// 2 s above the outer cap — runner returns ConnectionTimeout
-/// before the last RPC fires, which is fine: the operator sees a
-/// useful "5 of 6 services answered" output.
-const PER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Per-RPC timeout for `run_all`'s six sequential reads. Without it
+/// one hung RPC eats the whole `runner::OP_TIMEOUT`, which drops the
+/// op and every partial result with it. All six must fit inside that
+/// budget (checked below), so a list always comes back.
+const PER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const _: () = assert!(
+	PER_RPC_TIMEOUT.as_secs() * 6 < super::runner::OP_TIMEOUT.as_secs(),
+	"run_all's six reads must finish inside the one-shot op timeout"
+);
 
 /// Read every service in one shot. Used by `bairelay services <cam>`
 /// with no positional service argument. Each failed service becomes an
