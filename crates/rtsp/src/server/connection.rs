@@ -763,6 +763,29 @@ async fn handle_setup(
 		}
 	};
 
+	// A Session header must name a live session on this connection
+	// (454 otherwise; we must not mint a session under a client-chosen
+	// ID) set up for the same camera + stream (459: one session carries
+	// one presentation's wake lock and SDP). Checked before
+	// build_transport so a rejected SETUP binds no UDP ports.
+	let existing_session = match parsed.session.as_deref() {
+		None => None,
+		Some(sid) => {
+			let status = match state.sessions.path(sid) {
+				None => Some(rtsp_types::StatusCode::SessionNotFound),
+				Some(path) if path != resolved => {
+					Some(rtsp_types::StatusCode::AggregateOperationNotAllowed)
+				}
+				Some(_) => None,
+			};
+			if let Some(status) = status {
+				let resp = crate::rtsp::message::build_response(status, cseq, &[], None);
+				return write_response(state, &resp).await;
+			}
+			Some(sid.to_string())
+		}
+	};
+
 	// Per-track SSRC. Echoed in the Transport response (RFC 2326 §12.39)
 	// and threaded into the session task so RTP packets carry the same
 	// value the client was told about. A random SSRC per track keeps
@@ -789,14 +812,13 @@ async fn handle_setup(
 			}
 		};
 
-	let session_id = parsed.session.clone().unwrap_or_else(new_session_id);
 	let track_kind = if track_id_num == 0 {
 		TrackKind::Video
 	} else {
 		TrackKind::Audio
 	};
 
-	if state.sessions.contains(&session_id) {
+	if let Some(session_id) = existing_session {
 		// Append path: second (or later) SETUP on an existing session ID.
 		// Per RFC 7826 §13.3 a client may issue multiple SETUPs against
 		// the same session to negotiate additional tracks (video+audio).
@@ -834,9 +856,10 @@ async fn handle_setup(
 		return write_response(state, &resp).await;
 	}
 
-	// First SETUP for this session ID — subscribe to the camera (acquires
+	// First SETUP: mint the session ID, subscribe to the camera (acquires
 	// wake lock, waits for SDP to be ready) and spawn the session send
 	// loop.
+	let session_id = new_session_id();
 	let subscription = match subscribe_with_extern_fallback(
 		state,
 		&resolved.camera,
@@ -897,7 +920,12 @@ async fn handle_setup(
 	};
 	state.sessions.insert(
 		session_id.clone(),
-		crate::server::registry::SessionEntry::new(cancel, subscription, vec![first_track]),
+		crate::server::registry::SessionEntry::new(
+			cancel,
+			subscription,
+			resolved,
+			vec![first_track],
+		),
 	);
 	let session_tracks_for_task = state
 		.sessions
@@ -2191,6 +2219,40 @@ mod tests {
 		dispatch_request(&state, req.as_bytes()).await.unwrap();
 		let (head, _) = read_response(&mut client).await;
 		assert_eq!(status_of(&head), 200);
+	}
+
+	#[tokio::test]
+	async fn setup_with_unknown_session_returns_454() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 5\r\nSession: made-up\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 454);
+		assert!(
+			state.sessions.is_empty(),
+			"no session minted under a client ID"
+		);
+	}
+
+	#[tokio::test]
+	async fn setup_append_for_other_presentation_returns_459() {
+		let provider = MockProv::with_cameras(&["cam1", "cam2"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 5\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		let sid = session_of(&head);
+		for (cseq, uri) in [(6, "cam2/main"), (7, "cam1/sub")] {
+			let req = format!(
+				"SETUP rtsp://x/{uri}/trackID=1 RTSP/1.0\r\nCSeq: {cseq}\r\nSession: {sid}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n"
+			);
+			dispatch_request(&state, req.as_bytes()).await.unwrap();
+			let (head, _) = read_response(&mut client).await;
+			assert_eq!(status_of(&head), 459, "{uri}");
+		}
+		let tracks = state.sessions.tracks_arc(&sid).unwrap();
+		assert_eq!(tracks.lock().unwrap().len(), 1);
 	}
 
 	#[tokio::test]

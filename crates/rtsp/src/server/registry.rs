@@ -52,6 +52,10 @@ pub struct SessionEntry {
 	/// The opaque SDP-negotiated session controller (hands off the
 	/// `SubscriptionHandle` so its Drop can release the wake lock).
 	pub subscription: crate::provider::SubscriptionHandle,
+	/// Camera + stream the first SETUP resolved to (as requested, before
+	/// any Extern→Sub fallback). A later SETUP on this session must name
+	/// the same presentation.
+	pub path: crate::url::ResolvedPath,
 	/// Timestamp of the most recent request that referenced this session.
 	/// Used by [`SessionRegistry::sweep_expired`] to drop idle sessions so
 	/// the wake lock is released when a client disappears without sending
@@ -98,11 +102,13 @@ impl SessionEntry {
 	pub fn new(
 		cancel: CancellationToken,
 		subscription: crate::provider::SubscriptionHandle,
+		path: crate::url::ResolvedPath,
 		tracks: Vec<TrackEntry>,
 	) -> Self {
 		Self {
 			cancel,
 			subscription,
+			path,
 			last_activity: Mutex::new(Instant::now()),
 			tracks: Arc::new(Mutex::new(tracks)),
 			first_video_rtp: Arc::new(Mutex::new(None)),
@@ -201,6 +207,13 @@ impl SessionRegistry {
 			.lock()
 			.expect("registry lock poisoned")
 			.is_empty()
+	}
+
+	/// The presentation a session was set up for, or `None` if the session
+	/// is not registered.
+	pub fn path(&self, id: &str) -> Option<crate::url::ResolvedPath> {
+		let entries = self.entries.lock().expect("registry lock poisoned");
+		entries.get(id).map(|e| e.path.clone())
 	}
 
 	/// Clone the `Arc` holding the first-video-packet (seq, rtptime) slot
@@ -338,6 +351,13 @@ mod tests {
 
 	/// Minimal [`SubscriptionHandle`] stub for registry tests. The receiver
 	/// is never driven; it just needs to exist and drop cleanly.
+	fn stub_path() -> crate::url::ResolvedPath {
+		crate::url::ResolvedPath {
+			camera: "cam".into(),
+			stream: crate::url::StreamKind::Main,
+		}
+	}
+
 	fn stub_subscription() -> crate::provider::SubscriptionHandle {
 		use crate::buffer::LastFrameBuffer;
 		use crate::provider::{Frame, SubscriptionHandle};
@@ -371,7 +391,7 @@ mod tests {
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0x1234_5678,
 		};
-		let entry = SessionEntry::new(cancel, stub_subscription(), vec![track]);
+		let entry = SessionEntry::new(cancel, stub_subscription(), stub_path(), vec![track]);
 		assert_eq!(entry.tracks.lock().expect("tracks lock").len(), 1);
 		assert_eq!(
 			entry.tracks.lock().expect("tracks lock")[0].kind,
@@ -392,7 +412,7 @@ mod tests {
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xBBBB,
 		};
-		let entry = SessionEntry::new(cancel, stub_subscription(), vec![video]);
+		let entry = SessionEntry::new(cancel, stub_subscription(), stub_path(), vec![video]);
 		entry.append_track(audio);
 		let tracks = entry.tracks.lock().expect("tracks lock");
 		assert_eq!(tracks.len(), 2);
@@ -414,7 +434,12 @@ mod tests {
 	fn sweep_expired_removes_and_cancels_stale_entries() {
 		let registry = SessionRegistry::new();
 		let cancel = CancellationToken::new();
-		let entry = SessionEntry::new(cancel.clone(), stub_subscription(), vec![track()]);
+		let entry = SessionEntry::new(
+			cancel.clone(),
+			stub_subscription(),
+			stub_path(),
+			vec![track()],
+		);
 		registry.insert("sess-1".to_string(), entry);
 
 		// A zero-duration threshold means "anything at all is too old",
@@ -428,7 +453,12 @@ mod tests {
 	fn touch_all_refreshes_every_session() {
 		let registry = SessionRegistry::new();
 		for id in ["a", "b"] {
-			let entry = SessionEntry::new(CancellationToken::new(), stub_subscription(), vec![]);
+			let entry = SessionEntry::new(
+				CancellationToken::new(),
+				stub_subscription(),
+				stub_path(),
+				vec![],
+			);
 			registry.insert(id.to_string(), entry);
 		}
 		std::thread::sleep(Duration::from_millis(30));
@@ -442,7 +472,12 @@ mod tests {
 	fn sweep_expired_keeps_recent_entries() {
 		let registry = SessionRegistry::new();
 		let cancel = CancellationToken::new();
-		let entry = SessionEntry::new(cancel.clone(), stub_subscription(), vec![track()]);
+		let entry = SessionEntry::new(
+			cancel.clone(),
+			stub_subscription(),
+			stub_path(),
+			vec![track()],
+		);
 		registry.insert("sess-recent".to_string(), entry);
 
 		// Threshold far larger than any elapsed time → nothing removed.
@@ -468,11 +503,21 @@ mod tests {
 		let cancel_b = CancellationToken::new();
 		registry.insert(
 			"sess-a".to_string(),
-			SessionEntry::new(cancel_a.clone(), stub_subscription(), vec![track()]),
+			SessionEntry::new(
+				cancel_a.clone(),
+				stub_subscription(),
+				stub_path(),
+				vec![track()],
+			),
 		);
 		registry.insert(
 			"sess-b".to_string(),
-			SessionEntry::new(cancel_b.clone(), stub_subscription(), vec![track()]),
+			SessionEntry::new(
+				cancel_b.clone(),
+				stub_subscription(),
+				stub_path(),
+				vec![track()],
+			),
 		);
 		assert!(registry.contains("sess-a"));
 		assert!(registry.contains("sess-b"));
