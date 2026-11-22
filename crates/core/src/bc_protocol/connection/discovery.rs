@@ -50,6 +50,8 @@ struct ConnectResult {
 	client_id: i32,
 	camera_id: i32,
 	sid: u32,
+	/// Transaction id the handshake used.
+	tid: u32,
 	/// sigV3 login nonce from the `D2C_C_R` handshake (account cameras only).
 	nc: Option<i64>,
 	/// sigV3 ECDHE offer (`pl` line) from the handshake (account cameras only).
@@ -435,6 +437,7 @@ impl Discoverer {
 		);
 
 		let result = ConnectResult {
+			tid,
 			addr: camera_address,
 			client_id,
 			camera_id,
@@ -691,6 +694,7 @@ impl Discoverer {
 		.await?;
 
 		let result = ConnectResult {
+			tid: local_tid,
 			addr,
 			client_id: register_result.client_id,
 			sid: register_result.sid,
@@ -805,6 +809,7 @@ impl Discoverer {
 		.await?;
 
 		let result = ConnectResult {
+			tid: local_tid,
 			addr,
 			client_id: register_result.client_id,
 			sid: register_result.sid,
@@ -863,6 +868,7 @@ impl Discoverer {
 			.await?;
 
 		let result = ConnectResult {
+			tid,
 			addr: final_addr,
 			client_id: register_result.client_id,
 			sid: register_result.sid,
@@ -945,6 +951,7 @@ impl Discoverer {
 			.await?;
 
 		let result = ConnectResult {
+			tid,
 			addr: final_addr,
 			client_id: register_result.client_id,
 			sid: register_result.sid,
@@ -1188,6 +1195,7 @@ impl Discovery {
 			addr: connect_result.addr,
 			camera_id: connect_result.camera_id,
 			client_id: connect_result.client_id,
+			tid: connect_result.tid,
 		})
 	}
 
@@ -1230,6 +1238,7 @@ impl Discovery {
 			addr: connect_result.addr,
 			client_id: self.client_id,
 			camera_id: connect_result.camera_id,
+			tid: connect_result.tid,
 		})
 	}
 
@@ -1253,6 +1262,7 @@ impl Discovery {
 			addr: connect_result.addr,
 			client_id: self.client_id,
 			camera_id: connect_result.camera_id,
+			tid: connect_result.tid,
 		})
 	}
 
@@ -1273,6 +1283,7 @@ impl Discovery {
 			addr: connect_result.addr,
 			client_id: self.client_id,
 			camera_id: connect_result.camera_id,
+			tid: connect_result.tid,
 		})
 	}
 }
@@ -1525,6 +1536,7 @@ pub(crate) mod test_support {
 			addr,
 			client_id: 1,
 			camera_id: 2,
+			tid: 0,
 			nc: None,
 			pl: None,
 		}
@@ -1538,6 +1550,7 @@ pub(crate) mod test_support {
 			addr,
 			client_id: 1,
 			camera_id: 2,
+			tid: 0,
 			nc: Some(42),
 			pl: Some("V=1;P2=v3;P4=k".to_string()),
 		};

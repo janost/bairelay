@@ -58,6 +58,7 @@ impl UdpSource {
 			discovery.addr,
 			discovery.client_id,
 			discovery.camera_id,
+			discovery.tid,
 			username,
 			password,
 			debug,
@@ -65,17 +66,21 @@ impl UdpSource {
 		.await
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn new_from_socket<T: Into<String>, U: Into<String>>(
 		stream: Arc<UdpSocket>,
 		addr: SocketAddr,
 		client_id: i32,
 		camera_id: i32,
+		tid: u32,
 		username: T,
 		password: Option<U>,
 		debug: bool,
 	) -> Result<Self> {
 		let bcudp_source = BcUdpSource::new_from_socket(stream, addr).await?;
-		let payload_source = bcudp_source.into_payload_source(client_id, camera_id).await;
+		let payload_source = bcudp_source
+			.into_payload_source(client_id, camera_id, tid)
+			.await;
 		let async_read = payload_source.into_async_read().compat();
 		let codex = if debug {
 			BcCodex::new_with_debug(Credentials::new(username, password))
@@ -136,8 +141,9 @@ impl BcUdpSource {
 		self,
 		client_id: i32,
 		camera_id: i32,
+		tid: u32,
 	) -> UdpPayloadSource {
-		UdpPayloadSource::new(self, client_id, camera_id).await
+		UdpPayloadSource::new(self, client_id, camera_id, tid).await
 	}
 }
 
@@ -510,6 +516,7 @@ impl UdpPayloadInner {
 		thread_sink: ReceiverStream<Vec<u8>>,
 		client_id: i32,
 		camera_id: i32,
+		tid: u32,
 	) -> Self {
 		let mut set = JoinSet::new();
 		let camera_addr = inner.addr;
@@ -570,7 +577,7 @@ impl UdpPayloadInner {
                                         // At least I think that is what this is for.
                                         // Might also have to do this for the relay but not sure
                                         let msg = BcUdp::Discovery(UdpDiscovery {
-                                            tid: rand::random::<u8>() as u32,
+                                            tid,
                                             payload: UdpXml::C2dHb(C2dHb {
                                                     cid: thread_client_id,
                                                     did: thread_camera_id,
@@ -626,7 +633,7 @@ impl UdpPayloadInner {
 					loop {
 						thread_interval.tick().await;
 						let msg = BcUdp::Discovery(UdpDiscovery {
-							tid: rand::random::<u8>() as u32,
+							tid,
 							payload: UdpXml::C2dHb(C2dHb {
 									cid: thread_client_id,
 									did: thread_camera_id,
@@ -782,7 +789,7 @@ impl Drop for UdpPayloadInner {
 	}
 }
 impl UdpPayloadSource {
-	async fn new(inner: BcUdpSource, client_id: i32, camera_id: i32) -> Self {
+	async fn new(inner: BcUdpSource, client_id: i32, camera_id: i32, tid: u32) -> Self {
 		let (inner_sink, thread_sink) = channel(100);
 		let (thread_stream, inner_stream) = channel(100);
 
@@ -792,6 +799,7 @@ impl UdpPayloadSource {
 			ReceiverStream::new(thread_sink),
 			client_id,
 			camera_id,
+			tid,
 		);
 		let cancel_token = tokio_util::sync::CancellationToken::new();
 
@@ -1137,6 +1145,7 @@ mod tests {
 				.unwrap(),
 			client_id,
 			camera_id,
+			0,
 		)
 		.await;
 
@@ -1161,6 +1170,7 @@ mod tests {
 				server_addr,
 				1,
 				2,
+				0,
 				"admin",
 				Some("pw"),
 				false,
@@ -1184,6 +1194,7 @@ mod tests {
 				server_addr,
 				3,
 				4,
+				0,
 				"user",
 				Some("pass"),
 				true,
@@ -1206,6 +1217,7 @@ mod tests {
 			addr: server_addr,
 			client_id: 11,
 			camera_id: 22,
+			tid: 0,
 			nc: None,
 			pl: None,
 		};
@@ -1273,6 +1285,7 @@ mod tests {
 				.unwrap(),
 			client_id,
 			camera_id,
+			0,
 		)
 		.await;
 
@@ -1300,6 +1313,7 @@ mod tests {
 				.unwrap(),
 			1,
 			2,
+			0,
 		)
 		.await;
 		let encode = |pkt: BcUdp| {
@@ -1355,6 +1369,7 @@ mod tests {
 				.unwrap(),
 			1,
 			2,
+			0,
 		)
 		.await;
 		let mut codec = BcUdpCodex::new();
@@ -1440,6 +1455,7 @@ mod tests {
 				.unwrap(),
 			1,
 			2,
+			0,
 		)
 		.await;
 		let err = tokio::time::timeout(RECV_TIMEOUT + Duration::from_secs(2), psource.next())

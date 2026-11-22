@@ -33,6 +33,9 @@ pub(crate) struct DiscoveryResult {
 	addr: SocketAddr,
 	client_id: i32,
 	camera_id: i32,
+	/// Discovery transaction id; post-connect heartbeats reuse it, as
+	/// the official client does.
+	tid: u32,
 	/// sigV3 login nonce from the `D2C_C_R` handshake (account cameras only).
 	nc: Option<i64>,
 	/// sigV3 ECDHE offer (`pl` line) from the handshake (account cameras only).
