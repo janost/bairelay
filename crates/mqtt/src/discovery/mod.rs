@@ -203,15 +203,20 @@ pub struct DiscoveryDevice {
 	pub sw_version: Option<String>,
 }
 
-/// HA availability block. `payload_not_available` intentionally
-/// omitted — HA treats any other value as unavailable.
+/// HA availability keys, flattened into each entity payload as
+/// `availability` (a topic list) plus `availability_mode`.
 #[derive(Serialize, Debug, Clone)]
 pub struct DiscoveryAvailability {
+	pub availability: Vec<AvailabilityTopic>,
+	pub availability_mode: &'static str,
+}
+
+/// One entry of HA's `availability` list.
+#[derive(Serialize, Debug, Clone)]
+pub struct AvailabilityTopic {
 	pub topic: String,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub payload_available: Option<String>,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub payload_not_available: Option<String>,
+	pub payload_available: &'static str,
+	pub payload_not_available: &'static str,
 }
 
 /// Encoding hint for the HA `camera` entity's preview topic. Only
@@ -233,6 +238,7 @@ pub struct DiscoveryLight {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub state_topic: Option<String>,
@@ -251,6 +257,7 @@ pub struct DiscoveryCamera {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub topic: String,
 	pub image_encoding: Encoding,
@@ -263,6 +270,7 @@ pub struct DiscoverySwitch {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub command_topic: String,
 	pub payload_off: String,
@@ -282,6 +290,7 @@ pub struct DiscoverySelect {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub command_topic: String,
 	pub options: Vec<String>,
@@ -298,6 +307,7 @@ pub struct DiscoveryBinarySensor {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub payload_off: String,
 	pub payload_on: String,
@@ -312,6 +322,7 @@ pub struct DiscoveryEvent {
 	pub device_class: String,
 	pub icon: String,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub event_types: Vec<String>,
 	pub state_topic: String,
@@ -325,6 +336,7 @@ pub struct DiscoveryButton {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub command_topic: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -338,6 +350,7 @@ pub struct DiscoverySensor {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
+	#[serde(flatten)]
 	pub availability: DiscoveryAvailability,
 	pub state_topic: String,
 	pub state_class: String,
@@ -401,11 +414,26 @@ fn unique(prefix: &str, cam: &str, suffix: &str) -> String {
 	format!("{prefix}_{cam}_{suffix}")
 }
 
+/// An entity is available only while both the bridge (`online`, LWT
+/// `offline`) and its camera (`connected`/`disconnected`, see
+/// `StatusPublisher::publish_connection`) are up. The camera topic alone
+/// stays `connected` forever when bairelay dies without a clean
+/// shutdown; the LWT on the bridge topic covers that.
 fn availability_block(ctx: &DiscoveryContext) -> DiscoveryAvailability {
 	DiscoveryAvailability {
-		topic: format!("{}/{}/status", ctx.topic_prefix, ctx.camera_name),
-		payload_available: Some("connected".to_string()),
-		payload_not_available: None,
+		availability: vec![
+			AvailabilityTopic {
+				topic: topics::bridge_status(ctx.topic_prefix),
+				payload_available: crate::client::BRIDGE_ONLINE,
+				payload_not_available: crate::client::BRIDGE_OFFLINE,
+			},
+			AvailabilityTopic {
+				topic: topics::status(ctx.topic_prefix, ctx.camera_name),
+				payload_available: "connected",
+				payload_not_available: "disconnected",
+			},
+		],
+		availability_mode: "all",
 	}
 }
 
@@ -936,8 +964,22 @@ mod tests {
 		assert_eq!(v["device"]["model"], "Bairelay");
 		assert_eq!(v["device"]["identifiers"][0], "bairelay_frontdoor");
 		assert_eq!(v["device"]["name"], "Frontdoor");
-		assert_eq!(v["availability"]["topic"], "bairelay/frontdoor/status");
-		assert_eq!(v["availability"]["payload_available"], "connected");
+		assert_eq!(
+			v["availability"],
+			serde_json::json!([
+				{
+					"topic": "bairelay/status",
+					"payload_available": "online",
+					"payload_not_available": "offline",
+				},
+				{
+					"topic": "bairelay/frontdoor/status",
+					"payload_available": "connected",
+					"payload_not_available": "disconnected",
+				},
+			])
+		);
+		assert_eq!(v["availability_mode"], "all");
 	}
 
 	#[test]
