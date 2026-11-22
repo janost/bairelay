@@ -192,7 +192,9 @@ pub struct ClientList {
 /// It should be broadcasted to port 2018
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct D2cCr {
-	/// Called timer but not sure what it is a timer of
+	/// Called timer but not sure what it is a timer of. Some firmware
+	/// omits it; nothing reads it, so it defaults to zeros.
+	#[serde(default)]
 	pub timer: Timer,
 	/// Unknown seems to be 0 on success and -3 on fail
 	pub rsp: i32,
@@ -750,6 +752,20 @@ fn test_d2c_c_r_deser() {
 			did: 49,
 			pl: None,
 			nc: None,
+		})
+	);
+}
+
+#[test]
+fn test_d2c_c_r_without_timer() {
+	let sample = "<P2P><D2C_C_R><rsp>0</rsp><cid>5</cid><did>49</did></D2C_C_R></P2P>";
+	let b: UdpXml = UdpXml::try_parse(sample.as_bytes()).unwrap();
+	assert_matches::assert_matches!(
+		b,
+		UdpXml::D2cCr(D2cCr {
+			cid: 5,
+			did: 49,
+			..
 		})
 	);
 }

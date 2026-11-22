@@ -7,8 +7,6 @@ use crate::{Error, Result};
 use bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::xml::UdpXml;
-
 pub(crate) struct BcUdpCodex {}
 
 impl BcUdpCodex {
@@ -30,6 +28,11 @@ impl Encoder<BcUdp> for BcUdpCodex {
 	}
 }
 
+/// Each `UdpFramed` read hands this one datagram. A datagram that doesn't
+/// decode is dropped and never surfaces as an `Err`: `UdpFramed` keeps the
+/// buffer after an error and would return it forever, and the error
+/// carries no source address, so one junk packet from any LAN host would
+/// end the session or the shared discovery reader.
 impl Decoder for BcUdpCodex {
 	type Item = BcUdp;
 	type Error = Error;
@@ -40,20 +43,6 @@ impl Decoder for BcUdpCodex {
 			return Ok(None);
 		}
 		match BcUdp::deserialize(src) {
-			Ok(BcUdp::Discovery(UdpDiscovery {
-				payload: UdpXml::R2cDisc(_),
-				..
-			})) => {
-				log::trace!("   Decoding: Relay terminate");
-				Err(Error::RelayTerminate)
-			}
-			Ok(BcUdp::Discovery(UdpDiscovery {
-				payload: UdpXml::D2cDisc(_),
-				..
-			})) => {
-				log::trace!("   Decoding:Camera terminate");
-				Err(Error::CameraTerminate)
-			}
 			Ok(bc) => {
 				log::trace!("   Decoding: Ok");
 				Ok(Some(bc))
@@ -63,10 +52,23 @@ impl Decoder for BcUdpCodex {
 				Ok(None)
 			}
 			Err(e) => {
-				log::trace!("   Decoding: Err");
-				Err(e)
+				log::debug!(
+					"BcUdp: dropping undecodable datagram ({} bytes): {e:?}",
+					src.len()
+				);
+				src.clear();
+				Ok(None)
 			}
 		}
+	}
+
+	fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
+		let item = self.decode(src)?;
+		if item.is_none() && !src.is_empty() {
+			log::debug!("BcUdp: dropping truncated datagram ({} bytes)", src.len());
+			src.clear();
+		}
+		Ok(item)
 	}
 }
 
@@ -144,36 +146,36 @@ mod tests {
 	}
 
 	#[test]
-	fn decode_bad_magic_bubbles_error() {
+	fn decode_bad_magic_drops_datagram() {
 		let mut codec = BcUdpCodex::new();
 		let mut buf = BytesMut::from(&0xdeadbeefu32.to_le_bytes()[..]);
-		let result = codec.decode(&mut buf);
-		assert!(result.is_err(), "bad magic must surface an Err");
+		assert!(codec.decode(&mut buf).expect("no Err").is_none());
+		assert!(buf.is_empty(), "junk must be cleared");
 	}
 
 	#[test]
-	fn decode_r2c_disc_raises_relay_terminate() {
+	fn decode_eof_drops_truncated_datagram() {
 		let mut codec = BcUdpCodex::new();
 		let mut buf = BytesMut::new();
-		codec
-			.encode(disc(UdpXml::R2cDisc(R2cDisc { sid: 12 })), &mut buf)
-			.expect("encode");
-		match codec.decode(&mut buf) {
-			Err(Error::RelayTerminate) => {}
-			other => panic!("expected RelayTerminate, got {other:?}"),
-		}
+		buf.extend_from_slice(&0x2a87cf20u32.to_le_bytes());
+		buf.extend_from_slice(&[0u8; 4]);
+		assert!(codec.decode_eof(&mut buf).expect("no Err").is_none());
+		assert!(buf.is_empty());
 	}
 
 	#[test]
-	fn decode_d2c_disc_raises_camera_terminate() {
+	fn decode_yields_disconnects() {
 		let mut codec = BcUdpCodex::new();
-		let mut buf = BytesMut::new();
-		codec
-			.encode(disc(UdpXml::D2cDisc(D2cDisc { cid: 1, did: 2 })), &mut buf)
-			.expect("encode");
-		match codec.decode(&mut buf) {
-			Err(Error::CameraTerminate) => {}
-			other => panic!("expected CameraTerminate, got {other:?}"),
+		for payload in [
+			UdpXml::R2cDisc(R2cDisc { sid: 12 }),
+			UdpXml::D2cDisc(D2cDisc { cid: 1, did: 2 }),
+		] {
+			let mut buf = BytesMut::new();
+			codec
+				.encode(disc(payload.clone()), &mut buf)
+				.expect("encode");
+			let out = codec.decode(&mut buf).expect("decode ok").expect("some");
+			assert_eq!(out, disc(payload));
 		}
 	}
 

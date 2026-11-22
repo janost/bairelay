@@ -142,6 +142,9 @@ pub mod fuzz_api {
 	///   payload, capped at remaining input).
 	/// - tag % 4 == 3: drain_contiguous + build_send_ack — no params.
 	///
+	/// Every op also advances a synthetic clock by `(tag >> 2) * 16` ms
+	/// (0..~1 s) so the time-driven paths (receive-rate latch) run.
+	///
 	/// Input length is clamped to 8 KiB so the harness drives at most
 	/// ~1 k operations per iteration — `sent` is unbounded by design
 	/// (the camera-side ack stream shrinks it in production but the
@@ -151,10 +154,12 @@ pub mod fuzz_api {
 	pub fn flow_state_drive_arbitrary(data: &[u8]) {
 		let data = &data[..data.len().min(8 * 1024)];
 		let mut s = UdpFlowState::new(0xABCD, 0x1234);
+		let mut now = tokio::time::Instant::now();
 		let mut p = 0;
 		while p < data.len() {
 			let tag = data[p];
 			p += 1;
+			now += std::time::Duration::from_millis(u64::from(tag >> 2) * 16);
 			match tag % 4 {
 				0 => {
 					if data.len() - p < 5 {
@@ -164,11 +169,14 @@ pub mod fuzz_api {
 						u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]);
 					let payload_len = data[p + 4] as usize;
 					p += 5;
-					let _ = s.handle_data(UdpData {
-						connection_id: 0xABCD,
-						packet_id,
-						payload: vec![tag; payload_len.min(64)],
-					});
+					let _ = s.handle_data(
+						UdpData {
+							connection_id: 0xABCD,
+							packet_id,
+							payload: vec![tag; payload_len.min(64)],
+						},
+						now,
+					);
 				}
 				1 => {
 					if data.len() - p < 5 {
@@ -184,7 +192,7 @@ pub mod fuzz_api {
 						connection_id: 0x1234,
 						packet_id: pkt,
 						group_id: 0,
-						maybe_latency: 0,
+						recv_bytes_per_sec: 0,
 						payload,
 					});
 				}
@@ -199,7 +207,7 @@ pub mod fuzz_api {
 					p += take;
 				}
 				_ => {
-					let _ = s.drain_contiguous();
+					let _ = s.drain_contiguous(now);
 					let _ = s.build_send_ack();
 				}
 			}
