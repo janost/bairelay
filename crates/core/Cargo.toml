@@ -21,7 +21,6 @@ sha2 = "0.11"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 cookie-factory = "0.3"
 crc32fast = "1"
-crossbeam-channel = "0.5"
 delegate = "0.13"
 futures = "0.3"
 if-addrs = "0.15"

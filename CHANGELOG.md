@@ -14,7 +14,8 @@ Two-way audio (talk), ported from the neolink talk client:
 - talk: three-tier `TalkConfig` resolver (config table, camera `TalkAbility`, Reolink defaults)
 - talk: WAV reader, linear resampler, DVI4 IMA ADPCM encoder
 - config: `[cameras.talk_config]` table and `talk_dir`, validated by `check-config`
-- core: `bypass_ability_gate` on `talk`, `talk_stream`, `talk_ability`; fix underflow on a short last talk payload
+- core: `bypass_ability_gate` on `talk`, `talk_ability`; fix underflow on a short last talk payload
+- core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
 
 ## [1.1.2] — 2026-06-08
 
