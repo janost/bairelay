@@ -44,22 +44,6 @@ pub(crate) struct UdpSource {
 }
 
 impl UdpSource {
-	#[allow(unused)]
-	pub(crate) async fn new<T: Into<String>, U: Into<String>>(
-		addr: SocketAddr,
-		client_id: i32,
-		camera_id: i32,
-		username: T,
-		password: Option<U>,
-		debug: bool,
-	) -> Result<Self> {
-		let stream = Arc::new(connect().await?);
-
-		Self::new_from_socket(
-			stream, addr, client_id, camera_id, username, password, debug,
-		)
-		.await
-	}
 	pub(crate) async fn new_from_discovery<T: Into<String>, U: Into<String>>(
 		discovery: DiscoveryResult,
 		username: T,
@@ -104,17 +88,6 @@ impl UdpSource {
 			inner: Box::pin(framed),
 		})
 	}
-
-	// pub(crate) async fn send(&mut self, bc: Bc) -> Result<()> {
-	//     self.inner.send(bc).await
-	// }
-	// pub(crate) async fn recv(&mut self) -> Result<Bc> {
-	//     loop {
-	//         if let Some(result) = self.inner.next().await {
-	//             return result;
-	//         }
-	//     }
-	// }
 }
 
 impl Stream for UdpSource {
@@ -152,18 +125,6 @@ pub(crate) struct BcUdpSource {
 }
 
 impl BcUdpSource {
-	#[allow(unused)]
-	pub(crate) async fn new(addr: SocketAddr) -> Result<Self> {
-		let stream = Arc::new(connect().await?);
-
-		Self::new_from_socket(stream, addr).await
-	}
-
-	#[allow(unused)]
-	pub(crate) async fn new_from_discovery(discovery: DiscoveryResult) -> Result<Self> {
-		Self::new_from_socket(discovery.socket, discovery.addr).await
-	}
-
 	pub(crate) async fn new_from_socket(stream: Arc<UdpSocket>, addr: SocketAddr) -> Result<Self> {
 		Ok(Self {
 			inner: Box::pin(UdpFramed::new(stream, BcUdpCodex::new())),
@@ -207,15 +168,6 @@ impl Sink<(BcUdp, SocketAddr)> for BcUdpSource {
 			fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>>;
 		}
 	}
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-enum State {
-	Normal,   // Normal receive
-	Flushing, // Used to send ack packets and things in the buffer
-	Closed,   // Used to shutdown
-	YieldNow, // Used to ensure we rest between polling packets so as to not starve the runtime
 }
 
 /// Receive throughput reported in [`UdpAck::recv_bytes_per_sec`]. The
@@ -570,7 +522,6 @@ impl UdpPayloadInner {
 
 		let (socket_in_tx, socket_in_rx) = channel::<BcUdp>(500);
 		let (socket_out_tx, socket_out_rx) = channel::<(BcUdp, SocketAddr)>(500);
-		// let (mut socket_tx, mut socket_rx) = inner.split();
 
 		// Send/Recv on the socket
 		let send_cancel = cancel.clone();
@@ -960,20 +911,6 @@ impl futures::AsyncWrite for UdpPayloadSource {
 	}
 }
 
-/// Helper to create a UdpStream
-async fn connect() -> Result<UdpSocket> {
-	let mut ports: Vec<u16> = (53500..54000).collect();
-	ports.shuffle(&mut rand::rng());
-
-	let addrs: Vec<_> = ports
-		.iter()
-		.map(|&port| SocketAddr::from(([0, 0, 0, 0], port)))
-		.collect();
-	let socket = UdpSocket::bind(&addrs[..]).await?;
-
-	Ok(socket)
-}
-
 async fn connect_try_port(port: u16) -> Result<UdpSocket> {
 	let mut ports: Vec<u16> = (53500..54000).collect();
 	ports.shuffle(&mut rand::rng());
@@ -996,7 +933,7 @@ mod tests {
 	//! protection: every end-to-end await is wrapped in a short
 	//! `tokio::time::timeout`.
 	use super::*;
-	use crate::bcudp::xml::{C2dHb, ClientList, UdpXml};
+	use crate::bcudp::xml::{C2dHb, UdpXml};
 	use bytes::BytesMut;
 	use futures::StreamExt;
 	use std::time::Duration;
@@ -1028,17 +965,6 @@ mod tests {
 			tid: 7,
 			payload: UdpXml::C2dHb(C2dHb { cid, did }),
 		})
-	}
-
-	#[tokio::test]
-	async fn connect_binds_to_ephemeral_range() {
-		let sock = tokio::time::timeout(T, connect()).await.unwrap().unwrap();
-		let addr = sock.local_addr().unwrap();
-		assert!(
-			(53500..54000).contains(&addr.port()),
-			"port {} not in ephemeral range",
-			addr.port()
-		);
 	}
 
 	// Both tests take their port from the OS rather than a fixed number:
@@ -1105,18 +1031,6 @@ mod tests {
 			BcUdp::Ack(a) => assert_eq!(a.connection_id, 42),
 			other => panic!("expected Ack got {other:?}"),
 		}
-	}
-
-	#[tokio::test]
-	async fn bcudp_source_new_binds_socket() {
-		// Exercise the `BcUdpSource::new` constructor (the path that opens
-		// its own socket). We only need to verify it succeeds and carries
-		// the supplied addr.
-		let src = tokio::time::timeout(T, BcUdpSource::new("127.0.0.1:12345".parse().unwrap()))
-			.await
-			.unwrap()
-			.unwrap();
-		assert_eq!(src.addr.port(), 12345);
 	}
 
 	#[tokio::test]
@@ -1305,38 +1219,6 @@ mod tests {
 
 		// new_from_discovery should have turned broadcast off.
 		assert!(!sock.broadcast().unwrap());
-	}
-
-	#[tokio::test]
-	async fn udp_source_new_opens_socket_and_constructs() {
-		// Hit the `UdpSource::new` path which allocates its own socket
-		// via `connect()`.
-		let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		let server_addr = server.local_addr().unwrap();
-		let _src = tokio::time::timeout(
-			T,
-			UdpSource::new::<&str, &str>(server_addr, 5, 6, "u", None, false),
-		)
-		.await
-		.unwrap()
-		.unwrap();
-	}
-
-	#[test]
-	fn udp_payload_inner_build_send_ack_zero_packets() {
-		// With no packets received, build_send_ack returns an empty ack.
-		let _rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.unwrap();
-		// build_send_ack runs fine outside of runtime because it doesn't
-		// touch the socket, but UdpPayloadInner::new does. So we can't
-		// easily instantiate one here without the runtime helpers. This
-		// test is intentionally simple — just makes sure `UdpAck::empty`
-		// has the expected shape.
-		let empty = UdpAck::empty(5);
-		assert_eq!(empty.connection_id, 5);
-		assert!(empty.payload.is_empty());
 	}
 
 	#[tokio::test]
@@ -1600,12 +1482,6 @@ mod tests {
 			}
 			other => panic!("unexpected {other:?}"),
 		}
-	}
-
-	// Prevent unused warnings when only subsets of the helpers apply.
-	#[allow(dead_code)]
-	fn _touch_client_list() -> ClientList {
-		ClientList { port: 3000 }
 	}
 
 	// ---------- UdpFlowState pure-state tests ----------

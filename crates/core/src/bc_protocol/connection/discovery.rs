@@ -575,37 +575,6 @@ impl Discoverer {
 					{
 						Some(Ok((sid, dev, dmap, relay)))
 					}
-					// UdpDiscovery {
-					//     tid: _,
-					//     payload:
-					//         UdpXml {
-					//             r2c_c_r:
-					//                 Some(R2cCr {
-					//                     dmap,
-					//                     dev,
-					//                     relay: Some(mut relay),
-					//                     sid,
-					//                     rsp,
-					//                     ..
-					//                 }),
-					//             ..
-					//         },
-					// } if (dev
-					//     .as_ref()
-					//     .map(valid_addr)
-					//     .unwrap_or(false)
-					//     || dmap
-					//         .as_ref()
-					//         .map(valid_addr)
-					//         .unwrap_or(false)
-					//     || (relay.ip == format!("{}", socket.ip()) && relay.port == 0))
-					//     && rsp != -1 =>
-					// {
-					//     // For a relay connection if port is 0 and the ip is the current socker addr
-					//     // we use the current port
-					//     relay.port = socket.port();
-					//     Some(Ok((sid, dev, dmap, Some(relay))))
-					// }
 					UdpDiscovery {
 						tid: _,
 						payload:
@@ -1000,7 +969,6 @@ impl Discoverer {
 		self.send_and_forget(msg, register_result.reg).await?;
 
 		self.keep_alive_device(tid, &result).await;
-		// self.keep_alive_relay(tid, &result).await;
 
 		self.semaphore.close();
 		drop(permit);
@@ -1024,39 +992,6 @@ impl Discoverer {
 						let msg = BcUdp::Discovery(UdpDiscovery {
 							tid,
 							payload: UdpXml::C2dHb(C2dHb {
-									cid: client_id,
-									did: camera_id,
-								}),
-						});
-						if sender.send((msg, addr)).await.is_err() {
-							break Result::Ok(());
-						}
-					}
-				} => v,
-			}
-		});
-	}
-
-	#[allow(dead_code)] // Haven't seen this in the wild yet it is just speculation
-	async fn keep_alive_relay(&self, tid: u32, connect_result: &ConnectResult) {
-		let client_id = connect_result.client_id;
-		let camera_id = connect_result.camera_id;
-		let sid = connect_result.sid;
-		let addr = connect_result.addr;
-		let mut sender = ArcFramedSocket::new(self.socket.clone(), BcUdpCodex::new());
-		let mut interval = interval(Duration::from_secs(1));
-		let thread_cancel = self.cancel.clone();
-		self.handle.write().await.spawn(async move {
-			tokio::select! {
-				_ = thread_cancel.cancelled() => Result::Ok(()),
-				v = async {
-					loop {
-						tokio::task::yield_now().await;
-						interval.tick().await;
-						let msg = BcUdp::Discovery(UdpDiscovery {
-							tid,
-							payload: UdpXml::C2rHb(C2rHb {
-									sid,
 									cid: client_id,
 									did: camera_id,
 								}),
@@ -1244,7 +1179,6 @@ impl Discovery {
 			}
 		}
 		drop(futures);
-		// drop(discoverer_ref);
 
 		let socket = self.discoverer.get_socket().await;
 		Ok(DiscoveryResult {
