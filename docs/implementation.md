@@ -256,6 +256,7 @@ Match neolink's wire behaviour exactly:
 - **Siren.** `bc.siren()` takes no arguments. Only fire on `"on"` payload; ignore `"off"`.
 - **Wakeup.** Acquires a wake lock immediately (triggers the camera connection), then waits for the camera to actually connect before starting the countdown. 2-minute connection timeout, respects the cancellation token.
 - **Reply convention.** After every control command, publish `"OK"` or `"FAIL"` (non-retained) to the same control topic. Enables HA automations to confirm command success.
+- **Retained commands are ignored.** The broker replays a retained message on every subscribe, so a retained `control/reboot` or `control/siren` would fire on every start and reconnect. `mqtt_loop::RetainedFilter` drops every retained control/query publish and warns once per topic; clear it with `mosquitto_pub -r -n -t <topic>`.
 - **Query responses.** `query/battery` and `query/pir` serialise the full struct to XML via `quick_xml::se::to_writer` and publish to `status/battery` and `status/pir` respectively (non-retained).
 
 ---

@@ -124,6 +124,8 @@ pub enum EventAction<'a> {
 		topic: &'a str,
 		/// Raw payload bytes.
 		payload: &'a [u8],
+		/// Broker replayed a retained message rather than a live one.
+		retain: bool,
 	},
 	/// The broker just completed the CONNECT handshake. Subscribe all
 	/// cameras + re-publish HA discovery payloads where caps exist.
@@ -146,10 +148,42 @@ pub fn classify_event<'a, E>(event: &'a Result<Event, E>) -> EventAction<'a> {
 		Ok(Event::Incoming(Packet::Publish(msg))) => EventAction::Publish {
 			topic: &msg.topic,
 			payload: &msg.payload,
+			retain: msg.retain,
 		},
 		Ok(Event::Incoming(Packet::ConnAck(_))) => EventAction::ConnAck,
 		Err(_) => EventAction::LogError,
 		Ok(_) => EventAction::Ignore,
+	}
+}
+
+/// Drops retained publishes on the control/query topics. The broker
+/// replays a retained message on every subscribe, so a retained
+/// `control/reboot` would reboot the camera on every reconnect and
+/// start. Warns once per topic so the operator can clear it.
+#[derive(Debug, Default)]
+pub struct RetainedFilter {
+	warned: std::collections::HashSet<String>,
+}
+
+impl RetainedFilter {
+	/// `true` when the publish should be dispatched.
+	pub fn admit(&mut self, topic: &str, retain: bool) -> bool {
+		if !retain {
+			return true;
+		}
+		if !self.warned.contains(topic) {
+			self.warned.insert(topic.to_string());
+			tracing::warn!(
+				topic = %topic,
+				"Ignoring retained MQTT control message; clear it on the broker (publish an empty retained payload)"
+			);
+		}
+		false
+	}
+
+	#[cfg(test)]
+	fn warned_topics(&self) -> usize {
+		self.warned.len()
 	}
 }
 
@@ -391,13 +425,17 @@ pub async fn run_event_loop<S: EventSource>(
 ) {
 	let mut backoff = MqttBackoff::new();
 	let mut connack = ConnAckTask::new(shutdown);
+	let mut retained = RetainedFilter::default();
 	loop {
 		tokio::select! {
 			_ = cancel.cancelled() => break,
 			event = event_loop.poll() => {
 				match classify_event(&event) {
-					EventAction::Publish { topic, payload } => {
+					EventAction::Publish { topic, payload, retain } => {
 						backoff.reset();
+						if !retained.admit(topic, retain) {
+							continue;
+						}
 						let payload_str = String::from_utf8_lossy(payload);
 						tracing::debug!(topic = %topic, payload = %payload_str, "MQTT message received");
 						if let Some(cmd) = parse_control_message(&topic_prefix, topic, payload) {
@@ -464,12 +502,38 @@ mod tests {
 	fn classify_publish_returns_publish_action() {
 		let ev = publish_event();
 		match classify_event(&ev) {
-			EventAction::Publish { topic, payload } => {
+			EventAction::Publish {
+				topic,
+				payload,
+				retain,
+			} => {
 				assert_eq!(topic, "bairelay/cam/control/reboot");
 				assert_eq!(payload, b"1");
+				assert!(!retain);
 			}
 			_ => panic!("expected Publish action"),
 		}
+	}
+
+	#[test]
+	fn classify_publish_carries_retain_flag() {
+		let mut msg = Publish::new("bairelay/cam/control/reboot", QoS::AtLeastOnce, "1");
+		msg.retain = true;
+		let ev: Result<Event, &'static str> = Ok(Event::Incoming(Packet::Publish(msg)));
+		assert!(matches!(
+			classify_event(&ev),
+			EventAction::Publish { retain: true, .. }
+		));
+	}
+
+	#[test]
+	fn retained_filter_drops_retained_and_warns_once_per_topic() {
+		let mut f = RetainedFilter::default();
+		assert!(f.admit("bairelay/cam/control/reboot", false));
+		assert!(!f.admit("bairelay/cam/control/reboot", true));
+		assert!(!f.admit("bairelay/cam/control/reboot", true));
+		assert!(!f.admit("bairelay/cam/control/siren", true));
+		assert_eq!(f.warned_topics(), 2);
 	}
 
 	#[test]
