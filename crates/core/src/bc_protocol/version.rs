@@ -88,6 +88,7 @@ mod tests {
 		// is ever sent, so we build an empty-script mock.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.version().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}

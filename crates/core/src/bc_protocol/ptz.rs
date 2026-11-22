@@ -392,6 +392,7 @@ mod tests {
 	async fn send_ptz_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.send_ptz(Direction::Up, 1.0)
 			.await
@@ -504,6 +505,7 @@ mod tests {
 	async fn get_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_ptz_preset().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -548,6 +550,7 @@ mod tests {
 	async fn set_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.set_ptz_preset(1, "home".to_string())
 			.await
@@ -599,6 +602,7 @@ mod tests {
 	async fn moveto_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.moveto_ptz_preset(1).await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -654,6 +658,7 @@ mod tests {
 	async fn get_zoom_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_zoom().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}

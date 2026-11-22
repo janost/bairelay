@@ -632,6 +632,11 @@ impl BcCamera {
 
 	async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
 		let s: String = name.into();
+		if self.abilities.read().await.is_empty() {
+			// No AbilityInfo report (see `ability_advertised`): unknown, so
+			// let the camera answer the request itself.
+			return Ok(());
+		}
 		match self.has_ability(&s).await {
 			ReadKind::ReadWrite | ReadKind::ReadOnly => Ok(()),
 			ReadKind::None => Err(Error::MissingAbility {
@@ -643,6 +648,11 @@ impl BcCamera {
 	}
 	async fn has_ability_rw<T: Into<String>>(&self, name: T) -> Result<()> {
 		let s: String = name.into();
+		if self.abilities.read().await.is_empty() {
+			// No AbilityInfo report (see `ability_advertised`): unknown, so
+			// let the camera answer the request itself.
+			return Ok(());
+		}
 		match self.has_ability(&s).await {
 			ReadKind::ReadWrite => Ok(()),
 			ReadKind::ReadOnly => Err(Error::MissingAbility {
@@ -721,6 +731,17 @@ impl BcCamera {
 		};
 		self.abilities.write().await.insert(name.into(), kind);
 	}
+
+	/// Test-only: record an AbilityInfo report that lists nothing usable,
+	/// so gated calls fail with `MissingAbility` (an empty map, meaning no
+	/// report, lets them through).
+	#[cfg(test)]
+	pub(crate) async fn test_abilities_reported(&self) {
+		self.abilities
+			.write()
+			.await
+			.insert(String::new(), ReadKind::None);
+	}
 }
 
 /// The Baichuan library has a very peculiar behavior where it always zeros the last byte.  I
@@ -792,6 +813,17 @@ mod bccamera_helpers_tests {
 		));
 	}
 
+	/// No AbilityInfo report (account cameras get 421) means unknown:
+	/// gated calls go through to the camera.
+	#[tokio::test]
+	async fn empty_ability_map_lets_gated_calls_through() {
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.has_ability_ro("ledState").await.expect("ro unknown");
+		cam.has_ability_rw("ledState").await.expect("rw unknown");
+		assert_eq!(cam.ability_advertised("ledState").await, None);
+	}
+
 	#[tokio::test]
 	async fn test_set_ability_ro_flows_through_rw_check() {
 		// RO ability → has_ability_ro OK, has_ability_rw Err(write).
@@ -829,6 +861,7 @@ mod bccamera_helpers_tests {
 	async fn missing_ability_ro_reports_none_actual() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.has_ability_ro("absent").await.expect_err("no ability");
 		match err {
 			Error::MissingAbility { actual, .. } => assert_eq!(actual, "none"),
@@ -840,6 +873,7 @@ mod bccamera_helpers_tests {
 	async fn missing_ability_rw_reports_none_actual() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.has_ability_rw("absent").await.expect_err("no ability");
 		match err {
 			Error::MissingAbility {

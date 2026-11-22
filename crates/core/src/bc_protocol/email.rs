@@ -548,6 +548,7 @@ mod tests {
 		// the gate added 2026-05-01 actually fires.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_email().await.expect_err("must require ability");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}

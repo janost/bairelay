@@ -112,6 +112,7 @@ mod tests {
 		// not a generic protocol error.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.siren().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}

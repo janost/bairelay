@@ -435,6 +435,7 @@ mod tests {
 	async fn listen_on_motion_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.listen_on_motion().await.err().expect("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}

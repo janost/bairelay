@@ -875,6 +875,7 @@ mod tests {
 		// All four entrypoints share the same gate.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		assert!(matches!(
 			cam.talk_stop().await.unwrap_err(),
 			Error::MissingAbility { .. }

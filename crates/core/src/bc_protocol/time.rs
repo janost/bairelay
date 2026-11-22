@@ -522,6 +522,7 @@ mod tests {
 	async fn get_time_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_time().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -751,6 +752,7 @@ mod tests {
 	async fn set_time_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.set_time(OffsetDateTime::now_utc())
 			.await

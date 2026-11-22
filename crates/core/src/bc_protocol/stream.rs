@@ -464,6 +464,7 @@ mod tests {
 		// Neither `preview` RW nor `streamTable` RO present → error.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.stop_video(StreamKind::Main)
 			.await
@@ -533,6 +534,7 @@ mod tests {
 	async fn start_video_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let result = cam.start_video(StreamKind::Main, 0, false).await;
 		match result {
 			Ok(_) => panic!("should fail"),

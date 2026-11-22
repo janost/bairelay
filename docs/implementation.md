@@ -78,7 +78,7 @@ Inbound deserialisation tolerates absent fields; outbound serialisation still wr
 
 ### Error variants of note
 
-- `MissingAbility` — camera doesn't expose the feature. Maps to CLI exit code 6 ("unsupported"), distinct from a real protocol bug. Display: `camera does not support 'X': requested Y permission, has Z`.
+- `MissingAbility` — camera doesn't expose the feature. Maps to CLI exit code 6 ("unsupported"), distinct from a real protocol bug. Display: `camera does not support 'X': requested Y permission, has Z`. Raised only after the login-time `abilityInfo` report arrived. Without one (account cameras get 421) gated calls go to the camera, which answers for itself.
 - `UnintelligibleReply { reply, why }` / `UnintelligibleXml { reply, why }` — camera replied but the bytes don't parse. Display surfaces `why` (`unexpected camera reply: {why}`).
 
 ### `ptzMode = "none"` is fixed-mount, not PTZ
