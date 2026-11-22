@@ -457,9 +457,9 @@ pub mod pcap_decode_api {
 						}) = bc.body
 						{
 							if on_off == 0 {
-								self.ctx.binary_off(bc.meta.msg_num);
+								self.ctx.binary_off(bc.meta.msg_id, bc.meta.msg_num);
 							} else {
-								self.ctx.binary_on(bc.meta.msg_num);
+								self.ctx.binary_on(bc.meta.msg_id, bc.meta.msg_num);
 							}
 						}
 

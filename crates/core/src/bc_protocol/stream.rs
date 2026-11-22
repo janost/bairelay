@@ -53,24 +53,22 @@ pub struct StreamData {
 impl StreamData {
 	/// Pull data from the camera's buffer
 	/// This returns raw BcMedia packets
+	///
+	/// Frames already buffered are returned before the end of the stream.
+	/// Once the stream ends, the first call returns the task's error (or
+	/// [`Error::StreamFinished`]) and every later call `StreamFinished`.
 	pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
-		if let Some(handle) = self.handle.as_mut() {
-			if handle.is_finished() {
-				self.abort_handle.cancel();
-				handle.await??;
-				return Err(Error::StreamFinished);
-			}
-		} else {
-			self.abort_handle.cancel();
-			return Err(Error::StreamFinished);
+		// recv() yields None only after the task has dropped its sender,
+		// i.e. finished, so awaiting the handle below cannot block.
+		if let Some(data) = self.rx.recv().await {
+			return Ok(data);
 		}
-		match self.rx.recv().await {
-			Some(data) => Ok(data),
-			None => {
-				self.abort_handle.cancel();
-				Err(Error::StreamFinished)
-			}
+		self.abort_handle.cancel();
+		// take(): a JoinHandle must be awaited at most once.
+		if let Some(handle) = self.handle.take() {
+			handle.await??;
 		}
+		Err(Error::StreamFinished)
 	}
 
 	/// Attempts to gracefully shutdown this will cancel the background task and send
@@ -466,6 +464,7 @@ mod tests {
 		// Neither `preview` RW nor `streamTable` RO present → error.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.stop_video(StreamKind::Main)
 			.await
@@ -535,6 +534,7 @@ mod tests {
 	async fn start_video_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let result = cam.start_video(StreamKind::Main, 0, false).await;
 		match result {
 			Ok(_) => panic!("should fail"),
@@ -801,25 +801,18 @@ mod tests {
 			.start_video(StreamKind::Main, 4, false)
 			.await
 			.expect("start_video task spawn ok");
-		// Drain the task. Once both scripted expectations are
-		// consumed, the task either completes or the next recv
-		// blocks — either way the stop_video request was sent.
-		let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
-			while sd.get_data().await.is_ok() {}
-		})
-		.await;
-		// Confirm the spawned task has actually consumed the stop
-		// expectation by yielding until it terminates.
-		for _ in 0..100 {
-			if sd.handle.as_ref().is_some_and(|h| h.is_finished()) {
-				break;
+		// The task ends, with the handshake error, only after the stop
+		// exchange: the stop_video request was sent.
+		let err = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+			loop {
+				if let Err(e) = sd.get_data().await {
+					return e;
+				}
 			}
-			tokio::task::yield_now().await;
-		}
-		assert!(
-			sd.handle.as_ref().is_some_and(|h| h.is_finished()),
-			"task should have finished after consuming both scripted exchanges"
-		);
+		})
+		.await
+		.expect("task should finish after both scripted exchanges");
+		assert!(matches!(err, Error::UnintelligibleReply { .. }), "{err:?}");
 	}
 
 	#[tokio::test]
@@ -902,5 +895,35 @@ mod tests {
 			.await
 			.expect("did not hang");
 		assert!(matches!(res, Err(Error::StreamFinished)));
+	}
+
+	/// Buffered frames come out before the task's error, which is
+	/// reported once; later calls and Drop never re-poll the handle.
+	#[tokio::test]
+	async fn get_data_drains_then_reports_task_end_once() {
+		let (tx, rx) = channel(4);
+		let handle = task::spawn(async move {
+			for _ in 0..2 {
+				tx.send(Ok(BcMedia::Aac(BcMediaAac { data: vec![0; 8] })))
+					.await
+					.unwrap();
+			}
+			Err(Error::Other("stream task failed"))
+		});
+		while !handle.is_finished() {
+			task::yield_now().await;
+		}
+		let mut data = StreamData {
+			handle: Some(handle),
+			rx,
+			abort_handle: CancellationToken::new(),
+			rt_handle: tokio::runtime::Handle::current(),
+		};
+		for _ in 0..2 {
+			assert!(matches!(data.get_data().await, Ok(Ok(BcMedia::Aac(_)))));
+		}
+		assert!(matches!(data.get_data().await, Err(Error::Other(_))));
+		assert!(matches!(data.get_data().await, Err(Error::StreamFinished)));
+		data.shutdown().await.unwrap();
 	}
 }

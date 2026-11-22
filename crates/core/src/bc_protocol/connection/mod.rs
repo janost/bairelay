@@ -10,8 +10,6 @@ use tokio::net::UdpSocket;
 
 mod bcconn;
 mod bcsub;
-#[cfg(test)]
-mod chain;
 pub(crate) mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock;

@@ -40,9 +40,16 @@ fn bc_body<'a>(context: &BcContext, header: &BcHeader, buf: &'a [u8]) -> IResult
 		let (buf, body) = bc_modern_msg(context, header, buf)?;
 		Ok((buf, BcBody::ModernMsg(body)))
 	} else {
-		let (buf, body) = match header.msg_id {
-			MSG_ID_LOGIN => bc_legacy_login_msg(buf)?,
-			_ => (buf, LegacyMsg::UnknownMsg),
+		// Consume the whole declared body first: the legacy login is 64
+		// bytes of credentials plus 1772 bytes of padding, and any other
+		// legacy message must still be skipped or the stream desyncs.
+		let (buf, body_buf) = take(header.body_len).parse(buf)?;
+		let body = match header.msg_id {
+			MSG_ID_LOGIN => complete(bc_legacy_login_msg)
+				.parse(body_buf)
+				.map(|(_, msg)| msg)
+				.unwrap_or(LegacyMsg::UnknownMsg),
+			_ => LegacyMsg::UnknownMsg,
 		};
 		Ok((buf, BcBody::LegacyMsg(body)))
 	}
@@ -129,36 +136,38 @@ fn bc_modern_msg<'a>(
 				String::from_utf8(processed_ext_buf.to_vec()).unwrap_or("Not Text".to_string())
 			);
 		}
-		// Apply the XML parse function, but throw away the reference to decrypted in the Ok and
-		// Err case. This error-error-error thing is the same idiom Nom uses internally.
-		let parsed = Extension::try_parse(processed_ext_buf).map_err(|e| {
-			// The buffer, and the parse error that can quote it, are
-			// logged only when debugging: either can hold credentials.
-			log::error!(
-				"Unable to parse extension XML ({} bytes)",
-				processed_ext_buf.len()
-			);
-			if context.debug {
-				log::trace!("Extension buffer: {:?}", processed_ext_buf);
-				log::trace!("Extension XML error: {e:?}");
+		// A frame whose length checks passed is consumed even when its XML
+		// does not parse: failing here would end the Framed stream and take
+		// every subscriber on the connection down with it.
+		match Extension::try_parse(processed_ext_buf) {
+			Ok(parsed) => {
+				if let Extension {
+					binary_data: Some(1),
+					encrypt_len,
+					..
+				} = parsed
+				{
+					// In binary so tell the current context that we need to treat the payload as binary
+					in_binary = true;
+					encrypted_len = encrypt_len;
+				}
+				Some(parsed)
 			}
-			Err::Error(make_error(
-				buf,
-				"Unable to parse Extension XML",
-				ErrorKind::MapRes,
-			))
-		})?;
-		if let Extension {
-			binary_data: Some(1),
-			encrypt_len,
-			..
-		} = parsed
-		{
-			// In binary so tell the current context that we need to treat the payload as binary
-			in_binary = true;
-			encrypted_len = encrypt_len;
+			Err(e) => {
+				// The buffer, and the parse error that can quote it, are
+				// logged only when debugging: either can hold credentials.
+				warn!(
+					"Unable to parse extension XML: msg_id {} ({} bytes); ignoring the extension",
+					header.msg_id,
+					processed_ext_buf.len()
+				);
+				if context.debug {
+					log::trace!("Extension buffer: {:?}", processed_ext_buf);
+					log::trace!("Extension XML error: {e:?}");
+				}
+				None
+			}
 		}
-		Some(parsed)
 	} else {
 		None
 	};
@@ -198,25 +207,29 @@ fn bc_modern_msg<'a>(
 			_ => context.get_encrypted(),
 		};
 
-		let processed_payload_buf =
-			encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
-		if context.in_bin_mode.contains(&(header.msg_num)) || in_binary {
+		if context
+			.in_bin_mode
+			.contains(&(header.msg_id, header.msg_num))
+			|| in_binary
+		{
 			payload = match (context.get_encrypted(), encrypted_len) {
 				(EncryptionProtocol::FullAes(_), Some(encrypted_len)) => {
-					// `encrypted_len` is parsed from the camera's
-					// `<Extension>` XML — fully attacker-controlled.
-					// Without clamping, a hostile peer setting
-					// `<encryptLen>4294967295</encryptLen>` (or any value
-					// past the actual buffer) drives `[..n]` into a slice
-					// OOB panic that kills the camera task. Clamp to the
-					// real buffer length; legitimate camera firmware
-					// always emits `encryptLen <= ciphertext.len()`.
-					let take = (encrypted_len as usize).min(processed_payload_buf.len());
-					Some(BcPayloads::Binary(processed_payload_buf[..take].to_vec()))
+					// Only the leading `encryptLen` bytes are ciphertext; the
+					// rest of the payload is plaintext and is appended as is.
+					// `encryptLen` comes from the camera's `<Extension>` XML,
+					// so clamp it to the real buffer length rather than
+					// trusting it as a slice bound.
+					let n = (encrypted_len as usize).min(payload_buf.len());
+					let mut data =
+						encryption_protocol.decrypt(header.channel_id as u32, &payload_buf[..n]);
+					data.extend_from_slice(&payload_buf[n..]);
+					Some(BcPayloads::Binary(data))
 				}
 				_ => Some(BcPayloads::Binary(payload_buf.to_vec())),
 			};
 		} else {
+			let processed_payload_buf =
+				encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
 			// Same credential-leak concern as the Extension dump
 			// above: login replies + every authenticated control
 			// message flow through here. Demoted to `log::trace!`.
@@ -227,25 +240,26 @@ fn bc_modern_msg<'a>(
 						.unwrap_or("Not Text".to_string())
 				);
 			}
-			let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
-				// The payload, and the parse error that can quote it, are
-				// logged only when debugging: either can hold credentials
-				// or a webhook URL.
-				error!(
-					"Unable to parse payload XML: msg_id {} ({} bytes)",
-					header.msg_id,
-					processed_payload_buf.len()
-				);
-				if context.debug {
-					log::trace!("Payload XML error: {e:?}");
+			payload = match BcXml::try_parse(processed_payload_buf.as_slice()) {
+				Ok(xml) => Some(BcPayloads::BcXml(xml)),
+				Err(e) => {
+					// Hand the decrypted bytes on as binary: a caller that
+					// expects XML reports an unintelligible reply for this one
+					// request instead of the whole connection failing. The
+					// payload, and the parse error that can quote it, are
+					// logged only when debugging: either can hold credentials
+					// or a webhook URL.
+					warn!(
+						"Unable to parse payload XML: msg_id {} ({} bytes); passing it on as binary",
+						header.msg_id,
+						processed_payload_buf.len()
+					);
+					if context.debug {
+						log::trace!("Payload XML error: {e:?}");
+					}
+					Some(BcPayloads::Binary(processed_payload_buf))
 				}
-				Err::Error(make_error(
-					buf,
-					"Unable to parse Payload XML",
-					ErrorKind::MapRes,
-				))
-			})?;
-			payload = Some(BcPayloads::BcXml(xml));
+			};
 		}
 	} else {
 		payload = None;
@@ -478,7 +492,9 @@ mod tests {
 			_ => panic!(),
 		}
 
-		context.in_bin_mode.insert(msg1.meta.msg_num);
+		context
+			.in_bin_mode
+			.insert((msg1.meta.msg_id, msg1.meta.msg_num));
 		let msg2 = Bc::deserialize(&context, &mut BytesMut::from(&sample2[..])).unwrap();
 		match msg2.body {
 			BcBody::ModernMsg(ModernMsg {
@@ -623,14 +639,11 @@ mod tests {
 		);
 	}
 
-	/// Modern-class header with a payload that's not valid BcXml — the
-	/// `BcXml::try_parse` branch in `bc_modern_msg` surfaces a parse
-	/// error (Err::Error wrapped via map_err) rather than panicking.
+	/// A payload that is not valid XML is consumed and handed on as binary
+	/// so the connection survives.
 	#[test]
-	fn modern_msg_with_unparseable_payload_xml_returns_err() {
+	fn modern_msg_with_unparseable_payload_xml_becomes_binary() {
 		init();
-		// Hand-craft a 0x6414 (modern, has payload_offset) header with
-		// 5 bytes of pure non-XML payload following.
 		let payload = b"abcde";
 		let mut buf = vec![];
 		buf.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
@@ -643,34 +656,113 @@ mod tests {
 		buf.extend_from_slice(&0x6414u16.to_le_bytes()); // class
 		buf.extend_from_slice(&0u32.to_le_bytes()); // payload_offset = 0
 		buf.extend_from_slice(payload);
+		buf.extend_from_slice(b"next");
 
 		let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
-		let e = Bc::deserialize(&context, &mut BytesMut::from(&buf[..]));
-		assert!(e.is_err(), "should refuse non-XML payload");
+		let mut bytes = BytesMut::from(&buf[..]);
+		let bc = Bc::deserialize(&context, &mut bytes).expect("frame survives");
+		assert_matches!(
+			bc.body,
+			BcBody::ModernMsg(ModernMsg {
+				extension: None,
+				payload: Some(BcPayloads::Binary(b)),
+			}) if b == payload
+		);
+		assert_eq!(&bytes[..], b"next");
 	}
 
-	/// Modern-class header with non-XML extension bytes — surfaces the
-	/// `Extension::try_parse` Err branch (lines 122-126).
+	/// An extension that is not valid XML is dropped; the frame is still
+	/// consumed.
 	#[test]
-	fn modern_msg_with_unparseable_extension_xml_returns_err() {
+	fn modern_msg_with_unparseable_extension_xml_drops_extension() {
 		init();
 		let ext = b"badext";
-		let body = ext;
 		let mut buf = vec![];
 		buf.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
 		buf.extend_from_slice(&1u32.to_le_bytes());
-		buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+		buf.extend_from_slice(&(ext.len() as u32).to_le_bytes());
 		buf.push(0);
 		buf.push(0);
 		buf.extend_from_slice(&0u16.to_le_bytes());
 		buf.extend_from_slice(&200u16.to_le_bytes());
 		buf.extend_from_slice(&0x6414u16.to_le_bytes());
 		buf.extend_from_slice(&(ext.len() as u32).to_le_bytes()); // payload_offset = ext_len
-		buf.extend_from_slice(body);
+		buf.extend_from_slice(ext);
 
 		let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
-		let e = Bc::deserialize(&context, &mut BytesMut::from(&buf[..]));
-		assert!(e.is_err(), "should refuse non-XML extension");
+		let mut bytes = BytesMut::from(&buf[..]);
+		let bc = Bc::deserialize(&context, &mut bytes).expect("frame survives");
+		assert_matches!(
+			bc.body,
+			BcBody::ModernMsg(ModernMsg {
+				extension: None,
+				payload: None,
+			})
+		);
+		assert!(bytes.is_empty());
+	}
+
+	/// A legacy-class message other than login consumes its body.
+	#[test]
+	fn legacy_unknown_msg_consumes_body() {
+		init();
+		let mut buf = vec![];
+		buf.extend_from_slice(&MAGIC_HEADER.to_le_bytes());
+		buf.extend_from_slice(&3u32.to_le_bytes()); // msg_id, not login
+		buf.extend_from_slice(&4u32.to_le_bytes()); // body_len
+		buf.push(0);
+		buf.push(0);
+		buf.extend_from_slice(&0u16.to_le_bytes());
+		buf.extend_from_slice(&0u16.to_le_bytes());
+		buf.extend_from_slice(&0x6514u16.to_le_bytes());
+		buf.extend_from_slice(&[1, 2, 3, 4]);
+		buf.extend_from_slice(b"next");
+
+		let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+		let mut bytes = BytesMut::from(&buf[..]);
+		let bc = Bc::deserialize(&context, &mut bytes).expect("decodes");
+		assert_eq!(bc.body, BcBody::LegacyMsg(LegacyMsg::UnknownMsg));
+		assert_eq!(&bytes[..], b"next");
+	}
+
+	/// Under FullAes only the leading `encryptLen` bytes of a binary
+	/// payload are ciphertext; the plaintext tail must be kept.
+	#[test]
+	fn full_aes_binary_payload_keeps_plaintext_tail() {
+		init();
+		let protocol = EncryptionProtocol::full_aes([7u8; 16]);
+		let plain: Vec<u8> = (0..64u8).collect();
+		let encrypt_len = 20;
+		let mut wire = protocol.encrypt(0, &plain[..encrypt_len]);
+		wire.extend_from_slice(&plain[encrypt_len..]);
+		let bc = Bc::new(
+			BcMeta {
+				msg_id: MSG_ID_VIDEO,
+				channel_id: 0,
+				stream_type: 0,
+				response_code: 0,
+				msg_num: 5,
+				class: 0x0000,
+			},
+			Some(Extension {
+				binary_data: Some(1),
+				encrypt_len: Some(encrypt_len as u32),
+				..Default::default()
+			}),
+			Some(BcPayloads::Binary(wire)),
+		);
+		let bytes = bc.serialize(vec![], &protocol).expect("serialize ok");
+
+		let context = BcContext::new_with_encryption(protocol);
+		let decoded =
+			Bc::deserialize(&context, &mut BytesMut::from(bytes.as_slice())).expect("decode ok");
+		assert_matches!(
+			decoded.body,
+			BcBody::ModernMsg(ModernMsg {
+				payload: Some(BcPayloads::Binary(b)),
+				..
+			}) if b == plain
+		);
 	}
 
 	/// Modern message with a binary_data=1 extension and an actual
@@ -876,30 +968,30 @@ mod tests {
 		(result.is_err(), logs)
 	}
 
-	/// A payload that is not valid XML fails the message; the payload is
+	/// A payload that is not valid XML is passed on; the payload is
 	/// logged only when debugging.
 	#[test]
-	fn malformed_payload_xml_is_an_error() {
+	fn malformed_payload_xml_is_logged_without_secrets() {
 		let bytes = modern_msg_bytes(b"<HaCfg><url>http://example.com/hook/SECRET</ur");
 		assert_eq!(&bytes[PAYLOAD_OFFSET], &[0; 4]);
 		for debug in [false, true] {
 			let (failed, logs) = deserialize_logged(&bytes, debug);
-			assert!(failed, "debug={debug}");
+			assert!(!failed, "debug={debug}");
 			assert!(logs.contains("Unable to parse payload XML"), "{logs}");
 			assert_eq!(shows_secret(&logs), debug, "debug={debug}: {logs}");
 		}
 	}
 
-	/// An extension that is not valid XML fails the message; the buffer
-	/// is logged only when debugging.
+	/// An extension that is not valid XML is dropped; the buffer is
+	/// logged only when debugging.
 	#[test]
-	fn malformed_extension_xml_is_an_error() {
+	fn malformed_extension_xml_is_logged_without_secrets() {
 		let body = b"<Extension><userName>SECRET</user";
 		let mut bytes = modern_msg_bytes(body);
 		bytes[PAYLOAD_OFFSET].copy_from_slice(&(body.len() as u32).to_le_bytes());
 		for debug in [false, true] {
 			let (failed, logs) = deserialize_logged(&bytes, debug);
-			assert!(failed, "debug={debug}");
+			assert!(!failed, "debug={debug}");
 			assert!(logs.contains("Unable to parse extension XML"), "{logs}");
 			assert_eq!(shows_secret(&logs), debug, "debug={debug}: {logs}");
 		}

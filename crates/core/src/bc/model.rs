@@ -245,7 +245,10 @@ pub struct BcMeta {
 #[derive(Debug)]
 pub(crate) struct BcContext {
 	pub(crate) credentials: Credentials,
-	pub(crate) in_bin_mode: HashSet<u16>,
+	/// `(msg_id, msg_num)` pairs whose payloads are binary until the camera
+	/// sends `binaryData=0`. Cleared when we send a new request with the same
+	/// pair, since `msg_num` is a wrapping u16 and gets reused.
+	pub(crate) in_bin_mode: HashSet<(u32, u16)>,
 	pub(crate) encryption_protocol: EncryptionProtocol,
 	pub(crate) debug: bool,
 }
@@ -313,13 +316,12 @@ impl BcContext {
 		&self.encryption_protocol
 	}
 
-	pub(crate) fn binary_on(&mut self, msg_id: u16) {
-		self.in_bin_mode.insert(msg_id);
+	pub(crate) fn binary_on(&mut self, msg_id: u32, msg_num: u16) {
+		self.in_bin_mode.insert((msg_id, msg_num));
 	}
 
-	#[allow(unused)] // Used in tests
-	pub(crate) fn binary_off(&mut self, msg_id: u16) {
-		self.in_bin_mode.remove(&msg_id);
+	pub(crate) fn binary_off(&mut self, msg_id: u32, msg_num: u16) {
+		self.in_bin_mode.remove(&(msg_id, msg_num));
 	}
 
 	pub(crate) fn debug_on(&mut self) {

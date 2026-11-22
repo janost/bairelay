@@ -128,14 +128,6 @@ impl BcCamera {
 	}
 }
 
-/// Turn PIR ON or OFF
-pub enum PirState {
-	/// Turn the PIR on
-	On,
-	/// Turn the PIR off
-	Off,
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -171,6 +163,7 @@ mod tests {
 		// request is sent.
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_pirstate().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -209,6 +202,7 @@ mod tests {
 	async fn set_pirstate_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.set_pirstate(RfAlarmCfg {
 				version: "1.1".to_string(),

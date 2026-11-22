@@ -260,7 +260,9 @@ impl BcCamera {
 	/// Not sure what the units for this are, seems to be 1000 is 1x and 2000 is 2x
 	pub async fn zoom_to(&self, zoom_pos: u32) -> Result<()> {
 		let current = self.get_zoom().await?;
-		let zoom_pos = zoom_pos.clamp(current.zoom.min_pos, current.zoom.max_pos);
+		// The range is camera-supplied: `clamp` panics on min > max, so
+		// bound each side on its own (max wins on an inverted range).
+		let zoom_pos = zoom_pos.max(current.zoom.min_pos).min(current.zoom.max_pos);
 
 		self.has_ability_rw("control").await?;
 		let connection = self.get_connection();
@@ -392,6 +394,7 @@ mod tests {
 	async fn send_ptz_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.send_ptz(Direction::Up, 1.0)
 			.await
@@ -504,6 +507,7 @@ mod tests {
 	async fn get_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_ptz_preset().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -548,6 +552,7 @@ mod tests {
 	async fn set_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam
 			.set_ptz_preset(1, "home".to_string())
 			.await
@@ -599,6 +604,7 @@ mod tests {
 	async fn moveto_ptz_preset_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.moveto_ptz_preset(1).await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -654,6 +660,7 @@ mod tests {
 	async fn get_zoom_missing_ability_returns_err() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.get_zoom().await.expect_err("should fail");
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
@@ -768,5 +775,43 @@ mod tests {
 		cam.test_set_ability("control", true).await;
 		let err = cam.zoom_to(1500).await.expect_err("should fail");
 		assert!(matches!(err, Error::UnintelligibleReply { .. }));
+	}
+
+	#[tokio::test]
+	async fn zoom_to_inverted_camera_range_does_not_panic() {
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_GET_ZOOM_FOCUS)
+			.reply_with(|req| {
+				reply_200_xml(
+					req,
+					BcXml {
+						ptz_zoom_focus: Some(PtzZoomFocus {
+							version: "1.1".to_string(),
+							channel_id: 0,
+							zoom: HelperPosition {
+								cur_pos: 1500,
+								min_pos: 2000,
+								max_pos: 1000,
+							},
+							focus: HelperPosition {
+								cur_pos: 0,
+								min_pos: 0,
+								max_pos: 0,
+							},
+						}),
+						..Default::default()
+					},
+				)
+			})
+			.expect_msg(MSG_ID_SET_ZOOM_FOCUS)
+			.reply_with_xml(|req, xml| {
+				assert_eq!(xml.start_zoom_focus.as_ref().unwrap().move_pos, 1000);
+				reply_200_empty(req)
+			})
+			.build()
+			.await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_set_ability("control", true).await;
+		cam.zoom_to(1500).await.expect("ok");
 	}
 }

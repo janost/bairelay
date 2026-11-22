@@ -3,8 +3,6 @@ use crate::bcmedia::codex::BcMediaCodex;
 use crate::{Error, Result, bc::model::*, bcmedia::model::*};
 use futures::stream::{Stream, TryStreamExt};
 use std::io::{Error as IoError, Result as IoResult};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio_util::codec::FramedRead;
@@ -14,25 +12,6 @@ pub struct BcSubscription<'a> {
 	rx: ReceiverStream<Result<Bc>>,
 	msg_num: Option<u32>,
 	conn: &'a BcConnection,
-}
-
-pub struct BcStream<'a> {
-	rx: &'a mut ReceiverStream<Result<Bc>>,
-}
-
-impl Unpin for BcStream<'_> {}
-
-impl Stream for BcStream<'_> {
-	type Item = Result<Bc>;
-
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Bc>>> {
-		let mut this = self.as_mut();
-		match Pin::new(&mut this.rx).poll_next(cx) {
-			Poll::Ready(Some(bc)) => Poll::Ready(Some(bc)),
-			Poll::Ready(None) => Poll::Ready(None),
-			Poll::Pending => Poll::Pending,
-		}
-	}
 }
 
 impl<'a> BcSubscription<'a> {
@@ -90,11 +69,6 @@ impl<'a> BcSubscription<'a> {
 			}
 		}
 		bc
-	}
-
-	#[allow(unused)]
-	pub fn bc_stream(&'_ mut self) -> BcStream<'_> {
-		BcStream { rx: &mut self.rx }
 	}
 
 	pub fn payload_stream(&'_ mut self) -> impl Stream<Item = IoResult<Vec<u8>>> + '_ {
@@ -243,35 +217,5 @@ mod tests {
 			.await
 			.expect("got one");
 		assert!(first.is_err());
-	}
-
-	#[tokio::test]
-	async fn bcsub_bc_stream_forwards_messages() {
-		let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bc>>(4);
-		let mock = MockConnection::new().build().await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		let conn = cam.get_connection();
-		let mut sub = BcSubscription::new(rx, None, &conn);
-
-		let bc = Bc {
-			meta: BcMeta {
-				msg_id: 5,
-				channel_id: 0,
-				msg_num: 7,
-				stream_type: 0,
-				response_code: 200,
-				class: 0x6414,
-			},
-			body: BcBody::ModernMsg(ModernMsg::default()),
-		};
-		tx.send(Ok(bc)).await.unwrap();
-		drop(tx);
-
-		let mut stream = sub.bc_stream();
-		let first = futures::StreamExt::next(&mut stream)
-			.await
-			.expect("got one")
-			.expect("ok");
-		assert_eq!(first.meta.msg_num, 7);
 	}
 }

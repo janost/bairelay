@@ -18,7 +18,6 @@ mod battery;
 mod camera_driver;
 pub mod connection;
 mod credentials;
-mod email;
 mod errors;
 #[cfg(any(test, feature = "test-util"))]
 mod fake_camera;
@@ -32,10 +31,8 @@ mod login_authlogin;
 mod login_sigv3;
 mod logout;
 mod motion;
-mod ping;
 mod pirstate;
 mod ptz;
-mod pushinfo;
 mod reboot;
 mod resolution;
 mod services;
@@ -43,11 +40,9 @@ mod set_helpers;
 mod siren;
 mod snap;
 mod stream;
-mod stream_info;
 mod support;
 mod talk;
 mod time;
-mod uid;
 mod users;
 mod version;
 
@@ -63,9 +58,7 @@ pub use fake_camera::{FakeCalls, FakeCamera, FakeCameraBuilder};
 pub use ledstate::LightState;
 pub use login::MaxEncryption;
 pub use motion::{MotionData, MotionStatus};
-pub use pirstate::PirState;
 pub use ptz::Direction;
-pub use pushinfo::PhoneType;
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind, VideoStream};
@@ -161,20 +154,6 @@ pub struct BcCameraOpt {
 	pub cloud_refresh_token: Option<String>,
 	/// Toggle debug print of underlying data
 	pub debug: bool,
-}
-
-/// Used to choose the print format of various status messages like battery levels
-///
-/// Currently this is just the format of battery levels but if we ever got more status
-/// messages then they will also use this information
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PrintFormat {
-	/// None, don't print
-	None,
-	/// A human readable output
-	Human,
-	/// Xml formatted
-	Xml,
 }
 
 /// Type of connection to try
@@ -632,6 +611,11 @@ impl BcCamera {
 
 	async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
 		let s: String = name.into();
+		if self.abilities.read().await.is_empty() {
+			// No AbilityInfo report (see `ability_advertised`): unknown, so
+			// let the camera answer the request itself.
+			return Ok(());
+		}
 		match self.has_ability(&s).await {
 			ReadKind::ReadWrite | ReadKind::ReadOnly => Ok(()),
 			ReadKind::None => Err(Error::MissingAbility {
@@ -643,6 +627,11 @@ impl BcCamera {
 	}
 	async fn has_ability_rw<T: Into<String>>(&self, name: T) -> Result<()> {
 		let s: String = name.into();
+		if self.abilities.read().await.is_empty() {
+			// No AbilityInfo report (see `ability_advertised`): unknown, so
+			// let the camera answer the request itself.
+			return Ok(());
+		}
 		match self.has_ability(&s).await {
 			ReadKind::ReadWrite => Ok(()),
 			ReadKind::ReadOnly => Err(Error::MissingAbility {
@@ -656,13 +645,6 @@ impl BcCamera {
 				actual: "none".to_string(),
 			}),
 		}
-	}
-
-	/// Wait for all thread to finish
-	///
-	/// If an error is returned in any thread it will return the first error
-	pub async fn join(&self) -> Result<()> {
-		self.connection.join().await
 	}
 
 	/// Disconnect from the camera. This is done by sending cancel to
@@ -727,6 +709,17 @@ impl BcCamera {
 			ReadKind::ReadOnly
 		};
 		self.abilities.write().await.insert(name.into(), kind);
+	}
+
+	/// Test-only: record an AbilityInfo report that lists nothing usable,
+	/// so gated calls fail with `MissingAbility` (an empty map, meaning no
+	/// report, lets them through).
+	#[cfg(test)]
+	pub(crate) async fn test_abilities_reported(&self) {
+		self.abilities
+			.write()
+			.await
+			.insert(String::new(), ReadKind::None);
 	}
 }
 
@@ -799,6 +792,17 @@ mod bccamera_helpers_tests {
 		));
 	}
 
+	/// No AbilityInfo report (account cameras get 421) means unknown:
+	/// gated calls go through to the camera.
+	#[tokio::test]
+	async fn empty_ability_map_lets_gated_calls_through() {
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.has_ability_ro("ledState").await.expect("ro unknown");
+		cam.has_ability_rw("ledState").await.expect("rw unknown");
+		assert_eq!(cam.ability_advertised("ledState").await, None);
+	}
+
 	#[tokio::test]
 	async fn test_set_ability_ro_flows_through_rw_check() {
 		// RO ability → has_ability_ro OK, has_ability_rw Err(write).
@@ -836,6 +840,7 @@ mod bccamera_helpers_tests {
 	async fn missing_ability_ro_reports_none_actual() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.has_ability_ro("absent").await.expect_err("no ability");
 		match err {
 			Error::MissingAbility { actual, .. } => assert_eq!(actual, "none"),
@@ -847,6 +852,7 @@ mod bccamera_helpers_tests {
 	async fn missing_ability_rw_reports_none_actual() {
 		let mock = MockConnection::new().build().await;
 		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_abilities_reported().await;
 		let err = cam.has_ability_rw("absent").await.expect_err("no ability");
 		match err {
 			Error::MissingAbility {
@@ -910,16 +916,6 @@ mod bccamera_helpers_tests {
 			post, 0,
 			"shutdown left {post} tasks alive in rx JoinSet — leak / missing cancel?",
 		);
-	}
-
-	#[tokio::test]
-	async fn join_on_mock_connection_returns_ok() {
-		// Covers BcCamera::join(). After a clean shutdown the
-		// underlying task set is empty so join returns Ok.
-		let mock = MockConnection::new().build().await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.shutdown().await.expect("clean shutdown");
-		cam.join().await.expect("join returns ok after shutdown");
 	}
 
 	#[tokio::test]
@@ -1601,14 +1597,6 @@ mod bccamera_opt_tests {
 		);
 		assert!(dbg.contains("admin"), "username should still surface");
 		assert!(dbg.contains("******"), "redaction marker should surface");
-	}
-
-	#[test]
-	fn print_format_equality_and_copy() {
-		let a = PrintFormat::Human;
-		let b = a;
-		assert_eq!(a, b);
-		assert_ne!(PrintFormat::Human, PrintFormat::Xml);
 	}
 
 	#[test]

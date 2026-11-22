@@ -17,7 +17,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `BcCamera::new(&BcCameraOpt)`         | Connects via discovery. Local/direct: 2–15 s. Remote/relay registration retries 5 rounds w/ backoff, up to ~80 s for an asleep cam. |
 | `login_with_maxenc(MaxEncryption)`    | MD5 challenge-response auth.                              |
 | `logout()`                            | Concrete-only (not on `CameraDriver`); call with 5 s timeout. |
-| `get_linktype()`                      | Used for keepalive (NOT `ping()`; see "Keepalive").       |
+| `get_linktype()`                      | Used for keepalive (see "Keepalive").                     |
 | `get_support()`                       | Capability probe (PTZ, talk, etc.). Cache result.         |
 | `battery_info()`                      | Returns `BatteryInfo`. **`voltage` is i32 millivolts**, not volts. |
 | `listen_on_motion()`                  | Returns `MotionData`. `next_motion()` coalesces to the latest `MotionStatus`; `next_alarm_update()` yields every `AlarmUpdate` (motion, AI objects, doorbell press) in order. cmd 33 classification is `classify_alarm` in `bc_protocol/alarm.rs`. |
@@ -73,11 +73,13 @@ Reolink firmware routinely adds and removes XML fields between model generations
 
 Camera XML is decoded with `parse_lossy_utf8` (`crates/core/src/bc/xml.rs`): invalid UTF-8 bytes become U+FFFD before parsing, because quick-xml rejects a whole document on one bad byte and firmware can carry legacy-encoded text in fields bairelay never reads. Nesting depth is capped at quick-xml's default recursion limit of 128, on top of the `bc::de::MAX_BC_BODY_LEN` byte cap.
 
+An XML parse failure does not end the connection. `bc::de` consumes the frame, logs a warning, drops an unparseable `<Extension>` and passes an unparseable payload on as `BcPayloads::Binary`, so only the request waiting for that reply fails.
+
 Inbound deserialisation tolerates absent fields; outbound serialisation still writes the field with its current value, so there's no wire-level regression for messages we send.
 
 ### Error variants of note
 
-- `MissingAbility` — camera doesn't expose the feature. Maps to CLI exit code 6 ("unsupported"), distinct from a real protocol bug. Display: `camera does not support 'X': requested Y permission, has Z`.
+- `MissingAbility` — camera doesn't expose the feature. Maps to CLI exit code 6 ("unsupported"), distinct from a real protocol bug. Display: `camera does not support 'X': requested Y permission, has Z`. Raised only after the login-time `abilityInfo` report arrived. Without one (account cameras get 421) gated calls go to the camera, which answers for itself.
 - `UnintelligibleReply { reply, why }` / `UnintelligibleXml { reply, why }` — camera replied but the bytes don't parse. Display surfaces `why` (`unexpected camera reply: {why}`).
 
 ### `ptzMode = "none"` is fixed-mount, not PTZ
@@ -211,7 +213,7 @@ Without the separate token, per-camera teardown races the event-loop exit and hi
 
 ## Keepalive
 
-Use `BcCamera::get_linktype()`, **not** `BcCamera::ping()` — matches neolink. Some cameras return `UnintelligibleReply` for link-type queries: treat that as success (camera is alive but doesn't support the query), not failure.
+Use `BcCamera::get_linktype()`, as neolink does. Some cameras return `UnintelligibleReply` for link-type queries: treat that as success (camera is alive but doesn't support the query), not failure.
 
 Allow 5 consecutive failures before disconnecting. A single dropped packet shouldn't kill the connection. An error that means the connection itself is gone (`DroppedConnection`, `ConnectionShutdown`, `TimeoutDisconnected`, `TokioBcSendError`, `CameraTerminate`, `RelayTerminate`) disconnects on the first probe.
 

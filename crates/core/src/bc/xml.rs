@@ -448,8 +448,10 @@ pub struct LoginUser {
 }
 
 /// `<AuthInfo>` block sent on the `authType=getAccesskey` login step. The
-/// camera answers with the AES-encrypted authLogin challenge.
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+/// camera answers with the AES-encrypted authLogin challenge. Custom
+/// `Debug` redacts `auth_code`: it is a password proof, and the login
+/// path logs the request body.
+#[derive(PartialEq, Eq, Default, Deserialize, Serialize)]
 pub struct AuthInfo {
 	/// `md5(password + nonce)` truncated to 31 hex chars — the same proof
 	/// carried by the legacy `<password>` field.
@@ -469,6 +471,15 @@ pub struct AuthInfo {
 /// `getAccesskey` request (which omits it) doesn't emit `<userVer>0</…>`.
 fn is_zero_u32(v: &u32) -> bool {
 	*v == 0
+}
+
+impl std::fmt::Debug for AuthInfo {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AuthInfo")
+			.field("auth_code", &"<redacted>")
+			.field("phone_model", &self.phone_model)
+			.finish()
+	}
 }
 
 impl std::fmt::Debug for LoginUser {
@@ -2921,6 +2932,20 @@ fn login_user_debug_redacts_password() {
 		!dbg.contains("hunter2"),
 		"BcXml Debug must inherit LoginUser's redaction; got {dbg}"
 	);
+}
+
+#[test]
+fn login_user_debug_redacts_auth_code() {
+	let user = LoginUser {
+		auth_info: Some(AuthInfo {
+			auth_code: "0123456789abcdef".to_string(),
+			phone_model: None,
+		}),
+		..Default::default()
+	};
+	let dbg = format!("{user:?}");
+	assert!(!dbg.contains("0123456789abcdef"), "{dbg}");
+	assert!(dbg.contains("AuthInfo"), "{dbg}");
 }
 
 #[test]

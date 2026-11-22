@@ -69,6 +69,10 @@ impl Encoder<Bc> for BcCodex {
 			// applies only to THIS login's reply. Applied once that 200 decodes.
 			self.pending_session_aes = session_aes.map(|(k, iv)| (item.meta.msg_num, k, iv));
 		}
+		// A new request reusing this (msg_id, msg_num) after the u16 wrap
+		// starts afresh: the camera re-announces binary mode if its reply
+		// is binary, so a stale entry must not turn an XML reply into bytes.
+		self.context.binary_off(item.meta.msg_id, item.meta.msg_num);
 		// The modern login (msg_id 1) is always sent under BCEncrypt even when
 		// AES is negotiated — including the sigV3 / authLogin signed logins.
 		// The official app's `setXmlEncryptVersion(2)` only re-keys the
@@ -181,9 +185,9 @@ impl Decoder for BcCodex {
 		}) = bc.body
 		{
 			if on_off == 0 {
-				self.context.binary_off(bc.meta.msg_num);
+				self.context.binary_off(bc.meta.msg_id, bc.meta.msg_num);
 			} else {
-				self.context.binary_on(bc.meta.msg_num);
+				self.context.binary_on(bc.meta.msg_id, bc.meta.msg_num);
 			}
 		}
 
