@@ -10,6 +10,7 @@ use crate::bcudp::model::*;
 use crate::bcudp::xml::*;
 use crate::{Error, Result};
 use futures::{
+	future::FutureExt,
 	sink::SinkExt,
 	stream::{FuturesUnordered, StreamExt},
 };
@@ -1266,17 +1267,26 @@ impl Discovery {
 	//
 	// This method is best when broadcasts are not possible but we can contact the camera
 	// directly
-	#[allow(unused)]
 	pub(crate) async fn remote(
 		&self,
-		uid: &str,
+		_uid: &str,
 		reg_result: &RegisterResult,
 	) -> Result<DiscoveryResult> {
 		trace!("Start remote");
-		let connect_result = tokio::select! {
-			v = self.discoverer.client_initiated_dev(reg_result) => {v},
-			v = self.discoverer.device_initiated_dev(reg_result) => {v},
-		}?;
+		// Race only the paths the register gave us an address for, and take
+		// the first success: a path that fails fast (no `dev`) must not
+		// cancel the other.
+		let mut attempts = vec![];
+		if reg_result.dev.is_some() {
+			attempts.push(self.discoverer.client_initiated_dev(reg_result).boxed());
+		}
+		if reg_result.dmap.is_some() {
+			attempts.push(self.discoverer.device_initiated_dev(reg_result).boxed());
+		}
+		if attempts.is_empty() {
+			return Err(Error::NoDev);
+		}
+		let (connect_result, _) = futures::future::select_ok(attempts).await?;
 		trace!("connect_result: {:?}", connect_result);
 		let socket = self.discoverer.get_socket().await;
 		Ok(DiscoveryResult {
@@ -3026,19 +3036,33 @@ mod internal_tests {
 			client_id: 1,
 			sid: 0,
 		};
-		// remote runs client_initiated_dev + device_initiated_dev in a
-		// select!; with dev=None the client branch immediately errors
-		// with NoDev, and the device branch waits forever → tokio select
-		// takes NoDev.
-		let fut = discovery.remote("X", &reg);
-		tokio::pin!(fut);
-		tokio::time::advance(Duration::from_secs(30)).await;
-		let r = fut.await;
-		// select may choose NoDev or DiscoveryTimeout.
-		assert!(
-			matches!(r, Err(Error::NoDev) | Err(Error::DiscoveryTimeout)),
-			"got {r:?}"
-		);
+		// Neither dev nor dmap: no path to try.
+		let r = discovery.remote("X", &reg).await;
+		assert!(matches!(r, Err(Error::NoDev)), "got {r:?}");
+	}
+
+	#[tokio::test]
+	async fn discovery_remote_without_dev_still_takes_device_initiated_path() {
+		// Regression: client_initiated_dev fails at once without `dev`;
+		// that must not cancel the device-initiated (dmap) path.
+		let (peer, peer_addr) = scripted_peer().await;
+		let discovery = Discovery::new(false).await.unwrap();
+		let d_addr = loopback_of(&discovery.discoverer);
+		let reg = RegisterResult {
+			reg: peer_addr,
+			dev: None,
+			dmap: Some(peer_addr),
+			relay: None,
+			client_id: 500,
+			sid: 1234,
+		};
+		let camera = tokio::spawn(drive_device_initiated(peer, d_addr, "local"));
+		let res = t_timeout(Duration::from_secs(5), discovery.remote("X", &reg))
+			.await
+			.expect("remote timed out")
+			.expect("remote failed");
+		assert_eq!(res.camera_id, 7);
+		camera.await.unwrap();
 	}
 
 	#[tokio::test]
