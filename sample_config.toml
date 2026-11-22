@@ -21,8 +21,8 @@ bind = "0.0.0.0"
 # can never outlive the Baichuan session it pulls from.
 # stream_prune_grace_secs = 30
 
-# Directory that MQTT control/talk WAV paths must resolve under. Unset,
-# any regular file bairelay can read is accepted from any broker client.
+# Directory that MQTT control/talk WAV paths must lie under (absolute,
+# must exist). Unset, MQTT talk is refused; the talk CLI ignores it.
 # talk_dir = "/srv/bairelay/talk"
 
 

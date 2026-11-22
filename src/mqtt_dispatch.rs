@@ -414,9 +414,15 @@ async fn run_talk(
 	status_topic: &str,
 ) -> Result<(), crate::talk::TalkError> {
 	use crate::talk::TalkError;
+	// The payload names a host file, so MQTT talk is opt-in: without
+	// talk_dir any broker client could make bairelay open any file.
+	let talk_dir = cam
+		.config()
+		.talk_dir
+		.as_deref()
+		.ok_or(TalkError::Disabled)?;
 	let _slot = TalkSlot::claim(cam.name()).ok_or(TalkError::Busy)?;
-	let clip = crate::talk::load_clip(std::path::Path::new(path), cam.config().talk_dir.as_deref())
-		.await?;
+	let clip = crate::talk::load_clip(std::path::Path::new(path), Some(talk_dir)).await?;
 	let _guard = cam.wake_lock().acquire();
 	let bc = match cam.bc_camera() {
 		Some(bc) => bc,
@@ -583,52 +589,78 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 
-	/// `control/talk` loads the WAV, calls `talk` once, and reports
-	/// `playing` then `done` on `status/talk`.
-	#[tokio::test]
-	async fn dispatch_talk_plays_wav_and_reports_status() {
+	/// A camera handle with `talk_dir` set (or not) and a fake driver.
+	fn talk_cameras(
+		name: &str,
+		talk_dir: Option<std::path::PathBuf>,
+	) -> (HashMap<String, Arc<CameraHandle>>, StdArc<FakeCamera>) {
+		let mut cfg = minimal_camera_config(name);
+		cfg.talk_dir = talk_dir;
+		let handle = Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None));
 		let fake = FakeCameraBuilder::new()
 			.with_talk_ability(|| Ok(Default::default()))
 			.build();
-		let (cameras, fake) = test_cameras_with_fake("cam-talk", fake);
-		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
-		let wav = tempfile::NamedTempFile::new().unwrap();
-		std::fs::write(
-			wav.path(),
-			crate::talk::wav::tests::make_wav(16000, 1, &[0; 2050]),
-		)
-		.unwrap();
+		let driver: Arc<dyn CameraDriver> = fake.clone();
+		handle.set_driver_for_test(driver);
+		(HashMap::from([(name.to_string(), handle)]), fake)
+	}
 
+	async fn send_talk(
+		cameras: &HashMap<String, Arc<CameraHandle>>,
+		cam: &str,
+		path: &str,
+	) -> bairelay_mqtt::test_support::MockHandle {
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		dispatch_control(
 			ControlCommand::Talk {
-				camera: "cam-talk".to_string(),
-				path: wav.path().to_str().unwrap().to_string(),
+				camera: cam.to_string(),
+				path: path.to_string(),
 			},
-			&cameras,
+			cameras,
 			&mqtt,
 			"bairelay",
 		)
 		.await;
+		mock
+	}
+
+	fn published_on(mock: &bairelay_mqtt::test_support::MockHandle, topic: &str) -> Vec<Vec<u8>> {
+		mock.published()
+			.into_iter()
+			.filter(|(t, _, _)| t == topic)
+			.map(|(_, p, _)| p)
+			.collect()
+	}
+
+	/// `control/talk` loads the WAV, calls `talk` once, and reports
+	/// `playing` then `done` on `status/talk`.
+	#[tokio::test]
+	async fn dispatch_talk_plays_wav_and_reports_status() {
+		let dir = tempfile::tempdir().unwrap();
+		let wav = dir.path().join("a.wav");
+		std::fs::write(
+			&wav,
+			crate::talk::wav::tests::make_wav(16000, 1, &[0; 2050]),
+		)
+		.unwrap();
+		let (cameras, fake) = talk_cameras("cam-talk", Some(dir.path().to_path_buf()));
+
+		let mock = send_talk(&cameras, "cam-talk", wav.to_str().unwrap()).await;
 
 		let calls = fake.calls().talk.lock().unwrap();
 		assert_eq!(calls.len(), 1);
 		assert_eq!(calls[0].0.len(), 2 * 516);
-		let status: Vec<Vec<u8>> = mock
-			.published()
-			.into_iter()
-			.filter(|(t, _, _)| t == "bairelay/cam-talk/status/talk")
-			.map(|(_, p, _)| p)
-			.collect();
-		assert_eq!(status, vec![b"playing".to_vec(), b"done".to_vec()]);
-		assert!(
-			mock.published()
-				.iter()
-				.any(|(t, p, _)| t == "bairelay/cam-talk/control/talk" && p == b"OK")
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk/status/talk"),
+			vec![b"playing".to_vec(), b"done".to_vec()]
+		);
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk/control/talk"),
+			vec![b"OK".to_vec()]
 		);
 	}
 
-	/// With `talk_dir` set, a path outside it is refused before any
-	/// camera call and reported as `error: outside_talk_dir`.
+	/// A path outside `talk_dir` is refused before any camera call.
 	#[tokio::test]
 	async fn dispatch_talk_outside_talk_dir_reports_code() {
 		let root = tempfile::tempdir().unwrap();
@@ -640,64 +672,41 @@ mod tests {
 			crate::talk::wav::tests::make_wav(16000, 1, &[0; 4]),
 		)
 		.unwrap();
-		let mut cfg = minimal_camera_config("cam-talk-dir");
-		cfg.talk_dir = Some(allowed);
-		let handle = Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None));
-		let fake = FakeCameraBuilder::new().build();
-		let driver: Arc<dyn CameraDriver> = fake.clone();
-		handle.set_driver_for_test(driver);
-		let mut cameras = HashMap::new();
-		cameras.insert("cam-talk-dir".to_string(), handle);
-		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let (cameras, fake) = talk_cameras("cam-talk-dir", Some(allowed));
 
-		dispatch_control(
-			ControlCommand::Talk {
-				camera: "cam-talk-dir".to_string(),
-				path: outside.to_str().unwrap().to_string(),
-			},
-			&cameras,
-			&mqtt,
-			"bairelay",
-		)
-		.await;
+		let mock = send_talk(&cameras, "cam-talk-dir", outside.to_str().unwrap()).await;
 
 		assert!(fake.calls().talk.lock().unwrap().is_empty());
-		assert!(mock.published().iter().any(|(t, p, _)| {
-			t == "bairelay/cam-talk-dir/status/talk" && p == b"error: outside_talk_dir"
-		}));
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk-dir/status/talk"),
+			vec![b"error: outside_talk_dir".to_vec()]
+		);
 	}
 
-	/// A missing WAV is reported as `error: ...` without calling `talk`.
+	/// Without `talk_dir`, MQTT talk is refused outright: the file is
+	/// never opened and the camera never woken.
 	#[tokio::test]
-	async fn dispatch_talk_missing_file_reports_error() {
-		let fake = FakeCameraBuilder::new().build();
-		let (cameras, fake) = test_cameras_with_fake("cam-talk-missing", fake);
-		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
-
-		dispatch_control(
-			ControlCommand::Talk {
-				camera: "cam-talk-missing".to_string(),
-				path: "/nonexistent/bairelay-talk-xxyy.wav".to_string(),
-			},
-			&cameras,
-			&mqtt,
-			"bairelay",
+	async fn dispatch_talk_without_talk_dir_is_disabled() {
+		let wav = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(
+			wav.path(),
+			crate::talk::wav::tests::make_wav(16000, 1, &[0; 4]),
 		)
-		.await;
+		.unwrap();
+		let (cameras, fake) = talk_cameras("cam-talk-off", None);
+
+		let mock = send_talk(&cameras, "cam-talk-off", wav.path().to_str().unwrap()).await;
 
 		assert!(fake.calls().talk.lock().unwrap().is_empty());
-		let published = mock.published();
-		let status = published
-			.iter()
-			.find(|(t, _, _)| t == "bairelay/cam-talk-missing/status/talk")
-			.map(|(_, p, _)| String::from_utf8_lossy(p).into_owned())
-			.expect("status/talk published");
-		assert_eq!(status, "error: not_found");
-		assert!(
-			published
-				.iter()
-				.any(|(t, p, _)| t == "bairelay/cam-talk-missing/control/talk" && p == b"FAIL")
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk-off/status/talk"),
+			vec![b"error: disabled".to_vec()]
 		);
+		assert_eq!(
+			published_on(&mock, "bairelay/cam-talk-off/control/talk"),
+			vec![b"FAIL".to_vec()]
+		);
+		assert_eq!(cameras["cam-talk-off"].wake_lock().count(), 0);
 	}
 
 	/// `ControlCommand::Reboot` dispatches to `CameraDriver::reboot`

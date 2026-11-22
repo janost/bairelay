@@ -268,7 +268,7 @@ Match neolink's wire behaviour exactly:
 - **Wakeup.** Acquires a wake lock immediately (triggers the camera connection), then waits for the camera to actually connect before starting the countdown. 2-minute connection timeout, respects the cancellation token.
 - **Reply convention.** After every control command, publish `"OK"` or `"FAIL"` (non-retained) to the same control topic. Enables HA automations to confirm command success.
 - **Retained commands are ignored.** The broker replays a retained message on every subscribe, so a retained `control/reboot` or `control/siren` would fire on every start and reconnect. `mqtt_loop::RetainedFilter` drops every retained control/query publish and warns once per topic; clear it with `mosquitto_pub -r -n -t <topic>`.
-- **Talk.** Payload is an absolute host path to a 16-bit PCM WAV. With top-level `talk_dir`, the canonicalised path must lie under it. Status goes to `status/talk` (non-retained): `playing`, then `done` or `error: <code>` with code `not_found`, `not_a_file`, `outside_talk_dir`, `decode`, `timeout`, `busy` or `camera` — never the path or OS error text.
+- **Talk.** Payload is an absolute host path to a 16-bit PCM WAV. Refused with `disabled` unless top-level `talk_dir` is set. The path must lie under `talk_dir` by name with no `..` (`outside_talk_dir`, checked before any filesystem access); a path under it that does not canonicalise, or canonicalises outside it via a symlink, is `not_found`, so an MQTT client learns nothing about files outside `talk_dir`. Status goes to `status/talk` (non-retained): `playing`, then `done` or `error: <code>` with code `disabled`, `not_found`, `not_a_file`, `outside_talk_dir`, `decode`, `timeout`, `busy` or `camera` — never the path or OS error text.
 - **Query responses.** `query/battery` and `query/pir` serialise the full struct to XML via `quick_xml::se::to_writer` and publish to `status/battery` and `status/pir` respectively (non-retained).
 
 ---
@@ -368,6 +368,7 @@ Transient connect failures and lost sessions use the connect ladder (initial 2 s
 - `idle_disconnect`: defaults `false`. Must be explicitly enabled for battery cameras.
 - `gap_threshold_secs`: must be finite + positive.
 - `idle_disconnect_timeout_secs`: must be finite + positive.
+- `talk_dir`: absolute path to an existing directory.
 - `[cameras.talk_config]`: `audio_type = "adpcm"`, `sample_rate > 0`, `length_per_encoder >= 120` and `(length_per_encoder / 2) % 4 == 0`.
 
 ### Neolink-compat fields

@@ -120,6 +120,8 @@ pub const ABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 /// the MQTT `status/talk` topic. `Display` never includes the path.
 #[derive(Debug, thiserror::Error)]
 pub enum TalkError {
+	#[error("MQTT talk is disabled; set talk_dir to enable it")]
+	Disabled,
 	#[error("WAV file not found or not accessible")]
 	NotFound,
 	#[error("not a regular file")]
@@ -140,6 +142,7 @@ impl TalkError {
 	/// Short code published as `error: <code>` on `status/talk`.
 	pub fn code(&self) -> &'static str {
 		match self {
+			TalkError::Disabled => "disabled",
 			TalkError::NotFound => "not_found",
 			TalkError::NotAFile => "not_a_file",
 			TalkError::OutsideTalkDir => "outside_talk_dir",
@@ -162,7 +165,7 @@ pub fn check_volume(volume: f32) -> Result<()> {
 /// Load a WAV clip for `talk` and check its length, on a blocking
 /// thread under [`LOAD_TIMEOUT`]. Runs before any camera connection so
 /// a bad file never wakes the camera. With `talk_dir`, the path must
-/// canonicalise to a location under it.
+/// lie under it (see `confine`).
 pub async fn load_clip(
 	path: &std::path::Path,
 	talk_dir: Option<&std::path::Path>,
@@ -186,11 +189,7 @@ fn load_clip_blocking(
 	let resolved;
 	let path = match talk_dir {
 		Some(dir) => {
-			resolved = std::fs::canonicalize(path).map_err(|_| TalkError::NotFound)?;
-			let dir = std::fs::canonicalize(dir).map_err(|_| TalkError::OutsideTalkDir)?;
-			if !resolved.starts_with(&dir) {
-				return Err(TalkError::OutsideTalkDir);
-			}
+			resolved = confine(path, dir)?;
 			resolved.as_path()
 		}
 		None => path,
@@ -208,6 +207,32 @@ fn load_clip_blocking(
 		)));
 	}
 	Ok(clip)
+}
+
+/// Resolve `path` under `talk_dir` without telling an MQTT client
+/// anything about files outside it.
+///
+/// A path that is not under `talk_dir` by name (or has a `..`
+/// component) is `OutsideTalkDir` before any filesystem access. A path
+/// under it that does not canonicalise, or whose symlinks lead out of
+/// `talk_dir`, is `NotFound` either way, so a symlink cannot be used
+/// to probe whether its target exists.
+fn confine(
+	path: &std::path::Path,
+	talk_dir: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, TalkError> {
+	let dir = std::fs::canonicalize(talk_dir).map_err(|_| TalkError::OutsideTalkDir)?;
+	let has_parent = path
+		.components()
+		.any(|c| c == std::path::Component::ParentDir);
+	if has_parent || !(path.starts_with(talk_dir) || path.starts_with(&dir)) {
+		return Err(TalkError::OutsideTalkDir);
+	}
+	let resolved = std::fs::canonicalize(path).map_err(|_| TalkError::NotFound)?;
+	if !resolved.starts_with(&dir) {
+		return Err(TalkError::NotFound);
+	}
+	Ok(resolved)
 }
 
 /// Playback length of `clip`.
@@ -519,16 +544,33 @@ mod tests {
 		std::fs::write(&inside, &wav).unwrap();
 		std::fs::write(&outside, &wav).unwrap();
 		assert!(load_clip(&inside, Some(&allowed)).await.is_ok());
-		let err = load_clip(&outside, Some(&allowed)).await.unwrap_err();
-		assert_eq!(err.code(), "outside_talk_dir");
-		// `..` escapes are resolved before the check.
-		let sneaky = allowed.join("../b.wav");
-		let err = load_clip(&sneaky, Some(&allowed)).await.unwrap_err();
-		assert_eq!(err.code(), "outside_talk_dir");
+		// Outside talk_dir, existing or not, is the same code: no
+		// existence oracle.
+		for p in [
+			outside.clone(),
+			root.path().join("missing.wav"),
+			allowed.join("../b.wav"),
+			allowed.join("../missing.wav"),
+		] {
+			let err = load_clip(&p, Some(&allowed)).await.unwrap_err();
+			assert_eq!(err.code(), "outside_talk_dir", "{}", p.display());
+		}
 		let err = load_clip(&allowed.join("nope.wav"), Some(&allowed))
 			.await
 			.unwrap_err();
 		assert_eq!(err.code(), "not_found");
+		// A symlink out of talk_dir reports not_found whether or not
+		// its target exists.
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(root.path(), allowed.join("up")).unwrap();
+			for name in ["up/b.wav", "up/missing.wav"] {
+				let err = load_clip(&allowed.join(name), Some(&allowed))
+					.await
+					.unwrap_err();
+				assert_eq!(err.code(), "not_found", "{name}");
+			}
+		}
 		// No talk_dir: any regular file is accepted; a directory is not.
 		assert!(load_clip(&outside, None).await.is_ok());
 		let err = load_clip(root.path(), None).await.unwrap_err();

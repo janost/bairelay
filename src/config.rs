@@ -155,10 +155,9 @@ pub struct Config {
 	#[serde(default)]
 	pub cloud_password: Option<String>,
 
-	/// Directory that MQTT `control/talk` paths must resolve under (after
-	/// canonicalisation). Unset, any regular file the bairelay user can
-	/// read is accepted — anyone who can publish to the broker can then
-	/// make bairelay read it. Does not restrict the `talk` CLI.
+	/// Directory that MQTT `control/talk` paths must lie under. Unset,
+	/// MQTT talk is refused (`error: disabled`). Must be an absolute path
+	/// to an existing directory. Does not restrict the `talk` CLI.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub talk_dir: Option<std::path::PathBuf>,
 
@@ -1632,6 +1631,21 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 	}
 
+	if let Some(dir) = &config.talk_dir {
+		if !dir.is_absolute() {
+			return Err(format!(
+				"talk_dir must be an absolute path, got {}",
+				dir.display()
+			));
+		}
+		if !dir.is_dir() {
+			return Err(format!(
+				"talk_dir {} is not an existing directory",
+				dir.display()
+			));
+		}
+	}
+
 	for camera in &config.cameras {
 		if let Some(t) = &camera.talk_config {
 			validate_talk_config(t)
@@ -2139,6 +2153,29 @@ mod tests {
 			})
 			.is_ok()
 		);
+	}
+
+	#[test]
+	fn validate_talk_dir_must_be_absolute_existing_dir() {
+		let dir = tempfile::tempdir().unwrap();
+		let file = dir.path().join("f");
+		std::fs::write(&file, b"").unwrap();
+		let with = |p: &std::path::Path| Config {
+			talk_dir: Some(p.to_path_buf()),
+			..Config::default()
+		};
+		assert!(validate_config(&with(dir.path())).is_ok());
+		for bad in [
+			std::path::Path::new("relative/dir"),
+			&dir.path().join("missing"),
+			&file,
+		] {
+			assert!(
+				validate_config(&with(bad)).is_err(),
+				"{} must be rejected",
+				bad.display()
+			);
+		}
 	}
 
 	#[test]
