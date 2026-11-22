@@ -19,6 +19,14 @@ impl BcCamera {
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();
 		let mut sub_get = connection.subscribe(MSG_ID_SNAP, msg_num).await?;
+		// The JPEG chunks arrive on MSG_ID_SNAP under a msg_num the camera
+		// picks, right behind the XML reply. Install the wildcard subscriber
+		// before sending the request: the poller handles commands in order,
+		// so one added after the reply would miss every chunk queued ahead
+		// of it. The reply itself still goes to `sub_get` (an exact msg_num
+		// match wins over the wildcard), and the wildcard is upgraded to the
+		// chunks' msg_num on the first one.
+		let mut chunk_sub = connection.subscribe_to_id(MSG_ID_SNAP).await?;
 		let get = Bc {
 			meta: BcMeta {
 				msg_id: MSG_ID_SNAP,
@@ -72,22 +80,6 @@ impl BcCamera {
 		}) = msg.body
 		{
 			log::trace!("Got snap XML {} with size {}", filename, expected_size);
-			// Messages are now sent on ID 109 but not with the same message ID
-			// preumably because the camera considers it to be a new message rather
-			// than a reply
-			//
-			// This means we need to listen for the next 109 grab the message num and
-			// subscribe to it. This is what `subscribe_to_next` is for.
-			//
-			// Race-window note: install the wildcard `subscribe_to_id`
-			// subscriber BEFORE dropping the msg_num-scoped one. The
-			// camera fires its binary chunks on a fresh msg_num right
-			// after the XML reply; a `drop` → `subscribe_to_id` ordering
-			// drops every chunk that lands in between because no
-			// subscriber matches. With the wildcard installed first,
-			// chunks land on the `None` subscriber and the dispatcher's
-			// "upgrade None → Some(msg_num)" path takes over.
-			//
 			// Hard cap on the snapshot size: the loop below appends every
 			// 200-coded chunk to `result` and only terminates on a non-200
 			// response_code or connection drop. Without this cap, a buggy
@@ -100,7 +92,6 @@ impl BcCamera {
 					code: 200,
 				});
 			}
-			let mut chunk_sub = connection.subscribe_to_id(MSG_ID_SNAP).await?;
 			drop(sub_get);
 			let expected_size = expected_size as usize;
 
@@ -344,6 +335,43 @@ mod tests {
 				.expect("ok");
 		assert_eq!(bytes, vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
 		injector_task.await.ok();
+	}
+
+	/// The camera sends the chunks right behind the XML reply, before the
+	/// client has read it; none may be lost.
+	#[tokio::test]
+	async fn get_snapshot_chunks_back_to_back_with_reply() {
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_SNAP)
+			.reply_with_many(|req| {
+				vec![
+					crate::bc_protocol::connection::mock::reply_200_xml(
+						req,
+						BcXml {
+							snap: Some(Snap {
+								version: "1.1".to_string(),
+								channel_id: 0,
+								file_name: Some("snap.jpg".to_string()),
+								picture_size: Some(4),
+								..Default::default()
+							}),
+							..Default::default()
+						},
+					),
+					binary_chunk(42, 200, vec![0xDE, 0xAD]),
+					binary_chunk(42, 201, vec![0xBE, 0xEF]),
+				]
+			})
+			.build()
+			.await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_set_ability("preview", false).await;
+		let bytes =
+			tokio::time::timeout(tokio::time::Duration::from_millis(500), cam.get_snapshot())
+				.await
+				.expect("did not hang")
+				.expect("ok");
+		assert_eq!(bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
 	}
 
 	#[tokio::test]
