@@ -44,13 +44,10 @@ pub async fn control(
 	amount: u32,
 	speed: Option<u32>,
 ) -> Result<Outcome> {
-	// `BcCamera::send_ptz` takes an f32 "amount"; speed in neolink's CLI
-	// is an optional hint that scales the motion. We use `amount` as the
-	// primary argument and leave `speed` informational on the wire —
-	// matches what neolink does.
-	cam.send_ptz(direction, amount as f32)
+	let wire_speed = speed.map_or(crate::ptz::DEFAULT_SPEED, |s| s as f32);
+	crate::ptz::ptz_move(cam, direction, amount as f32, wire_speed)
 		.await
-		.context("send_ptz failed")?;
+		.context("PTZ move failed")?;
 	Ok(Outcome::PtzControl {
 		direction: direction_label(direction).into(),
 		amount,
@@ -59,10 +56,9 @@ pub async fn control(
 }
 
 pub async fn zoom(cam: &dyn CameraDriver, amount: f32) -> Result<Outcome> {
-	// `zoom_to` takes u32 zoom position. The CLI accepts a float to
-	// match neolink's interface; multiply by 1000 and clamp to a u32.
-	let pos = (amount * 1000.0).round().max(0.0) as u32;
-	cam.zoom_to(pos).await.context("zoom_to failed")?;
+	crate::ptz::zoom(cam, amount)
+		.await
+		.context("zoom_to failed")?;
 	Ok(Outcome::PtzZoom { amount })
 }
 
@@ -132,8 +128,8 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
-	async fn control_formats_direction_label() {
+	#[tokio::test(start_paused = true)]
+	async fn control_moves_at_speed_then_stops() {
 		let fake = FakeCameraBuilder::new().build();
 		let outcome = control(&*fake, Direction::Up, 2, Some(5)).await.unwrap();
 		assert_eq!(
@@ -144,12 +140,13 @@ mod tests {
 				speed: Some(5),
 			}
 		);
-		let calls = fake.calls().send_ptz.lock().unwrap();
-		assert_eq!(calls.len(), 1);
-		assert_eq!(calls[0].0, Direction::Up);
+		assert_eq!(
+			*fake.calls().send_ptz.lock().unwrap(),
+			[(Direction::Up, 5.0), (Direction::Stop, 5.0)]
+		);
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn control_all_directions_label() {
 		let fake = FakeCameraBuilder::new().build();
 		for (dir, label) in [

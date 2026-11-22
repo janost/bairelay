@@ -26,16 +26,23 @@ fn now_unix() -> i64 {
 }
 
 /// Serialise `auth` to `path` as JSON, owner-read/write only (`0600` on Unix —
-/// the trust token is a ~30-day account credential).
+/// the trust token is a ~30-day account credential). A new file is
+/// created `0600`, so the token is never readable by others, and an
+/// existing one is narrowed to `0600` before the token is written.
 pub fn write_auth(path: &Path, auth: &CloudAuth) -> std::io::Result<()> {
 	let json = serde_json::to_string_pretty(auth).map_err(std::io::Error::other)?;
-	std::fs::write(path, json)?;
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create(true).truncate(true);
+	#[cfg(unix)]
+	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+	let mut file = options.open(path)?;
 	#[cfg(unix)]
 	{
+		// `mode` only applies on create; tighten a pre-existing file too.
 		use std::os::unix::fs::PermissionsExt;
-		std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+		file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
 	}
-	Ok(())
+	file.write_all(json.as_bytes())
 }
 
 /// Read one trimmed line from stdin after printing `label`.
@@ -132,6 +139,26 @@ mod tests {
 			assert_eq!(mode & 0o777, 0o600, "trust-token file must be owner-only");
 		}
 		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn write_auth_narrows_an_existing_readable_file() {
+		use std::os::unix::fs::PermissionsExt;
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join(CLOUD_AUTH_FILE);
+		std::fs::write(&path, "old").unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+		let auth = CloudAuth {
+			account: "you@example.com".into(),
+			mfa_trust_token: Some("TRUST".into()),
+			refresh_token: None,
+			expiry_unix_s: 4_102_444_800,
+		};
+		write_auth(&path, &auth).unwrap();
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+		assert_eq!(mode & 0o777, 0o600);
+		assert!(std::fs::read_to_string(&path).unwrap().contains("TRUST"));
 	}
 
 	#[tokio::test]

@@ -23,8 +23,15 @@ pub fn classify(err: &anyhow::Error) -> i32 {
 		if cause.is::<ConfigError>() {
 			return EXIT_CONFIG;
 		}
+		if let Some(e) = cause.downcast_ref::<crate::run_support::LoadError>() {
+			return e.exit_code();
+		}
 		if let Some(core_err) = cause.downcast_ref::<CoreError>() {
 			return classify_core(core_err);
+		}
+		// A connect / login / op deadline: the camera never answered.
+		if cause.is::<tokio::time::error::Elapsed>() {
+			return EXIT_CONNECTION;
 		}
 	}
 	EXIT_UNEXPECTED
@@ -134,6 +141,18 @@ mod tests {
 			.context("while loading config")
 			.context("during bairelay startup");
 		assert_eq!(classify(&e), EXIT_CONFIG);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn classify_elapsed_deadline_is_connection() {
+		let elapsed = tokio::time::timeout(
+			std::time::Duration::from_secs(1),
+			std::future::pending::<()>(),
+		)
+		.await
+		.unwrap_err();
+		let e = anyhow::Error::new(elapsed).context("login timed out");
+		assert_eq!(classify(&e), EXIT_CONNECTION);
 	}
 
 	#[test]

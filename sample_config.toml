@@ -66,6 +66,9 @@ bind = "0.0.0.0"
 # Motion-push listener.
 # Treats the camera's TCP connect to pushx.reolink.com as a motion event.
 # Operator must redirect DNS for pushx.reolink.com to push_listener_addr.
+# The pushing camera is found by source IP: via [wake_server]'s heartbeat
+# registry when enabled, else by a camera's `address` (an IP literal, or
+# the IP its hostname last resolved to; give it a DHCP reservation).
 # [push_listener]
 # enable = false                       # opt-in
 # push_listener_addr = "0.0.0.0"       # default: wake_server bind / top-level bind
@@ -98,6 +101,7 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # max_encryption = "aes"      # none | aes | bcencrypt
 # idle_disconnect = false     # true for battery cams
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
+#                                    # every *_secs setting: at most 86400 (1 day)
 # motion_wake_hold_secs = 30  # wake-lock hold after motion stops
 # enabled = true
 # permitted_users = ["me"]

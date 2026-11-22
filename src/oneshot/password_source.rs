@@ -48,6 +48,27 @@ pub fn resolve(provided: Option<String>, prompt: &str) -> Result<String> {
 	finalize_read_password(&raw)
 }
 
+/// Resolve an omitted `users add` / `users password` password in
+/// `cmd`. The one-shot path calls this before connecting, so the
+/// blocking prompt never runs while a camera session (and its op
+/// timeout) is live.
+pub fn resolve_command(cmd: &mut crate::cli::Command) -> Result<()> {
+	use crate::cli::{Command, UserAction};
+	let (password, prompt) = match cmd {
+		Command::Users {
+			action: Some(UserAction::Add { password, .. }),
+			..
+		} => (password, PROMPT_ADD),
+		Command::Users {
+			action: Some(UserAction::Password { password, .. }),
+			..
+		} => (password, PROMPT_PASSWORD),
+		_ => return Ok(()),
+	};
+	*password = Some(resolve(password.take(), prompt)?);
+	Ok(())
+}
+
 /// Strip the trailing CR/LF that `read_line` and tty-no-echo readers
 /// leave on the input, then reject an empty result as a usage error.
 /// Extracted so the post-read transform is unit-testable without
@@ -80,6 +101,37 @@ mod tests {
 			chain.iter().any(|c| c.is::<UsageError>()),
 			"empty positional should classify as usage error"
 		);
+	}
+
+	#[test]
+	fn resolve_command_validates_a_provided_password_and_skips_other_commands() {
+		use crate::cli::{Command, OneShotArgs, UserAction};
+		let users = |action| Command::Users {
+			common: OneShotArgs {
+				camera: "cam".into(),
+			},
+			action: Some(action),
+		};
+		let mut set = users(UserAction::Password {
+			name: "bob".into(),
+			password: Some("pw".into()),
+		});
+		resolve_command(&mut set).unwrap();
+		assert!(matches!(
+			set,
+			Command::Users {
+				action: Some(UserAction::Password { password: Some(ref p), .. }),
+				..
+			} if p == "pw"
+		));
+		let mut empty = users(UserAction::Password {
+			name: "bob".into(),
+			password: Some(String::new()),
+		});
+		assert!(resolve_command(&mut empty).is_err());
+		// No password involved: nothing to prompt for.
+		resolve_command(&mut users(UserAction::List)).unwrap();
+		resolve_command(&mut Command::CheckConfig).unwrap();
 	}
 
 	// `provided = None` triggers TTY/stdin reads which are environment-

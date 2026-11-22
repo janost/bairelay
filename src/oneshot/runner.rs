@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use bairelay_neolink_core::bc_protocol::BcCamera;
 use futures::future::BoxFuture;
 use tokio::time::timeout;
@@ -21,7 +21,7 @@ use crate::oneshot::errors::InterruptedError;
 // hang in the non-retry discovery / socket-setup paths.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(100);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
-const OP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connect, run `op`, log out. Honours Ctrl+C / SIGTERM via `cancel`; on cancel
@@ -60,7 +60,8 @@ where
 			// faster and matches the comment's intent.
 			let op_result: Result<T> = match timeout(OP_TIMEOUT, op(&camera)).await {
 				Ok(inner) => inner,
-				Err(_) => Err(anyhow!("operation timed out")),
+				// Keep the `Elapsed` so it classifies as EXIT_CONNECTION.
+				Err(elapsed) => Err(anyhow::Error::new(elapsed).context("operation timed out")),
 			};
 			let _ = timeout(LOGOUT_TIMEOUT, camera.logout()).await;
 			op_result

@@ -15,7 +15,7 @@ use bairelay_neolink_core::bc_protocol::CameraDriver;
 
 use crate::cli::{Command, FloodlightState, OnOff, PtzCommand};
 use crate::cli_convert::{
-	clone_ptz_cmd, clone_service_action, clone_user_action, ptz_direction_to_core,
+	clone_service_action, clone_user_action, ptz_cmd_or_list, ptz_direction_to_core,
 	service_name_to_core,
 };
 use crate::oneshot::{
@@ -121,7 +121,7 @@ pub async fn dispatch_oneshot(
 			status_light::run(cam, set).await
 		}
 		Command::Ptz { cmd, .. } => {
-			let cmd = clone_ptz_cmd(cmd);
+			let cmd = ptz_cmd_or_list(cmd);
 			match cmd {
 				PtzCommand::Preset { preset_id } => ptz::preset(cam, preset_id).await,
 				PtzCommand::Assign { preset_id, name } => ptz::assign(cam, preset_id, name).await,
@@ -149,10 +149,9 @@ pub async fn dispatch_oneshot(
 			}
 		}
 		Command::Users { action, .. } => {
-			// `clone_user_action` resolves any omitted password via TTY
-			// prompt or stdin (see `oneshot::password_source`). That
-			// blocks the current task on stdin/getch, which is fine in
-			// the one-shot path — there's no concurrent work to starve.
+			// `run_oneshot_to` resolves an omitted password before
+			// connecting (`password_source::resolve_command`), so
+			// `clone_user_action` only validates it here.
 			let action = clone_user_action(action)?;
 			users::run(cam, action).await
 		}
@@ -487,7 +486,7 @@ mod tests {
 		assert_eq!(fake.calls().set_ptz_preset.lock().unwrap().len(), 1);
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn dispatch_ptz_control_runs_send_branch() {
 		let fake = FakeCameraBuilder::new().build();
 		let cmd = Command::Ptz {
@@ -499,7 +498,8 @@ mod tests {
 			}),
 		};
 		let _ = dispatch_oneshot(&*fake, &cmd, false).await.unwrap();
-		assert_eq!(fake.calls().send_ptz.lock().unwrap().len(), 1);
+		// The move, then the stop.
+		assert_eq!(fake.calls().send_ptz.lock().unwrap().len(), 2);
 	}
 
 	#[tokio::test]

@@ -17,6 +17,7 @@ pub mod oneshot;
 pub mod orchestrator;
 pub mod preview_overlay;
 pub mod preview_state;
+pub mod ptz;
 pub mod push_listener;
 pub mod run_support;
 pub mod shutdown_signal;

@@ -13,6 +13,11 @@
 //! registered camera's IP as a motion event, fire `status/motion=on`
 //! plus a `motion_wake_hold_secs` wake-lock, and close the socket.
 //!
+//! A camera is known by its source IP: first through the wake server's
+//! heartbeat registry, then through its address
+//! (`match_camera_by_address`), so the listener also works without
+//! the wake server.
+//!
 //! The wake-lock acquire kicks the connect loop, which uses the local
 //! BcUdp wake server to bring the camera online. Once the
 //! Baichuan session is up, the existing `motion_listener` subscribes
@@ -24,7 +29,7 @@
 //! (`wake_events::push_edge`).
 //!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
-//! the wake-server registry is treated as authentic; we have no further
+//! the wake-server registry or a camera address is treated as authentic; we have no further
 //! authentication on the TCP-accept itself (the camera's TLS handshake
 //! never completes — the cert chain is pinned to Reolink's CA). On a
 //! flat home LAN, anyone able to spoof the camera's IP can fire a fake
@@ -34,7 +39,7 @@
 //! for any future multi-tenant use.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +50,10 @@ use bairelay_mqtt::SharedMqttClient;
 use bairelay_wake_server::registry::CameraRegistry;
 
 use crate::camera::CameraHandle;
+
+/// Pause after a failed `accept`, so a persistent error (e.g. no free
+/// file descriptors) can't spin the loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Validated runtime config; the binary builds this from
 /// `[push_listener]` + the resolved bind fallback chain.
@@ -59,39 +68,9 @@ pub struct RuntimeConfig {
 	pub stale_after: Duration,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum PushListenerError {
-	#[error("push listener failed to bind to {addr}: {source}")]
-	Bind {
-		addr: SocketAddr,
-		source: std::io::Error,
-	},
-	#[error("push listener accept error: {0}")]
-	Accept(#[from] std::io::Error),
-}
-
-/// Spawn the listener; returns when the cancellation token fires or a
-/// fatal accept error occurs. Convenience wrapper that binds the socket
-/// and forwards to [`run_with_listener`]. The binary uses the pre-bind
-/// path so a port conflict fails the daemon synchronously at startup.
-pub async fn run(
-	cfg: RuntimeConfig,
-	registry: Arc<CameraRegistry>,
-	cameras: Arc<HashMap<String, Arc<CameraHandle>>>,
-	mqtt: Option<SharedMqttClient>,
-	topic_prefix: String,
-	cancel: CancellationToken,
-) -> Result<(), PushListenerError> {
-	let addr = SocketAddr::new(cfg.bind_addr, cfg.bind_port);
-	let listener = TcpListener::bind(addr)
-		.await
-		.map_err(|source| PushListenerError::Bind { addr, source })?;
-	run_with_listener(listener, cfg, registry, cameras, mqtt, topic_prefix, cancel).await
-}
-
-/// Run the accept loop against an already-bound `TcpListener`. The
-/// binary binds in `main.rs` so a startup-time bind error halts the
-/// process before any "started" log line.
+/// Run the accept loop against an already-bound `TcpListener` until
+/// `cancel` fires. The binary binds in `main.rs` so a startup-time bind
+/// error halts the process before any "started" log line.
 pub async fn run_with_listener(
 	listener: TcpListener,
 	cfg: RuntimeConfig,
@@ -100,28 +79,26 @@ pub async fn run_with_listener(
 	mqtt: Option<SharedMqttClient>,
 	topic_prefix: String,
 	cancel: CancellationToken,
-) -> Result<(), PushListenerError> {
-	tracing::info!(
-		bind_addr = %cfg.bind_addr,
-		bind_port = cfg.bind_port,
-		motion_wake_hold_secs = cfg.motion_wake_hold.as_secs_f64(),
-		"Push listener started"
-	);
-
+) {
 	loop {
 		tokio::select! {
 			_ = cancel.cancelled() => {
 				tracing::debug!("Push listener cancelled");
-				return Ok(());
+				return;
 			}
 			accept = listener.accept() => {
 				match accept {
 					Ok((sock, peer)) => {
 						drop(sock);
-						handle_push(peer.ip(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
+						// A `::` bind sees IPv4 cameras as `::ffff:a.b.c.d`;
+						// camera lookups compare the plain form.
+						handle_push(peer.ip().to_canonical(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
 					}
 					Err(e) => {
 						tracing::warn!(error = %e, "push listener accept failed");
+						if !crate::run_support::sleep_or_cancel(ACCEPT_ERROR_BACKOFF, &cancel).await {
+							return;
+						}
 					}
 				}
 			}
@@ -142,19 +119,21 @@ fn handle_push(
 	cfg: &RuntimeConfig,
 	cancel: &CancellationToken,
 ) {
-	let Some((registry_uid, _entry)) =
-		registry.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
-	else {
-		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP — no registry match");
-		return;
-	};
-
-	let Some(handle) = match_camera_by_uid(cameras, &registry_uid) else {
-		tracing::debug!(
-			peer_ip = %peer_ip,
-			registry_uid = %registry_uid,
-			"push matched registry UID but no camera handle has a matching configured UID"
-		);
+	let by_registry = registry
+		.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
+		.and_then(|(registry_uid, _entry)| {
+			let handle = match_camera_by_uid(cameras, &registry_uid);
+			if handle.is_none() {
+				tracing::debug!(
+					peer_ip = %peer_ip,
+					registry_uid = %registry_uid,
+					"push matched registry UID but no camera handle has a matching configured UID"
+				);
+			}
+			handle
+		});
+	let Some(handle) = by_registry.or_else(|| match_camera_by_address(cameras, peer_ip)) else {
+		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP; no registry or address match");
 		return;
 	};
 
@@ -202,6 +181,24 @@ pub(crate) fn match_camera_by_uid<'a>(
 		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
 }
 
+/// The camera at `peer_ip`, by the address its last direct session
+/// used ([`CameraHandle::camera_ip`]) or its literal configured
+/// `address` ([`CameraHandle::configured_ip`]). Two cameras at one IP
+/// are ambiguous, so neither matches.
+pub(crate) fn match_camera_by_address(
+	cameras: &HashMap<String, Arc<CameraHandle>>,
+	peer_ip: IpAddr,
+) -> Option<&Arc<CameraHandle>> {
+	let mut matches = cameras.values().filter(|h| {
+		[h.camera_ip(), h.configured_ip()]
+			.into_iter()
+			.flatten()
+			.any(|ip| ip.to_canonical() == peer_ip)
+	});
+	let first = matches.next()?;
+	matches.next().is_none().then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -214,6 +211,152 @@ mod tests {
 		let mut cfg = minimal_camera_config(name);
 		cfg.uid = uid.map(str::to_string);
 		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	fn handle_with_address(name: &str, address: Option<&str>) -> Arc<CameraHandle> {
+		let mut cfg = minimal_camera_config(name);
+		cfg.address = address.map(str::to_string);
+		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	#[test]
+	fn match_by_address_uses_the_literal_configured_ip() {
+		let cameras = HashMap::from([
+			(
+				"front".into(),
+				handle_with_address("front", Some("192.168.1.20:9000")),
+			),
+			(
+				"back".into(),
+				handle_with_address("back", Some("192.168.1.21")),
+			),
+			(
+				"named".into(),
+				handle_with_address("named", Some("cam.local:9000")),
+			),
+		]);
+		let at =
+			|ip: &str| match_camera_by_address(&cameras, ip.parse().unwrap()).map(|h| h.name());
+		assert_eq!(at("192.168.1.20"), Some("front"));
+		assert_eq!(at("192.168.1.21"), Some("back"));
+		assert_eq!(at("192.168.1.22"), None);
+	}
+
+	#[test]
+	fn match_by_address_uses_the_last_session_ip() {
+		// A hostname or UID camera is known by the IP it was last reached at.
+		let named = handle_with_address("named", Some("cam.local:9000"));
+		let cameras = HashMap::from([("named".into(), Arc::clone(&named))]);
+		let ip: IpAddr = "192.168.1.30".parse().unwrap();
+		assert!(match_camera_by_address(&cameras, ip).is_none());
+		named.set_camera_ip_for_test(ip);
+		assert_eq!(
+			match_camera_by_address(&cameras, ip).map(|h| h.name()),
+			Some("named")
+		);
+	}
+
+	#[test]
+	fn match_by_address_refuses_an_ambiguous_ip() {
+		let cameras = HashMap::from([
+			("a".into(), handle_with_address("a", Some("192.168.1.20"))),
+			(
+				"b".into(),
+				handle_with_address("b", Some("192.168.1.20:9000")),
+			),
+		]);
+		assert!(match_camera_by_address(&cameras, "192.168.1.20".parse().unwrap()).is_none());
+	}
+
+	/// Run the listener on `listener` with a mock MQTT client.
+	fn spawn_listener(
+		listener: TcpListener,
+		registry: Arc<CameraRegistry>,
+		cameras: HashMap<String, Arc<CameraHandle>>,
+		hold: Duration,
+	) -> (
+		bairelay_mqtt::test_support::MockHandle,
+		CancellationToken,
+		tokio::task::JoinHandle<()>,
+	) {
+		let local = listener.local_addr().unwrap();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: local.ip(),
+			bind_port: local.port(),
+			motion_wake_hold: hold,
+			stale_after: Duration::from_secs(80),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			registry,
+			Arc::new(cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+		(mock, cancel, server)
+	}
+
+	#[tokio::test]
+	async fn push_matches_by_address_without_a_registry_entry() {
+		// Wake server off: the registry stays empty and the camera is
+		// found by its configured IP.
+		let handle = handle_with_address("porch", Some("127.0.0.1:9000"));
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mock, cancel, server) = spawn_listener(
+			listener,
+			bairelay_wake_server::make_registry(),
+			HashMap::from([("porch".into(), Arc::clone(&handle))]),
+			Duration::from_secs(5),
+		);
+		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/porch/status/motion" && p == b"on"
+		})
+		.await;
+		assert!(saw_on, "{:?}", mock.published_topics());
+		assert_eq!(handle.wake_lock().count(), 1);
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	#[tokio::test]
+	async fn dual_stack_bind_matches_an_ipv4_camera() {
+		// A `::` bind reports an IPv4 peer as `::ffff:127.0.0.1`.
+		let Ok(listener) = TcpListener::bind("[::]:0").await else {
+			return; // no IPv6 on this host
+		};
+		let port = listener.local_addr().unwrap().port();
+		let registry = bairelay_wake_server::make_registry();
+		registry.upsert(
+			"DUALUID01234",
+			"127.0.0.1:55006".parse().unwrap(),
+			0x0BAD_F00D,
+			Instant::now(),
+		);
+		let handle = handle_with_uid("dual", Some("DUALUID0"));
+		let (mock, cancel, server) = spawn_listener(
+			listener,
+			registry,
+			HashMap::from([("dual".into(), Arc::clone(&handle))]),
+			Duration::from_secs(5),
+		);
+		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/dual/status/motion" && p == b"on"
+		})
+		.await;
+		assert!(saw_on, "{:?}", mock.published_topics());
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 	}
 
 	#[test]
@@ -319,69 +462,10 @@ mod tests {
 		});
 		tokio::time::sleep(Duration::from_millis(20)).await;
 		cancel.cancel();
-		let res = tokio::time::timeout(Duration::from_secs(2), task)
+		tokio::time::timeout(Duration::from_secs(2), task)
 			.await
 			.expect("task joined within deadline")
 			.expect("task panic-free");
-		assert!(res.is_ok(), "graceful cancel must return Ok, got {res:?}");
-	}
-
-	#[tokio::test]
-	async fn run_returns_on_cancel() {
-		let registry = bairelay_wake_server::make_registry();
-		let cameras: Arc<HashMap<String, Arc<CameraHandle>>> = Arc::new(HashMap::new());
-		let cancel = CancellationToken::new();
-		let cfg = RuntimeConfig {
-			bind_addr: "127.0.0.1".parse().unwrap(),
-			bind_port: 0, // ephemeral
-			motion_wake_hold: Duration::from_millis(10),
-			stale_after: Duration::from_secs(80),
-		};
-		let cancel_clone = cancel.clone();
-		let task = tokio::spawn(async move {
-			run(
-				cfg,
-				registry,
-				cameras,
-				None,
-				"bairelay".into(),
-				cancel_clone,
-			)
-			.await
-		});
-		// Give the listener a moment to bind, then cancel.
-		tokio::time::sleep(Duration::from_millis(20)).await;
-		cancel.cancel();
-		let res = tokio::time::timeout(Duration::from_secs(2), task)
-			.await
-			.expect("task joined within deadline")
-			.expect("task panic-free");
-		assert!(res.is_ok(), "graceful cancel must return Ok, got {res:?}");
-	}
-
-	#[tokio::test]
-	async fn bind_error_surfaces_addr_and_source() {
-		// Bind 127.0.0.1:0 once to grab a port, then try to bind it
-		// again from the listener — expect a Bind error with the
-		// occupied port surfaced.
-		let squatter = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let port = squatter.local_addr().unwrap().port();
-		let registry = bairelay_wake_server::make_registry();
-		let cameras: Arc<HashMap<String, Arc<CameraHandle>>> = Arc::new(HashMap::new());
-		let cancel = CancellationToken::new();
-		let cfg = RuntimeConfig {
-			bind_addr: "127.0.0.1".parse().unwrap(),
-			bind_port: port,
-			motion_wake_hold: Duration::from_millis(10),
-			stale_after: Duration::from_secs(80),
-		};
-		let err = run(cfg, registry, cameras, None, "bairelay".into(), cancel)
-			.await
-			.expect_err("port is taken; bind must fail");
-		match err {
-			PushListenerError::Bind { addr, .. } => assert_eq!(addr.port(), port),
-			other => panic!("expected Bind, got {other:?}"),
-		}
 	}
 
 	#[tokio::test]
@@ -402,9 +486,8 @@ mod tests {
 		cameras.insert("nomqtt".into(), Arc::clone(&handle));
 		let cameras = Arc::new(cameras);
 
-		let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let port = probe.local_addr().unwrap().port();
-		drop(probe);
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
 
 		let cancel = CancellationToken::new();
 		let cfg = RuntimeConfig {
@@ -415,7 +498,8 @@ mod tests {
 		};
 		let cancel_for_run = cancel.clone();
 		let server = tokio::spawn(async move {
-			run(
+			run_with_listener(
+				listener,
 				cfg,
 				registry,
 				cameras,
@@ -426,7 +510,6 @@ mod tests {
 			.await
 		});
 
-		tokio::time::sleep(Duration::from_millis(30)).await;
 		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
 			.await
 			.expect("connect");
@@ -471,9 +554,8 @@ mod tests {
 		cameras.insert("bravo_cam".into(), Arc::clone(&bravo));
 		let cameras = Arc::new(cameras);
 
-		let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let port = probe.local_addr().unwrap().port();
-		drop(probe);
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
 
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cancel = CancellationToken::new();
@@ -487,7 +569,8 @@ mod tests {
 		let registry_for_run = Arc::clone(&registry);
 		let cameras_for_run = Arc::clone(&cameras);
 		let server = tokio::spawn(async move {
-			run(
+			run_with_listener(
+				listener,
 				cfg,
 				registry_for_run,
 				cameras_for_run,
@@ -498,8 +581,6 @@ mod tests {
 			.await
 		});
 
-		// Wait for bind, then connect — same shape as the happy path.
-		tokio::time::sleep(Duration::from_millis(30)).await;
 		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
 			.await
 			.expect("connect");
@@ -545,10 +626,8 @@ mod tests {
 		cameras.insert("front".into(), Arc::clone(&handle));
 		let cameras = Arc::new(cameras);
 
-		// Pre-bind to learn a free port, then close so the listener can claim it.
-		let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let port = probe.local_addr().unwrap().port();
-		drop(probe);
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
 
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cancel = CancellationToken::new();
@@ -562,7 +641,8 @@ mod tests {
 		let registry_for_run = Arc::clone(&registry);
 		let cameras_for_run = Arc::clone(&cameras);
 		let server = tokio::spawn(async move {
-			run(
+			run_with_listener(
+				listener,
 				cfg,
 				registry_for_run,
 				cameras_for_run,
@@ -573,9 +653,7 @@ mod tests {
 			.await
 		});
 
-		// Wait for bind, then connect (and immediately close like the
-		// camera does after our cert is rejected).
-		tokio::time::sleep(Duration::from_millis(30)).await;
+		// Connect and close, like the camera after our cert is rejected.
 		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
 			.await
 			.expect("connect");

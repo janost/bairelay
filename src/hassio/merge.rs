@@ -13,22 +13,23 @@ pub fn parse_overlay(toml_src: &str) -> Result<Config, String> {
 	// - A `[[cameras]]` entry that overrides one field but doesn't restate
 	//   `username` — inject `username = ""`. The merge logic preserves
 	//   the base's username when the overlay's is empty.
-	let mut doc: toml::Value =
+	//
+	// Syntax errors carry a line and column from parsing the text; the
+	// edited table has no spans, so field errors name the key only.
+	let mut table: toml::Table =
 		toml::from_str(toml_src).map_err(|e| format!("overlay parse error: {e}"))?;
-	if let Some(table) = doc.as_table_mut() {
-		table
-			.entry("cameras")
-			.or_insert_with(|| toml::Value::Array(Vec::new()));
-		if let Some(toml::Value::Array(cams)) = table.get_mut("cameras") {
-			for cam in cams {
-				if let Some(t) = cam.as_table_mut() {
-					t.entry("username")
-						.or_insert_with(|| toml::Value::String(String::new()));
-				}
+	table
+		.entry("cameras")
+		.or_insert_with(|| toml::Value::Array(Vec::new()));
+	if let Some(toml::Value::Array(cams)) = table.get_mut("cameras") {
+		for cam in cams {
+			if let Some(t) = cam.as_table_mut() {
+				t.entry("username")
+					.or_insert_with(|| toml::Value::String(String::new()));
 			}
 		}
 	}
-	doc.try_into()
+	<Config as serde::Deserialize>::deserialize(table)
 		.map_err(|e| format!("overlay parse error: {e}"))
 }
 

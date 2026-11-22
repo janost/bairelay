@@ -19,9 +19,7 @@ use bairelay::mqtt_loop::{
 	resolve_topic_prefix, run_event_loop,
 };
 use bairelay::orchestrator::Orchestrator;
-use bairelay::run_support::{
-	bind_service_listener, camera_names, load_validated_config, resolve_bind_ip,
-};
+use bairelay::run_support::{bind_service_listener, camera_names, load_config, resolve_bind_ip};
 use bairelay::watchdog::Watchdog;
 
 /// Concurrent-RTSP-connection cap. Picked an order of magnitude above
@@ -112,7 +110,7 @@ async fn async_main() -> Result<()> {
 
 	// Load, parse, and validate the config file.
 	let config_path = cli.config_path();
-	let config = load_validated_config(config_path)?;
+	let config = load_config(config_path)?;
 
 	// Emit one-line migration warnings for deprecated neolink
 	// `[cameras.pause]` fields kept only for smooth upgrades.
@@ -584,8 +582,9 @@ async fn async_main() -> Result<()> {
 			let mqtt_for_pl = orchestrator.mqtt_client().cloned();
 			let prefix_for_pl = orchestrator.topic_prefix().to_string();
 			let bind_port_log = pl_block.push_listener_port;
-			sup.spawn("push_listener", move |cancel| async move {
-				if let Err(e) = bairelay::push_listener::run_with_listener(
+			let hold_log = cfg.motion_wake_hold.as_secs_f64();
+			sup.spawn("push_listener", move |cancel| {
+				bairelay::push_listener::run_with_listener(
 					listener,
 					cfg,
 					registry_for_pl,
@@ -594,14 +593,11 @@ async fn async_main() -> Result<()> {
 					prefix_for_pl,
 					cancel,
 				)
-				.await
-				{
-					tracing::error!(error = %e, "push listener exited with error");
-				}
 			});
 			info!(
 				bind = %bind_addr,
 				port = bind_port_log,
+				motion_wake_hold_secs = hold_log,
 				"Push listener started"
 			);
 		}
@@ -618,7 +614,9 @@ async fn async_main() -> Result<()> {
 			let cameras_for_wh = orchestrator.cameras_arc();
 			let mqtt_for_wh = orchestrator.mqtt_client().cloned();
 			let prefix_for_wh = orchestrator.topic_prefix().to_string();
-			let hold = std::time::Duration::from_secs_f64(wh_block.motion_wake_hold_secs);
+			let hold =
+				bairelay::webhook_listener::WebhookTarget::from_config(&wh_block, &rtsp_bind_addr)?
+					.hold();
 			sup.spawn("webhook_listener", move |cancel| async move {
 				bairelay::webhook_listener::run_with_listener(
 					listener,

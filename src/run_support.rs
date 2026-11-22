@@ -8,7 +8,7 @@
 //! formatting success / failure payloads, and the shutdown-signal
 //! fanout — now live here behind straightforward function signatures.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,7 +18,6 @@ use crate::cli::{Cli, Command};
 use crate::config::{Config, parse_config, validate_config};
 use crate::oneshot::classify;
 use crate::oneshot::dispatch::{dispatch_oneshot, find_camera_config, snapshot_json_preflight};
-use crate::oneshot::errors::ConfigError;
 use crate::oneshot::output::{Mode, Outcome, format_failure, format_success};
 use crate::oneshot::{runner, snapshot};
 
@@ -28,36 +27,61 @@ pub fn cli_output_mode(cli: &Cli) -> Mode {
 	if cli.json { Mode::Json } else { Mode::Human }
 }
 
-/// Read a config file, parse the TOML, then run the validator. Any
-/// failure is wrapped in an [`anyhow::Error`] with file-path context.
-/// Used by both the service-mode and one-shot bring-up paths.
-pub fn load_validated_config(path: &Path) -> Result<Config> {
-	let config_str = std::fs::read_to_string(path)
-		.with_context(|| format!("Failed to read config file: {}", path.display()))?;
-	let mut config = parse_config(&config_str)
-		.map_err(|e| anyhow::anyhow!(e))
-		.context("Invalid configuration")?;
-	// Attach the host's MFA trust token (if bootstrapped via `cloud-authorise`)
-	// from the sibling state file, so cloud cameras can clear login verification.
+/// Why [`load_config`] failed. [`Self::exit_code`] is the one-shot exit
+/// code; the daemon reports it through `anyhow`.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+	/// The operator pointed at nothing: a usage error, not a bad config.
+	#[error("config file not found: {}", .0.display())]
+	NotFound(PathBuf),
+	#[error("read {}: {source}", path.display())]
+	Read {
+		path: PathBuf,
+		source: std::io::Error,
+	},
+	#[error("parse {}: {msg}", path.display())]
+	Parse { path: PathBuf, msg: String },
+	#[error("validate {}: {msg}", path.display())]
+	Validate { path: PathBuf, msg: String },
+}
+
+impl LoadError {
+	/// `EXIT_USAGE` for a missing file, `EXIT_CONFIG` otherwise.
+	pub fn exit_code(&self) -> i32 {
+		match self {
+			LoadError::NotFound(_) => classify::EXIT_USAGE,
+			_ => classify::EXIT_CONFIG,
+		}
+	}
+}
+
+/// Read, parse and validate the config file at `path`, attaching the
+/// host's MFA trust token (if bootstrapped via `cloud-authorise`) from
+/// the sibling state file so cloud cameras can clear login
+/// verification. Every entry point (daemon, one-shots, `check-config`,
+/// `cloud-authorise`) loads through here.
+pub fn load_config(path: &Path) -> Result<Config, LoadError> {
+	let path_buf = || path.to_path_buf();
+	let config_str = std::fs::read_to_string(path).map_err(|source| {
+		if source.kind() == std::io::ErrorKind::NotFound {
+			LoadError::NotFound(path_buf())
+		} else {
+			LoadError::Read {
+				path: path_buf(),
+				source,
+			}
+		}
+	})?;
+	let mut config = parse_config(&config_str).map_err(|msg| LoadError::Parse {
+		path: path_buf(),
+		msg,
+	})?;
 	crate::config::apply_cloud_auth(&mut config, path);
-	validate_config(&config)
-		.map_err(|e| anyhow::anyhow!(e))
-		.context("Configuration validation failed")?;
+	validate_config(&config).map_err(|msg| LoadError::Validate {
+		path: path_buf(),
+		msg,
+	})?;
 	Ok(config)
-}
-
-/// Write a success [`Outcome`] to stdout/stderr per the given mode.
-/// Returns the written-byte counts as `(stdout_len, stderr_len)` so
-/// tests can assert the split without capturing real fds.
-pub fn emit_success_bytes(mode: Mode, outcome: &Outcome) -> (String, String) {
-	format_success(mode, outcome)
-}
-
-/// Produce the textual failure payload for the given mode + kind.
-/// Mirrors the side-effectful `emit_failure` in `main.rs` but returns
-/// the string + target-stream tag so tests don't need to capture fds.
-pub fn emit_failure_payload(mode: Mode, err: &anyhow::Error, kind: &str) -> (Mode, String) {
-	(mode, format_failure(mode, err, kind))
 }
 
 /// Sleep for `delay` or until `cancel` fires, whichever comes first.
@@ -131,9 +155,9 @@ pub fn camera_names(config: &Config) -> Vec<String> {
 }
 
 /// Write a success outcome split across the two given writers.
-/// Production calls [`emit_success`] which forwards to the real
-/// `stdout` + `stderr`; tests pass `&mut Vec<u8>` for both so they
-/// can assert on the bytes without polluting the test runner output.
+/// Production passes the real `stdout` + `stderr`; tests pass
+/// `&mut Vec<u8>` for both so they can assert on the bytes without
+/// polluting the test runner output.
 pub fn emit_success_to<W1: std::io::Write, W2: std::io::Write>(
 	mode: Mode,
 	outcome: &Outcome,
@@ -170,27 +194,6 @@ pub fn emit_failure_to<W1: std::io::Write, W2: std::io::Write>(
 	}
 }
 
-/// Write a success outcome to the process's real `stdout` / `stderr`.
-pub fn emit_success(mode: Mode, outcome: &Outcome) {
-	emit_success_to(
-		mode,
-		outcome,
-		&mut std::io::stdout().lock(),
-		&mut std::io::stderr().lock(),
-	);
-}
-
-/// Write a failure payload to the process's real `stdout` / `stderr`.
-pub fn emit_failure(mode: Mode, err: &anyhow::Error, kind: &str) {
-	emit_failure_to(
-		mode,
-		err,
-		kind,
-		&mut std::io::stdout().lock(),
-		&mut std::io::stderr().lock(),
-	);
-}
-
 /// `check-config` body: load the config and walk the validator. On
 /// success write a one-line summary to `stdout`; on failure write a
 /// classified error to either `stdout` (Json) or `stderr` (Human) and
@@ -204,44 +207,15 @@ pub fn run_check_config_to<W1: std::io::Write, W2: std::io::Write>(
 	stderr: &mut W2,
 ) -> i32 {
 	let path = cli.config_path();
-	// Mirror the read → parse → validate triple from `run_oneshot`
-	// below. Each step's error is wrapped as `ConfigError` so the
-	// exit-code classifier returns `EXIT_CONFIG`. A missing file maps
-	// to `EXIT_USAGE` (the operator pointed us somewhere that doesn't
-	// exist) — distinct from `EXIT_CONFIG` which is "file present but
-	// malformed".
-	let config_str = match std::fs::read_to_string(path) {
-		Ok(s) => s,
-		Err(e) => {
-			let kind = if e.kind() == std::io::ErrorKind::NotFound {
-				classify::EXIT_USAGE
-			} else {
-				classify::EXIT_CONFIG
-			};
-			let msg = anyhow::anyhow!(format!("read {}: {}", path.display(), e));
-			emit_failure_to(
-				mode,
-				&msg,
-				crate::cli_convert::exit_code_to_kind(kind),
-				stdout,
-				stderr,
-			);
-			return kind;
-		}
-	};
-	let config = match crate::config::parse_config(&config_str) {
+	let config = match load_config(path) {
 		Ok(c) => c,
 		Err(e) => {
-			let msg = anyhow::anyhow!(format!("parse {}: {}", path.display(), e));
-			emit_failure_to(mode, &msg, "config", stdout, stderr);
-			return classify::EXIT_CONFIG;
+			let code = e.exit_code();
+			let kind = crate::cli_convert::exit_code_to_kind(code);
+			emit_failure_to(mode, &anyhow::Error::new(e), kind, stdout, stderr);
+			return code;
 		}
 	};
-	if let Err(e) = crate::config::validate_config(&config) {
-		let msg = anyhow::anyhow!(format!("validate {}: {}", path.display(), e));
-		emit_failure_to(mode, &msg, "config", stdout, stderr);
-		return classify::EXIT_CONFIG;
-	}
 	// Load the MQTT TLS material too: a wrong path or bad PEM is a
 	// config error the daemon would otherwise only hit at startup.
 	if let Err(e) = crate::mqtt_loop::build_broker_config(&config) {
@@ -313,18 +287,11 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 			_ => unreachable!("is_cloud_authorise gated the variant"),
 		};
 		let path = cli.config_path();
-		let config_str = match std::fs::read_to_string(path) {
-			Ok(s) => s,
-			Err(e) => {
-				let _ = writeln!(stderr, "cloud-authorise: read {}: {e}", path.display());
-				return classify::EXIT_USAGE;
-			}
-		};
-		let config = match parse_config(&config_str) {
+		let config = match load_config(path) {
 			Ok(c) => c,
 			Err(e) => {
 				let _ = writeln!(stderr, "cloud-authorise: {e}");
-				return classify::EXIT_CONFIG;
+				return e.exit_code();
 			}
 		};
 		return crate::oneshot::cloud_authorise::run(path, &config, &method).await;
@@ -337,30 +304,7 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 	}
 
 	let result: Result<Outcome> = async {
-		// Load + validate config.
-		let config_path = cli.config_path();
-		let config_str = match std::fs::read_to_string(config_path) {
-			Ok(s) => s,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				// Missing config file is operator-pointing-at-nothing,
-				// not "config malformed". Mirror `check-config`'s
-				// EXIT_USAGE mapping and the doc table at
-				// `docs/architecture.md` § Error handling.
-				return Err(crate::oneshot::errors::UsageError::new(format!(
-					"config file not found: {}",
-					config_path.display()
-				))
-				.into());
-			}
-			Err(e) => {
-				return Err(
-					ConfigError::new(format!("read {}: {}", config_path.display(), e)).into(),
-				);
-			}
-		};
-		let config =
-			parse_config(&config_str).map_err(|e| ConfigError::new(format!("parse: {}", e)))?;
-		validate_config(&config).map_err(|e| ConfigError::new(format!("validate: {}", e)))?;
+		let config = load_config(cli.config_path())?;
 
 		let camera_name = cli.camera_name().expect("oneshot without camera name");
 		let cam_cfg = find_camera_config(&config, camera_name)?;
@@ -393,7 +337,9 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 			})
 			.await;
 		}
-		let cmd = crate::cli_convert::clone_command(&cli.command);
+		let mut cmd = cli.command.clone();
+		// Prompt before connecting: the op timeout runs from connect.
+		crate::oneshot::password_source::resolve_command(&mut cmd)?;
 		let json = cli.json;
 		runner::run(&cam_cfg, cancel, move |cam| {
 			async move {
@@ -462,56 +408,70 @@ mod tests {
 		assert!(matches!(cli_output_mode(&cli), Mode::Human));
 	}
 
-	#[test]
-	fn load_validated_config_missing_file_errors() {
-		let p = std::path::PathBuf::from("/nonexistent/bairelay-cfg-xxyy.toml");
-		let err = load_validated_config(&p).expect_err("should fail");
-		assert!(format!("{:#}", err).contains("Failed to read config file"));
+	fn write_config(dir: &Path, toml: &str) -> PathBuf {
+		let path = dir.join("config.toml");
+		std::fs::write(&path, toml).unwrap();
+		path
 	}
 
 	#[test]
-	fn load_validated_config_malformed_toml_errors() {
-		let f = tempfile::NamedTempFile::new().unwrap();
-		std::fs::write(f.path(), b"not { valid toml = [[[").unwrap();
-		let err = load_validated_config(f.path()).expect_err("should fail");
-		// Either parse or validate message — we only care we got past read.
-		let s = format!("{:#}", err);
-		assert!(s.contains("Invalid configuration") || s.contains("validation"));
-	}
+	fn load_config_maps_each_failure_to_its_exit_code() {
+		let dir = tempfile::tempdir().unwrap();
+		let missing = load_config(&dir.path().join("absent.toml")).unwrap_err();
+		assert!(matches!(missing, LoadError::NotFound(_)), "{missing}");
+		assert_eq!(missing.exit_code(), classify::EXIT_USAGE);
 
-	#[test]
-	fn load_validated_config_validation_fails() {
-		// bind_port = 0 trips validate_config's first check, so we exercise
-		// the Err path of the third stage (validator, not parser).
-		let f = tempfile::NamedTempFile::new().unwrap();
-		let toml = r#"
-bind = "127.0.0.1"
-bind_port = 0
-cameras = []
-"#;
-		std::fs::write(f.path(), toml).unwrap();
-		let err = load_validated_config(f.path()).expect_err("validator should reject");
-		let s = format!("{:#}", err);
-		assert!(
-			s.contains("validation") || s.contains("bind_port"),
-			"unexpected error: {s}"
+		let unreadable = load_config(dir.path()).unwrap_err();
+		assert!(matches!(unreadable, LoadError::Read { .. }), "{unreadable}");
+
+		let bad_toml = write_config(dir.path(), "not { valid toml = [[[");
+		let parse = load_config(&bad_toml).unwrap_err();
+		assert!(matches!(parse, LoadError::Parse { .. }), "{parse}");
+
+		let invalid = write_config(
+			dir.path(),
+			"bind = \"127.0.0.1\"\nbind_port = 0\ncameras = []\n",
 		);
+		let validate = load_config(&invalid).unwrap_err();
+		assert!(matches!(validate, LoadError::Validate { .. }), "{validate}");
+		for e in [unreadable, parse, validate] {
+			assert_eq!(e.exit_code(), classify::EXIT_CONFIG, "{e}");
+		}
 	}
 
 	#[test]
-	fn load_validated_config_happy_path() {
-		// Minimal valid config passes parse + validate and returns Ok.
-		let f = tempfile::NamedTempFile::new().unwrap();
-		let toml = r#"
-bind = "127.0.0.1"
-bind_port = 8554
-stream_prune_grace_secs = 60
-cameras = []
-"#;
-		std::fs::write(f.path(), toml).unwrap();
-		let cfg = load_validated_config(f.path()).expect("minimal valid config");
-		assert_eq!(cfg.bind_port, 8554);
-		assert!(cfg.cameras.is_empty());
+	fn load_config_attaches_the_cloud_trust_token() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = write_config(
+			dir.path(),
+			r#"
+cloud_account = "owner@example.com"
+cloud_password = "pw"
+[[cameras]]
+name = "cloud"
+uid = "95270000ABCDEFGH"
+username = "admin"
+password = "x"
+discovery = "cloud"
+"#,
+		);
+		let expiry = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+			+ 86_400;
+		std::fs::write(
+			dir.path().join(crate::config::CLOUD_AUTH_FILE),
+			format!(
+				r#"{{"account":"owner@example.com","mfa_trust_token":"TT","expiry_unix_s":{expiry}}}"#
+			),
+		)
+		.unwrap();
+		let config = load_config(&path).expect("valid cloud config");
+		assert_eq!(
+			config.cameras[0].cloud_mfa_trust_token.as_deref(),
+			Some("TT")
+		);
 	}
 
 	#[test]
@@ -531,31 +491,6 @@ cameras = []
 			..Config::default()
 		};
 		assert_eq!(camera_names(&cfg), vec!["a", "b", "c"]);
-	}
-
-	#[test]
-	fn emit_success_bytes_returns_both_streams() {
-		// Outcome::Snapshot payload in Human mode goes to stderr (progress)
-		// + stdout (bytes) — smoke-test the split exists regardless of
-		// exact wording.
-		let (stdout, _stderr) = emit_success_bytes(
-			Mode::Human,
-			&Outcome::Snapshot {
-				bytes: 4,
-				path: Some("/tmp/x.jpg".into()),
-				format: "jpeg".into(),
-			},
-		);
-		// At least one channel produced something.
-		assert!(!stdout.is_empty() || !_stderr.is_empty());
-	}
-
-	#[test]
-	fn emit_failure_payload_packages_mode() {
-		let err = anyhow::anyhow!("boom");
-		let (mode, s) = emit_failure_payload(Mode::Human, &err, "protocol");
-		assert!(matches!(mode, Mode::Human));
-		assert!(!s.is_empty());
 	}
 
 	#[test]
@@ -689,8 +624,7 @@ cameras = []
 	// process stdout, polluting the test runner — no test here.
 
 	#[tokio::test]
-	async fn run_oneshot_missing_config_file_returns_config_exit() {
-		// Fails at the `read_to_string` stage → ConfigError → classified.
+	async fn run_oneshot_missing_config_file_returns_usage_exit() {
 		let cli = cli_from(&[
 			"bairelay",
 			"snapshot",
@@ -701,9 +635,7 @@ cameras = []
 			"/nonexistent-config-xyzz.toml",
 		]);
 		let code = run_oneshot_to(&cli, &mut Vec::new(), &mut Vec::new()).await;
-		// Per classify tables, a ConfigError surfaces as EXIT_CONFIG or
-		// a coarse non-zero code — whatever the table decided.
-		assert_ne!(code, classify::EXIT_OK);
+		assert_eq!(code, classify::EXIT_USAGE);
 	}
 
 	#[tokio::test]
@@ -754,12 +686,27 @@ cameras = []
 		assert_ne!(code, classify::EXIT_OK);
 	}
 
-	// `emit_success` / `emit_failure` are 5-line wrappers around
-	// `format_success` / `format_failure` (covered above by
-	// `emit_success_bytes_returns_both_streams` and
-	// `emit_failure_payload_packages_mode`). Their only side effect is
-	// writing to the real process stdout/stderr, which would pollute
-	// the cargo-test output for zero correctness signal — no test here.
+	/// The `users` password is checked before connecting: an empty one
+	/// is a usage error even though the camera is unreachable.
+	#[tokio::test]
+	async fn run_oneshot_resolves_the_users_password_before_connecting() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+[[cameras]]
+name = "cam0"
+address = "127.0.0.1:65502"
+username = "u"
+password = ""
+discovery = "local"
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let p = f.path().display().to_string();
+		let cli = cli_from(&["bairelay", "users", "cam0", "password", "bob", "", "-c", &p]);
+		let code = run_oneshot_to(&cli, &mut Vec::new(), &mut Vec::new()).await;
+		assert_eq!(code, classify::EXIT_USAGE);
+	}
 
 	/// `run_oneshot` dispatches to `runner::run` for the
 	/// non-`--use-stream-raw` path. The TCP connect fails (no real
@@ -872,7 +819,7 @@ password = "x"
 		assert_eq!(code, classify::EXIT_USAGE);
 		assert!(out.is_empty(), "Human err path must not write to stdout");
 		let s = String::from_utf8(err).expect("utf8");
-		assert!(s.contains("read"));
+		assert!(s.contains("not found"));
 	}
 
 	#[test]
@@ -969,23 +916,6 @@ on_motion = true
 		assert_eq!(code, classify::EXIT_CONFIG);
 		let s = String::from_utf8(err).expect("utf8");
 		assert!(s.contains("read"));
-	}
-
-	#[test]
-	fn emit_success_real_stdio_does_not_panic() {
-		// The production wrapper around `std::io::stdout().lock()` /
-		// `std::io::stderr().lock()`. Cargo-test captures both, so the
-		// test runner output is untouched. Coverage-only assertion.
-		emit_success(Mode::Json, &Outcome::Siren);
-		emit_success(Mode::Human, &Outcome::Siren);
-	}
-
-	#[test]
-	fn emit_failure_real_stdio_does_not_panic() {
-		// Same shape: production wrapper around real stdout/stderr.
-		let err = anyhow::anyhow!("synthetic failure for coverage");
-		emit_failure(Mode::Json, &err, "test");
-		emit_failure(Mode::Human, &err, "test");
 	}
 
 	#[test]

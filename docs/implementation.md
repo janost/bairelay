@@ -30,7 +30,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `camera_ip()`                         | The camera's own IP (canonical form) when the session reaches it directly: TCP or local discovery. `None` through remote, map or relay discovery. `CameraHandle::camera_ip()` keeps the last such IP across sessions. |
 | `send_ptz(Direction, f32)`            | Always pair with `Direction::Stop` (see Control commands). |
 | `set_floodlight_manual(bool, u16)`    | Second arg is duration **seconds**. Use 30.               |
-| `zoom_to(u32)`                        | Pre-multiply by 1000 (`level * 1000.0` for MQTT float).   |
+| `zoom_to(u32)`                        | Pre-multiply by 1000 (`ptz::zoom_position`).              |
 | `set_ptz_preset(u8, String)`          | Preset ID + name.                                         |
 | `start_video(kind, channel, record)` / `stop_video(kind)` | Returns `StreamData`; covered by `VideoStream` trait. |
 | `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly. An Argus answers msg 109 with `400` (`CameraServiceUnavailable`) for several seconds after connect (6 s or more); startup wake and the preview poller retry through `camera_tasks::snapshot_with_retry` (2 s backoff while the next attempt starts within 12 s of the first, cancel-aware, 10 s per attempt). |
@@ -255,11 +255,12 @@ Update intervals (`battery_update`, `preview_update`, `floodlight_update`) must 
 
 Match neolink's wire behaviour exactly:
 
-- **PTZ.** Send the move command with speed = 32.0, sleep `amount / speed` seconds (clamped to 0–10 s), then **always** send `Direction::Stop`. Without the stop, the camera keeps moving forever.
-- **Zoom.** MQTT payload is a float (e.g. `1.5`). Call `zoom_to((level * 1000.0) as u32)`.
+- **PTZ.** Send the move command with speed = 32.0 (the CLI's `ptz control <amount> <dir> [speed]` may override it), sleep `amount / speed` seconds (clamped to 0–10 s), then **always** send `Direction::Stop`. Without the stop, the camera keeps moving forever. CLI and MQTT share `crate::ptz::ptz_move`.
+- **Zoom.** MQTT payload and CLI argument are a float (e.g. `1.5`). Both call `zoom_to(crate::ptz::zoom_position(level))`: `level * 1000`, rounded, negative to 0.
 - **Siren.** `bc.siren()` takes no arguments. Only fire on `"on"` payload; ignore `"off"`.
 - **Wakeup.** Acquires a wake lock immediately (triggers the camera connection), then waits for the camera to actually connect before starting the countdown. 2-minute connection timeout, respects the cancellation token.
 - **Reply convention.** After every control command, publish `"OK"` or `"FAIL"` (non-retained) to the same control topic. Enables HA automations to confirm command success.
+- **Retained commands are ignored.** The broker replays a retained message on every subscribe, so a retained `control/reboot` or `control/siren` would fire on every start and reconnect. `mqtt_loop::RetainedFilter` drops every retained control/query publish and warns once per topic; clear it with `mosquitto_pub -r -n -t <topic>`.
 - **Query responses.** `query/battery` and `query/pir` serialise the full struct to XML via `quick_xml::se::to_writer` and publish to `status/battery` and `status/pir` respectively (non-retained).
 
 ---
