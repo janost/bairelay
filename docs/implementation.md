@@ -53,13 +53,13 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 
 **Shutdown sequence (per session, inside `CameraHandle::teardown_session_tasks`):**
 
-`run_connected_session` is the per-session lifecycle coordinator: it sets up via `spawn_session_tasks`, runs the keepalive loop, then on connection loss / shutdown cancels `session_cancel` and hands off to `teardown_session_tasks`, which performs:
+`run_connected_session` is the per-session lifecycle coordinator: it installs a session token (a child of the camera token, cancelled by `request_disconnect`), sets up via `spawn_session_tasks`, runs the keepalive loop, then on connection loss / shutdown clears the token, leaves `Connected`, cancels the session and hands off to `teardown_session_tasks`, which performs:
 
 1. Wait up to **2 seconds** for `JoinSet` tasks (motion / battery / floodlight / PIR / preview-aggregator) to exit gracefully.
 2. After the deadline, call `abort_all()` on the `JoinSet`.
 3. `stop_all_stream_sources().await` — fires cancel + awaits each reader task with a 7 s budget. Reader tasks hold their own `Arc<BcCamera>` clones outside the `JoinSet`; without this await the next session's `start_video` can race a still-running previous reader.
 4. `logout()` with a 5 s timeout (`LOGOUT_TIMEOUT`). Uses the local `concrete: Option<Arc<BcCamera>>` parameter — the trait surface intentionally omits `logout()`.
-5. Clear `bc_camera` + `bc_camera_concrete`, drop the local `concrete` Arc, transition to `Disconnected`.
+5. Clear `bc_camera` + `bc_camera_concrete`, drop the local `concrete` Arc, publish `disconnected`.
 
 Without the abort deadline, shutdown hangs because internal tasks hold references that prevent cleanup. Without step 4's await, a detached reader keeps `Arc<BcCamera>` alive for up to its own `STOP_VIDEO_TIMEOUT` (5 s), which bairelay_neolink_core can't reliably handle when the next `BcCamera::new` is already in flight.
 
@@ -208,12 +208,12 @@ Without the separate token, per-camera teardown races the event-loop exit and hi
 
 Use `BcCamera::get_linktype()`, **not** `BcCamera::ping()` — matches neolink. Some cameras return `UnintelligibleReply` for link-type queries: treat that as success (camera is alive but doesn't support the query), not failure.
 
-Allow 5 consecutive failures before disconnecting. A single dropped packet shouldn't kill the connection.
+Allow 5 consecutive failures before disconnecting. A single dropped packet shouldn't kill the connection. An error that means the connection itself is gone (`DroppedConnection`, `ConnectionShutdown`, `TimeoutDisconnected`, `TokioBcSendError`, `CameraTerminate`, `RelayTerminate`) disconnects on the first probe.
 
 Cadence shared between production and tests via `KEEPALIVE_INTERVAL = 5 s` and `KEEPALIVE_MAX_FAILURES = 5` constants in `src/camera.rs`. Two decision-table helpers are exported for testing under a paused virtual clock:
 
-- `classify_keepalive_tick(result)` — folds `Ok(Ok)` / `UnintelligibleReply-still-ok` / `Ok(Err)` / `Elapsed` into a `KeepaliveTickOutcome::{Ok, Failed}` binary outcome.
-- `advance_keepalive_counter(state, outcome, max_failures) -> (next_failures, should_break)` — drives the consecutive-failure counter (reset on Ok, saturate at max_failures, signal break at exactly `next == max_failures`).
+- `classify_keepalive_tick(result)` — folds `Ok(Ok)` / `Ok(Err)` / `Elapsed` into `KeepaliveTickOutcome::{Ok, Failed, Dead}` (`Dead` for the connection-gone errors above).
+- `advance_keepalive_counter(state, outcome, max_failures) -> (next_failures, should_break)` — drives the consecutive-failure counter (reset on Ok, saturate at max_failures, signal break at exactly `next == max_failures` or on `Dead`).
 
 ---
 

@@ -102,29 +102,42 @@ pub(crate) enum KeepaliveTickOutcome {
 	/// Probe failed or timed out. Caller should increment the counter
 	/// and compare against `MAX_FAILURES`.
 	Failed,
+	/// The connection itself is gone; retrying the probe can't help.
+	Dead,
 }
 
 /// Fold a `timeout(..., keepalive_probe()).await` outcome into a
 /// [`KeepaliveTickOutcome`].
 ///
-/// `Ok(Ok(_))` is success; everything else (any protocol error, any
-/// timeout) is a failure. The "camera is alive but doesn't speak
-/// link-type" special case used to live here — it now lives one layer
-/// down in [`CameraDriver::keepalive_probe`], which matches on
-/// `Error::UnintelligibleReply` directly instead of stringifying.
-pub(crate) fn classify_keepalive_tick<T, E>(
-	outcome: std::result::Result<std::result::Result<T, E>, tokio::time::error::Elapsed>,
+/// `Ok(Ok(_))` is success. An error that means the connection is gone
+/// (dropped, shut down, camera or relay hung up, send channel closed)
+/// is [`KeepaliveTickOutcome::Dead`]; any other error or a timeout is a
+/// failure. The "camera is alive but doesn't speak link-type" case
+/// lives one layer down in [`CameraDriver::keepalive_probe`].
+pub(crate) fn classify_keepalive_tick<T>(
+	outcome: std::result::Result<
+		std::result::Result<T, bairelay_neolink_core::Error>,
+		tokio::time::error::Elapsed,
+	>,
 ) -> KeepaliveTickOutcome {
+	use bairelay_neolink_core::Error as E;
 	match outcome {
 		Ok(Ok(_)) => KeepaliveTickOutcome::Ok,
-		Ok(Err(_)) => KeepaliveTickOutcome::Failed,
-		Err(_) => KeepaliveTickOutcome::Failed,
+		Ok(Err(
+			E::DroppedConnection
+			| E::ConnectionShutdown
+			| E::TimeoutDisconnected
+			| E::TokioBcSendError
+			| E::CameraTerminate
+			| E::RelayTerminate,
+		)) => KeepaliveTickOutcome::Dead,
+		Ok(Err(_)) | Err(_) => KeepaliveTickOutcome::Failed,
 	}
 }
 
 /// Update the running failure counter given a new tick outcome, and
 /// report whether the loop should break (consecutive failures reached
-/// `max_failures`).
+/// `max_failures`, or the connection is dead).
 ///
 /// Pure — consumed by `keepalive_loop` to keep its body small enough
 /// to audit. Not part of the `CameraHandle` impl so unit tests can
@@ -140,6 +153,7 @@ pub(crate) fn advance_keepalive_counter(
 			let next = consecutive_failures.saturating_add(1);
 			(next, next >= max_failures)
 		}
+		KeepaliveTickOutcome::Dead => (consecutive_failures.saturating_add(1), true),
 	}
 }
 
@@ -1002,6 +1016,10 @@ impl CameraHandle {
 					failures = consecutive_failures,
 					"Keepalive probe failed",
 				);
+			}
+			if outcome == KeepaliveTickOutcome::Dead {
+				tracing::warn!(camera = %self.config.name, "Keepalive: connection lost, disconnecting");
+				return SessionEnd::Lost;
 			}
 			if should_break {
 				tracing::warn!(
@@ -2030,16 +2048,14 @@ mod tests {
 	// `advance_keepalive_counter` with scripted inputs so we don't need
 	// a live `get_linktype()` round-trip to pin the decision table.
 
-	#[derive(Debug)]
-	#[allow(dead_code)] // Field shown in Debug output via the derive.
-	struct FakeErr(&'static str);
+	type ProbeResult = std::result::Result<
+		std::result::Result<(), bairelay_neolink_core::Error>,
+		tokio::time::error::Elapsed,
+	>;
 
 	#[test]
 	fn classify_ok_reply_is_ok() {
-		let raw: std::result::Result<
-			std::result::Result<(), FakeErr>,
-			tokio::time::error::Elapsed,
-		> = Ok(Ok(()));
+		let raw: ProbeResult = Ok(Ok(()));
 		assert_eq!(classify_keepalive_tick(raw), KeepaliveTickOutcome::Ok);
 	}
 
@@ -2049,11 +2065,24 @@ mod tests {
 
 	#[test]
 	fn classify_other_err_is_failed() {
-		let raw: std::result::Result<
-			std::result::Result<(), FakeErr>,
-			tokio::time::error::Elapsed,
-		> = Ok(Err(FakeErr("ConnectionReset")));
+		let raw: ProbeResult = Ok(Err(bairelay_neolink_core::Error::Other("reset")));
 		assert_eq!(classify_keepalive_tick(raw), KeepaliveTickOutcome::Failed);
+	}
+
+	/// A dead connection breaks on the first probe instead of waiting
+	/// out `KEEPALIVE_MAX_FAILURES` intervals.
+	#[test]
+	fn classify_dead_connection_breaks_at_once() {
+		use bairelay_neolink_core::Error as E;
+		for e in [
+			E::DroppedConnection,
+			E::CameraTerminate,
+			E::TokioBcSendError,
+		] {
+			let outcome = classify_keepalive_tick::<()>(Ok(Err(e)));
+			assert_eq!(outcome, KeepaliveTickOutcome::Dead);
+			assert_eq!(advance_keepalive_counter(0, outcome, 5), (1, true));
+		}
 	}
 
 	#[test]
@@ -2063,18 +2092,18 @@ mod tests {
 		// `Elapsed` variant in stable tokio. `current_thread` flavour:
 		// this test races one timeout to completion and exits, so a
 		// worker pool would be wasted overhead.
-		let raw: std::result::Result<std::result::Result<(), FakeErr>, _> =
-			tokio::runtime::Builder::new_current_thread()
-				.enable_all()
-				.build()
-				.unwrap()
-				.block_on(async {
-					tokio::time::timeout(
-						Duration::from_millis(0),
-						futures::future::pending::<std::result::Result<(), FakeErr>>(),
-					)
-					.await
-				});
+		let raw: ProbeResult = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap()
+			.block_on(async {
+				tokio::time::timeout(
+					Duration::from_millis(0),
+					futures::future::pending::<std::result::Result<(), bairelay_neolink_core::Error>>(
+					),
+				)
+				.await
+			});
 		assert_eq!(classify_keepalive_tick(raw), KeepaliveTickOutcome::Failed);
 	}
 
