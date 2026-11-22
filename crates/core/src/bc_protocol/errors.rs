@@ -308,11 +308,25 @@ impl From<tokio::time::error::Elapsed> for Error {
 	}
 }
 
+/// Summarise a nom error without its input slices: each one runs to the
+/// end of the read buffer, which can hold MiBs of media.
+fn describe_nom_error(e: &NomErrorType<'_>) -> String {
+	e.errors
+		.iter()
+		.map(|(input, kind)| {
+			let head = &input[..input.len().min(16)];
+			format!("{kind:?} with {} bytes left {head:02X?}", input.len())
+		})
+		.collect::<Vec<_>>()
+		.join("; ")
+}
+
 impl<'a> From<nom::Err<NomErrorType<'a>>> for Error {
 	fn from(k: nom::Err<NomErrorType<'a>>) -> Self {
 		match k {
-			nom::Err::Error(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
-			nom::Err::Failure(e) => Error::NomError(format!("Nom Error: {:X?}", e)),
+			nom::Err::Error(e) | nom::Err::Failure(e) => {
+				Error::NomError(format!("Nom Error: {}", describe_nom_error(&e)))
+			}
 			nom::Err::Incomplete(nom::Needed::Size(amount)) => Error::NomIncomplete(amount.get()),
 			nom::Err::Incomplete(nom::Needed::Unknown) => Error::NomIncomplete(1),
 		}
@@ -612,6 +626,26 @@ mod tests {
 		})
 		.into();
 		assert!(matches!(e, Error::NomError(_)));
+	}
+
+	#[test]
+	fn nom_error_message_omits_the_input_buffer() {
+		let input = vec![0xABu8; 1024 * 1024];
+		let e: Error = nom::Err::Error::<NomErrorType>(nom_language::error::VerboseError {
+			errors: vec![(
+				&input[..],
+				nom_language::error::VerboseErrorKind::Context("Magic invalid"),
+			)],
+		})
+		.into();
+		let Error::NomError(msg) = e else {
+			panic!("expected NomError");
+		};
+		assert!(msg.len() < 200, "{msg}");
+		assert!(
+			msg.contains("Magic invalid") && msg.contains("1048576"),
+			"{msg}"
+		);
 	}
 
 	#[tokio::test]
