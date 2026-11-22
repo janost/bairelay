@@ -246,16 +246,28 @@ pub async fn dispatch_control(
 				Ok(Ok(jpeg)) => {
 					// One-shot render (no shared cache); cheaper than
 					// threading the per-camera OverlayCache in for a
-					// single operator-triggered query.
-					let payload = crate::preview_overlay::rendered_preview(
-						bytes::Bytes::from(jpeg),
-						cam.config().pause.preview_overlay,
-						*cam.preview_state_rx().borrow(),
-						None,
-					);
+					// single operator-triggered query. JPEG decode, draw
+					// and re-encode are CPU work, so off the runtime.
+					let overlay = cam.config().pause.preview_overlay;
+					let state = *cam.preview_state_rx().borrow();
+					let render = tokio::task::spawn_blocking(move || {
+						crate::preview_overlay::rendered_preview(
+							bytes::Bytes::from(jpeg),
+							overlay,
+							state,
+							None,
+						)
+					});
 					let publisher = StatusPublisher::new(mqtt, topic_prefix, camera);
-					if let Err(e) = publisher.publish_preview(&payload).await {
-						tracing::warn!(camera = %camera, error = %e, "QueryPreview publish failed");
+					match render.await {
+						Ok(payload) => {
+							if let Err(e) = publisher.publish_preview(&payload).await {
+								tracing::warn!(camera = %camera, error = %e, "QueryPreview publish failed");
+							}
+						}
+						Err(e) => {
+							tracing::warn!(camera = %camera, error = %e, "QueryPreview render failed");
+						}
 					}
 				}
 				Ok(Err(e)) => {
