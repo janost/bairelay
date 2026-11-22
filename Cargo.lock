@@ -250,6 +250,7 @@ dependencies = [
  "clap",
  "futures",
  "image",
+ "libc",
  "predicates",
  "quick-xml",
  "rcgen",

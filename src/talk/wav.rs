@@ -26,19 +26,22 @@ pub const MAX_CHANNELS: u16 = 2;
 pub const MAX_WAV_BYTES: u64 =
 	super::MAX_CLIP.as_secs() * MAX_SAMPLE_RATE as u64 * MAX_CHANNELS as u64 * 2 + (1 << 20);
 
-/// Read and decode a WAV file from disk. Only a regular file is opened
+/// Read and decode a WAV file from disk. Only a regular file is read
 /// (a FIFO or device would block or never end), and at most
 /// [`MAX_WAV_BYTES`] are read. Blocking; call from a blocking thread.
 pub fn read_wav_file(path: &std::path::Path) -> Result<MonoPcm, TalkError> {
 	use std::io::Read;
-	let meta = std::fs::metadata(path).map_err(|_| TalkError::NotFound)?;
+	let file = open_nonblocking(path).map_err(|_| TalkError::NotFound)?;
+	// Type and size come from the open handle, so a path swapped after
+	// any earlier check cannot change what is read.
+	let meta = file.metadata().map_err(|_| TalkError::NotFound)?;
 	if !meta.is_file() {
 		return Err(TalkError::NotAFile);
 	}
-	let file = std::fs::File::open(path).map_err(|_| TalkError::NotFound)?;
-	// Re-check on the open handle: the path may have been swapped.
-	if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
-		return Err(TalkError::NotAFile);
+	if meta.len() > MAX_WAV_BYTES {
+		return Err(TalkError::Decode(anyhow::anyhow!(
+			"file is larger than {MAX_WAV_BYTES} bytes"
+		)));
 	}
 	let mut bytes = Vec::new();
 	file.take(MAX_WAV_BYTES + 1)
@@ -50,6 +53,20 @@ pub fn read_wav_file(path: &std::path::Path) -> Result<MonoPcm, TalkError> {
 		)));
 	}
 	parse_wav(&bytes).map_err(TalkError::Decode)
+}
+
+/// Open read-only. On unix with `O_NONBLOCK`: opening a FIFO without
+/// it blocks until a writer appears. Reads from a regular file ignore
+/// the flag.
+fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+	let mut opts = std::fs::OpenOptions::new();
+	opts.read(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		opts.custom_flags(libc::O_NONBLOCK);
+	}
+	opts.open(path)
 }
 
 fn le_u16(b: &[u8], at: usize) -> u16 {
@@ -269,7 +286,8 @@ pub(crate) mod tests {
 			.status()
 			.expect("run mkfifo");
 		assert!(st.success());
-		// Must return at once, never open (and block on) the FIFO.
+		// Must return at once: the non-blocking open never waits for a
+		// writer.
 		assert!(matches!(read_wav_file(&fifo), Err(TalkError::NotAFile)));
 		assert!(matches!(
 			read_wav_file(&dir.path().join("missing.wav")),
@@ -278,6 +296,15 @@ pub(crate) mod tests {
 		let good = dir.path().join("ok.wav");
 		std::fs::write(&good, make_wav(16000, 1, &[1, 2, 3])).unwrap();
 		assert_eq!(read_wav_file(&good).unwrap().samples, vec![1, 2, 3]);
+	}
+
+	#[test]
+	fn read_rejects_oversized_file_before_reading() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		// Sparse: the size check must fire on the handle's length.
+		f.as_file().set_len(MAX_WAV_BYTES + 1).unwrap();
+		let err = read_wav_file(f.path()).unwrap_err();
+		assert!(format!("{err}").contains("larger than"), "{err}");
 	}
 
 	#[test]
