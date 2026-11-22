@@ -670,6 +670,20 @@ async fn dispatch(
 				tracing::debug!(camera = %handle.name(), "Webhook: alarm ignored; the live session reports alarms");
 				return;
 			}
+			// Hold before publishing: the edge is already committed, and a
+			// wedged broker running out DISPATCH_TIMEOUT mid-publish must
+			// not lose the wake.
+			if matches!(update.motion, MotionStatus::Start(_)) {
+				motion_hold(
+					Arc::clone(&handle),
+					shared.mqtt.as_ref(),
+					&shared.topic_prefix,
+					hold,
+					cancel,
+				);
+			} else if update.doorbell_press {
+				spawn_wake_hold(Arc::clone(&handle), hold, cancel);
+			}
 			if let Some(publisher) = &publisher {
 				let caps = handle.capabilities().unwrap_or_default().into();
 				report_alarm_update(
@@ -681,17 +695,6 @@ async fn dispatch(
 					&update,
 				)
 				.await;
-			}
-			if matches!(update.motion, MotionStatus::Start(_)) {
-				motion_hold(
-					Arc::clone(&handle),
-					shared.mqtt.as_ref(),
-					&shared.topic_prefix,
-					hold,
-					cancel,
-				);
-			} else if update.doorbell_press {
-				spawn_wake_hold(Arc::clone(&handle), hold, cancel);
 			}
 		}
 	}
@@ -1314,6 +1317,19 @@ mod tests {
 			[b"on".to_vec(), b"off".to_vec()]
 		);
 		assert_eq!(local.handle.wake_lock().count(), 0);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn alarm_start_takes_the_hold_when_the_broker_is_wedged() {
+		let mut local = Local::new(webhook_camera());
+		local.shared.hold = Duration::from_secs(60);
+		// Fill the never-polled request channel so the next publish blocks.
+		for _ in 0..1024 {
+			local.mqtt.publish("bairelay/fill", b"x").await.unwrap();
+		}
+		// `serve` returns once DISPATCH_TIMEOUT cancels the stuck publish.
+		assert_eq!(local.post(&alarm_body("MD", "none")).await, 200);
+		assert_eq!(local.holds(), 1);
 	}
 
 	#[tokio::test(start_paused = true)]
