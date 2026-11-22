@@ -268,6 +268,20 @@ impl SessionRegistry {
 		}
 	}
 
+	/// Mark every session as freshly active. Called when the client sends
+	/// interleaved data (RTCP receiver reports), which carries no Session
+	/// header.
+	pub fn touch_all(&self) {
+		let now = Instant::now();
+		let entries = self.entries.lock().expect("registry lock poisoned");
+		for entry in entries.values() {
+			*entry
+				.last_activity
+				.lock()
+				.expect("last_activity lock poisoned") = now;
+		}
+	}
+
 	/// Remove every session whose most recent activity is older than
 	/// `max_idle`. Returns the IDs that were removed so the caller can log
 	/// them. Each removed session has its cancellation token fired and its
@@ -408,6 +422,20 @@ mod tests {
 		let removed = registry.sweep_expired(Duration::from_nanos(0));
 		assert_eq!(removed, vec!["sess-1".to_string()]);
 		assert!(cancel.is_cancelled(), "expired entry's cancel token fires");
+	}
+
+	#[test]
+	fn touch_all_refreshes_every_session() {
+		let registry = SessionRegistry::new();
+		for id in ["a", "b"] {
+			let entry = SessionEntry::new(CancellationToken::new(), stub_subscription(), vec![]);
+			registry.insert(id.to_string(), entry);
+		}
+		std::thread::sleep(Duration::from_millis(30));
+		registry.touch_all();
+		assert!(registry.sweep_expired(Duration::from_millis(20)).is_empty());
+		std::thread::sleep(Duration::from_millis(30));
+		assert_eq!(registry.sweep_expired(Duration::from_millis(20)).len(), 2);
 	}
 
 	#[test]

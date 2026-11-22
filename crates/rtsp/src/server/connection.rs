@@ -152,42 +152,8 @@ pub async fn handle_connection<S>(
 						break;
 					}
 					Ok(_) => {
-						// Try to parse a complete RTSP request.
-						match try_consume_request(&mut buf) {
-							Ok(Some(req_bytes)) => {
-								if let Err(e) = crate::server::connection::dispatch_request(
-									&state, &req_bytes,
-								).await {
-									tracing::warn!(error = %e, "request handler error");
-									break;
-								}
-								// Refresh the rolling deadline: the
-								// connection has shown activity, so
-								// give it another full window before
-								// the slow-loris arm can fire.
-								last_activity = tokio::time::Instant::now();
-							}
-							Ok(None) => {
-								// Need more bytes.
-								if buf.len() > MAX_REQUEST_BYTES {
-									tracing::warn!("request buffer exceeded limit, closing");
-									break;
-								}
-							}
-							Err(e) => {
-								tracing::warn!(error = %e, "malformed RTSP request, closing");
-								// Send 400 Bad Request once then close.
-								let resp = crate::rtsp::message::build_response(
-									rtsp_types::StatusCode::BadRequest,
-									0,
-									&[],
-									None,
-								);
-								let mut w = writer.lock().await;
-								let _ = w.write_all(&resp).await;
-								let _ = w.flush().await;
-								break;
-							}
+						if !process_buffered(&state, &mut buf, &mut last_activity).await {
+							break;
 						}
 					}
 					Err(e) => {
@@ -214,6 +180,90 @@ where
 	}
 	buf.extend_from_slice(&tmp[..n]);
 	Ok(n)
+}
+
+/// Consume every complete message in `buf`: a single `read()` can carry
+/// several pipelined requests, or interleaved data followed by a request.
+/// Returns `false` when the connection must close.
+async fn process_buffered(
+	state: &Arc<ConnectionState>,
+	buf: &mut Vec<u8>,
+	last_activity: &mut tokio::time::Instant,
+) -> bool {
+	loop {
+		match try_consume(buf) {
+			Ok(Some(Inbound::Interleaved)) => {
+				// RTCP receiver reports are the client's liveness signal
+				// while it streams over TCP (GStreamer and live555 send no
+				// RTSP keepalive). Sessions are per connection, so refresh
+				// them all. The pre-session slow-loris deadline is left
+				// alone: data frames without a session are noise.
+				state.sessions.touch_all();
+			}
+			Ok(Some(Inbound::Request(req_bytes))) => {
+				if let Err(e) = dispatch_request(state, &req_bytes).await {
+					tracing::warn!(error = %e, "request handler error");
+					return false;
+				}
+				// Rolling slow-loris deadline: activity buys another window.
+				*last_activity = tokio::time::Instant::now();
+			}
+			Ok(None) => {
+				// A partial `$` frame is bounded by its u16 length; only a
+				// partial request can grow without limit.
+				if buf.first() != Some(&b'$') && buf.len() > MAX_REQUEST_BYTES {
+					tracing::warn!("request buffer exceeded limit, closing");
+					return false;
+				}
+				return true;
+			}
+			Err(e) => {
+				tracing::warn!(error = %e, "malformed RTSP request, closing");
+				let resp = crate::rtsp::message::build_response(
+					rtsp_types::StatusCode::BadRequest,
+					0,
+					&[],
+					None,
+				);
+				let _ = write_response(state, &resp).await;
+				return false;
+			}
+		}
+	}
+}
+
+/// One complete message at the head of the read buffer.
+#[derive(Debug, PartialEq, Eq)]
+enum Inbound {
+	/// A client-to-server `$`-framed packet (RFC 2326 §10.12), already
+	/// drained. Its content (RTCP RR) is not parsed.
+	Interleaved,
+	/// The bytes of one RTSP request, body included.
+	Request(Vec<u8>),
+}
+
+/// Slice the next complete message off the front of `buf`; `Ok(None)` if
+/// more bytes are needed.
+fn try_consume(buf: &mut Vec<u8>) -> Result<Option<Inbound>, String> {
+	// Tolerate stray CRLFs between messages (some clients send them as a
+	// keepalive), as HTTP/1.1 servers do.
+	let blank = buf
+		.iter()
+		.take_while(|&&b| b == b'\r' || b == b'\n')
+		.count();
+	buf.drain(..blank);
+	if buf.first() == Some(&b'$') {
+		let Some(len) = buf.get(2..4) else {
+			return Ok(None);
+		};
+		let total = 4 + usize::from(u16::from_be_bytes([len[0], len[1]]));
+		if buf.len() < total {
+			return Ok(None);
+		}
+		buf.drain(..total);
+		return Ok(Some(Inbound::Interleaved));
+	}
+	try_consume_request(buf).map(|r| r.map(Inbound::Request))
 }
 
 /// Attempt to slice out exactly one RTSP request from `buf`. Returns:
@@ -274,18 +324,29 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 /// Dispatch a parsed request to the right handler.
 ///
 /// Parses `req_bytes` as a single RTSP request, then matches on
-/// [`RtspMethod`] to invoke the per-method handler. On a parse failure
-/// we emit a `400 Bad Request` with `CSeq: 0` and return an error so
-/// the connection loop closes the socket.
+/// [`RtspMethod`] to invoke the per-method handler. An unsupported method
+/// gets `501` and the connection stays up. Any other parse failure gets
+/// `400 Bad Request` with `CSeq: 0` and an error so the connection loop
+/// closes the socket.
 #[tracing::instrument(skip_all)]
 pub(crate) async fn dispatch_request(
 	state: &Arc<ConnectionState>,
 	req_bytes: &[u8],
 ) -> io::Result<()> {
-	use crate::rtsp::message::{RtspMethod, build_response, parse_request};
+	use crate::rtsp::message::{MessageError, RtspMethod, build_response, parse_request};
 
 	let parsed = match parse_request(req_bytes) {
 		Ok(p) => p,
+		Err(MessageError::UnsupportedMethod { method, cseq }) => {
+			tracing::debug!(method, "unsupported RTSP method");
+			let resp = build_response(
+				rtsp_types::StatusCode::NotImplemented,
+				cseq,
+				&[("Public", PUBLIC_METHODS.to_string())],
+				None,
+			);
+			return write_response(state, &resp).await;
+		}
 		Err(e) => {
 			let resp = build_response(rtsp_types::StatusCode::BadRequest, 0, &[], None);
 			write_response(state, &resp).await?;
@@ -314,6 +375,7 @@ pub(crate) async fn dispatch_request(
 	match parsed.method {
 		RtspMethod::Options => handle_options(state, cseq).await,
 		RtspMethod::GetParameter => handle_getparameter(state, cseq, &parsed).await,
+		RtspMethod::SetParameter => handle_setparameter(state, cseq, &parsed).await,
 		RtspMethod::Pause => handle_pause(state, cseq, &parsed).await,
 		RtspMethod::Describe => handle_describe(state, cseq, &parsed).await,
 		RtspMethod::Setup => handle_setup(state, cseq, &parsed).await,
@@ -329,17 +391,38 @@ async fn write_response(state: &Arc<ConnectionState>, resp: &[u8]) -> io::Result
 	Ok(())
 }
 
+/// `Public:` header value for OPTIONS and 501 responses.
+const PUBLIC_METHODS: &str =
+	"OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER, PAUSE";
+
 async fn handle_options(state: &Arc<ConnectionState>, cseq: u32) -> io::Result<()> {
 	let resp = crate::rtsp::message::build_response(
 		rtsp_types::StatusCode::Ok,
 		cseq,
-		&[(
-			"Public",
-			"OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, PAUSE".to_string(),
-		)],
+		&[("Public", PUBLIC_METHODS.to_string())],
 		None,
 	);
 	write_response(state, &resp).await
+}
+
+/// SET_PARAMETER with an empty body is a keepalive (the session was
+/// already touched by the dispatcher). We have no settable parameters, so
+/// a non-empty body gets 451.
+async fn handle_setparameter(
+	state: &Arc<ConnectionState>,
+	cseq: u32,
+	parsed: &crate::rtsp::message::ParsedRequest,
+) -> io::Result<()> {
+	if parsed.has_body {
+		let resp = crate::rtsp::message::build_response(
+			rtsp_types::StatusCode::ParameterNotUnderstood,
+			cseq,
+			&[],
+			None,
+		);
+		return write_response(state, &resp).await;
+	}
+	handle_getparameter(state, cseq, parsed).await
 }
 
 async fn handle_getparameter(
@@ -1453,6 +1536,189 @@ mod tests {
 		cancel.cancel();
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
 		drop(client);
+	}
+
+	/// Run `handle_connection` on one end of a duplex; returns the client
+	/// end, the cancel token and the task.
+	fn spawn_connection(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+	) -> (
+		tokio::io::DuplexStream,
+		CancellationToken,
+		tokio::task::JoinHandle<()>,
+	) {
+		let (client, server) = tokio::io::duplex(256 * 1024);
+		let cancel = CancellationToken::new();
+		let lo = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+		let task = tokio::spawn(handle_connection(
+			server,
+			provider,
+			vec![],
+			"test".into(),
+			Arc::new(crate::server::udp_pool::UdpPortPool::new()),
+			lo,
+			lo,
+			lo,
+			false,
+			cancel.clone(),
+		));
+		(client, cancel, task)
+	}
+
+	/// Reads RTSP responses off a client stream, keeping leftover bytes
+	/// between calls and skipping `$`-framed media.
+	#[derive(Default)]
+	struct ResponseReader {
+		buf: Vec<u8>,
+		/// `$` frames seen so far, as (channel, payload).
+		frames: Vec<(u8, Vec<u8>)>,
+	}
+
+	impl ResponseReader {
+		async fn next(&mut self, client: &mut tokio::io::DuplexStream) -> String {
+			use tokio::io::AsyncReadExt;
+			loop {
+				if self.buf.first() == Some(&b'$') && self.buf.len() >= 4 {
+					let len = usize::from(u16::from_be_bytes([self.buf[2], self.buf[3]]));
+					if self.buf.len() >= 4 + len {
+						let frame: Vec<u8> = self.buf.drain(..4 + len).collect();
+						self.frames.push((frame[1], frame[4..].to_vec()));
+						continue;
+					}
+				} else if let Some(pos) = find_double_crlf(&self.buf) {
+					let head = String::from_utf8(self.buf[..pos + 4].to_vec()).unwrap();
+					let cl = parse_content_length(head.as_bytes()).unwrap_or(0);
+					if self.buf.len() >= pos + 4 + cl {
+						self.buf.drain(..pos + 4 + cl);
+						return head;
+					}
+				}
+				let mut tmp = [0u8; 4096];
+				let n =
+					tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut tmp))
+						.await
+						.expect("timed out waiting for response")
+						.unwrap();
+				assert!(n > 0, "connection closed while waiting for a response");
+				self.buf.extend_from_slice(&tmp[..n]);
+			}
+		}
+	}
+
+	fn session_of(head: &str) -> String {
+		head.split("\r\n")
+			.find_map(|l| l.strip_prefix("Session: "))
+			.expect("Session header")
+			.split(';')
+			.next()
+			.unwrap()
+			.to_string()
+	}
+
+	#[tokio::test]
+	async fn pipelined_requests_in_one_read_all_get_answered() {
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		client
+			.write_all(
+				b"OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 1\r\n\r\n\
+				  OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\n\r\n",
+			)
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		assert!(rr.next(&mut client).await.contains("CSeq: 1"));
+		assert!(rr.next(&mut client).await.contains("CSeq: 2"));
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn client_interleaved_frames_are_demuxed_not_parsed_as_requests() {
+		// GStreamer/live555 send RTCP RR on the interleaved RTCP channel.
+		// The frame (split across writes, then glued to the next request)
+		// must be drained, not prepended to the request and 400'd.
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		let mut rr = ResponseReader::default();
+		client
+			.write_all(b"SETUP rtsp://x/cam1/main/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n")
+			.await
+			.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		let sid = session_of(&head);
+
+		let rtcp_rr = [0x81u8, 201, 0x00, 0x07, 1, 2, 3, 4];
+		let mut frame = vec![b'$', 1, 0, rtcp_rr.len() as u8];
+		frame.extend_from_slice(&rtcp_rr);
+		client.write_all(&frame[..3]).await.unwrap();
+		tokio::task::yield_now().await;
+		let mut rest = frame[3..].to_vec();
+		rest.extend_from_slice(
+			format!("GET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\nSession: {sid}\r\n\r\n")
+				.as_bytes(),
+		);
+		client.write_all(&rest).await.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200, "{head}");
+		assert!(head.contains("CSeq: 2"));
+		assert!(!task.is_finished());
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[test]
+	fn try_consume_waits_for_whole_interleaved_frame() {
+		let mut buf = vec![b'$', 1, 0, 4, 0xaa];
+		assert_eq!(try_consume(&mut buf).unwrap(), None);
+		buf.extend_from_slice(&[0xbb, 0xcc, 0xdd]);
+		buf.extend_from_slice(b"\r\nOPTIONS / RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+		assert_eq!(try_consume(&mut buf).unwrap(), Some(Inbound::Interleaved));
+		assert!(matches!(
+			try_consume(&mut buf).unwrap(),
+			Some(Inbound::Request(r)) if r.starts_with(b"OPTIONS")
+		));
+		assert!(buf.is_empty());
+	}
+
+	#[tokio::test]
+	async fn unsupported_method_gets_501_and_connection_stays_open() {
+		use tokio::io::AsyncWriteExt;
+		let (mut client, cancel, task) = spawn_connection(MockProv::with_cameras(&["cam1"]));
+		client
+			.write_all(
+				b"ANNOUNCE rtsp://x/cam1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 3\r\n\r\nv=0",
+			)
+			.await
+			.unwrap();
+		let mut rr = ResponseReader::default();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 501);
+		assert!(head.contains("CSeq: 3"));
+		client
+			.write_all(b"OPTIONS rtsp://x/cam1 RTSP/1.0\r\nCSeq: 4\r\n\r\n")
+			.await
+			.unwrap();
+		assert_eq!(status_of(&rr.next(&mut client).await), 200);
+		cancel.cancel();
+		task.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn set_parameter_empty_body_is_keepalive_and_body_gets_451() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let (state, mut client) = make_state(provider);
+		let req = b"SET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 2\r\nSession: abc\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		assert!(head.contains("Session: abc"));
+		let req =
+			b"SET_PARAMETER rtsp://x/cam1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 6\r\n\r\nfoo: 1";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 451);
 	}
 
 	#[tokio::test]

@@ -17,9 +17,16 @@ pub enum MessageError {
 	/// response/data message rather than a request.
 	#[error("malformed RTSP message")]
 	Malformed,
-	/// The request used a method we do not accept (e.g. `RECORD`).
-	#[error("unsupported method: {0}")]
-	UnsupportedMethod(String),
+	/// The request used a method we do not accept (e.g. `RECORD`). Carries
+	/// the parsed `CSeq` so the server can answer `501` and keep the
+	/// connection open.
+	#[error("unsupported method: {method}")]
+	UnsupportedMethod {
+		/// Method token as sent by the client.
+		method: String,
+		/// The request's `CSeq`.
+		cseq: u32,
+	},
 	/// The mandatory `CSeq` header was absent or not a valid integer.
 	#[error("missing CSeq header")]
 	MissingCSeq,
@@ -42,6 +49,9 @@ pub enum RtspMethod {
 	Pause,
 	/// `GET_PARAMETER` — keepalive / parameter query.
 	GetParameter,
+	/// `SET_PARAMETER` — some clients send it with an empty body as a
+	/// keepalive.
+	SetParameter,
 }
 
 impl RtspMethod {
@@ -56,6 +66,7 @@ impl RtspMethod {
 			Method::Teardown => RtspMethod::Teardown,
 			Method::Pause => RtspMethod::Pause,
 			Method::GetParameter => RtspMethod::GetParameter,
+			Method::SetParameter => RtspMethod::SetParameter,
 			_ => return None,
 		})
 	}
@@ -70,6 +81,7 @@ impl RtspMethod {
 			RtspMethod::Teardown => "TEARDOWN",
 			RtspMethod::Pause => "PAUSE",
 			RtspMethod::GetParameter => "GET_PARAMETER",
+			RtspMethod::SetParameter => "SET_PARAMETER",
 		}
 	}
 }
@@ -94,12 +106,15 @@ pub struct ParsedRequest {
 	pub transport: Option<String>,
 	/// `Range` header, unparsed.
 	pub range: Option<String>,
+	/// Whether the request carried a non-empty body.
+	pub has_body: bool,
 }
 
 /// Parse a buffer containing exactly one RTSP request.
 ///
-/// Returns an error if the message is malformed, is not a request, uses an
-/// unsupported method, or lacks a valid `CSeq` header.
+/// Returns an error if the message is malformed, is not a request, lacks
+/// a valid `CSeq` header, or uses an unsupported method (checked after
+/// `CSeq`, so the error can carry it).
 pub fn parse_request(buf: &[u8]) -> Result<ParsedRequest, MessageError> {
 	let (msg, _) = Message::<Vec<u8>>::parse(buf).map_err(|_| MessageError::Malformed)?;
 	let req: Request<Vec<u8>> = match msg {
@@ -107,18 +122,22 @@ pub fn parse_request(buf: &[u8]) -> Result<ParsedRequest, MessageError> {
 		_ => return Err(MessageError::Malformed),
 	};
 
-	let method = RtspMethod::from_rtsp_types(req.method())
-		.ok_or_else(|| MessageError::UnsupportedMethod(format!("{:?}", req.method())))?;
-	let uri = req
-		.request_uri()
-		.ok_or(MessageError::Malformed)?
-		.to_string();
-
 	let cseq: u32 = req
 		.headers()
 		.find(|(n, _)| n.as_str().eq_ignore_ascii_case("CSeq"))
 		.and_then(|(_, v)| v.as_str().trim().parse().ok())
 		.ok_or(MessageError::MissingCSeq)?;
+
+	let method = RtspMethod::from_rtsp_types(req.method()).ok_or_else(|| {
+		MessageError::UnsupportedMethod {
+			method: <&str>::from(req.method()).to_string(),
+			cseq,
+		}
+	})?;
+	let uri = req
+		.request_uri()
+		.ok_or(MessageError::Malformed)?
+		.to_string();
 
 	let header_str = |name: &str| -> Option<String> {
 		req.headers()
@@ -138,6 +157,7 @@ pub fn parse_request(buf: &[u8]) -> Result<ParsedRequest, MessageError> {
 		user_agent: header_str("User-Agent"),
 		transport: header_str("Transport"),
 		range: header_str("Range"),
+		has_body: !req.body().is_empty(),
 	})
 }
 
@@ -234,6 +254,7 @@ mod tests {
 		assert_eq!(RtspMethod::Teardown.as_str(), "TEARDOWN");
 		assert_eq!(RtspMethod::Pause.as_str(), "PAUSE");
 		assert_eq!(RtspMethod::GetParameter.as_str(), "GET_PARAMETER");
+		assert_eq!(RtspMethod::SetParameter.as_str(), "SET_PARAMETER");
 	}
 
 	#[test]
@@ -301,12 +322,31 @@ mod tests {
 	}
 
 	#[test]
-	fn unsupported_method_yields_unsupported_error() {
-		let raw = b"RECORD rtsp://host/cam1 RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+	fn unsupported_method_carries_method_and_cseq() {
+		let raw = b"ANNOUNCE rtsp://host/cam1 RTSP/1.0\r\nCSeq: 7\r\n\r\n";
+		match parse_request(raw) {
+			Err(MessageError::UnsupportedMethod { method, cseq }) => {
+				assert_eq!(method, "ANNOUNCE");
+				assert_eq!(cseq, 7);
+			}
+			other => panic!("expected UnsupportedMethod, got {other:?}"),
+		}
+		// Extension methods parse too.
+		let raw = b"FROB rtsp://host/cam1 RTSP/1.0\r\nCSeq: 8\r\n\r\n";
 		assert!(matches!(
 			parse_request(raw),
-			Err(MessageError::UnsupportedMethod(_))
+			Err(MessageError::UnsupportedMethod { cseq: 8, .. })
 		));
+	}
+
+	#[test]
+	fn parses_set_parameter_body_presence() {
+		let raw = b"SET_PARAMETER rtsp://host/cam1 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+		let p = parse_request(raw).unwrap();
+		assert_eq!(p.method, RtspMethod::SetParameter);
+		assert!(!p.has_body);
+		let raw = b"SET_PARAMETER rtsp://host/cam1 RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 6\r\n\r\nfoo: 1";
+		assert!(parse_request(raw).unwrap().has_body);
 	}
 
 	#[test]
