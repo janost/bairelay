@@ -281,7 +281,7 @@ Match neolink's wire behaviour exactly:
 
 ### Talk ADPCM block layout (DVI4)
 
-The talk encoder (`src/talk/adpcm.rs`) matches GStreamer `adpcmenc layout=dvi blockalign=<n>` as used by the neolink talk client. Block size is `length_per_encoder / 2 + 4` bytes (516 for the default 1024); `BcCamera::talk` chunks its input by the same size. Each mono block is: first sample as `i16` LE, step index (0–88, carried over from the previous block), one reserved zero byte, then `2 * (n - 4)` 4-bit codes, low nibble first — 1025 samples per 516-byte block. The predictor restarts from the header sample each block. The last block is padded with silence.
+The talk encoder (`encode_dvi4` in `crates/rtsp/src/transcode/adpcm.rs`, next to the RTSP-side decoder and sharing its tables and nibble update) matches GStreamer `adpcmenc layout=dvi blockalign=<n>` as used by the neolink talk client. Block size is `length_per_encoder / 2 + 4` bytes (516 for the default 1024); `BcCamera::talk` chunks its input by the same size. Each mono block is: first sample as `i16` LE, step index (0–88, carried over from the previous block), one reserved zero byte, then `2 * (n - 4)` 4-bit codes, low nibble first — 1025 samples per 516-byte block. The predictor restarts from the header sample each block. The last block is padded with silence.
 
 ### HEVC NAL whitelist (`is_decodable_nal`)
 

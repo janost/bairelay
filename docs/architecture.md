@@ -28,7 +28,7 @@ bairelay/
 Owns the application lifecycle:
 
 - CLI parsing via `clap` — service modes (`mqtt` / `rtsp` / `mqtt-rtsp`), one-shot camera commands (`reboot`, `snapshot`, `battery`, `talk`, etc.), and `check-config` (parse + validate + warn, no camera connect).
-- Two-way audio (`src/talk/`) — WAV reader, linear resampler and DVI4 IMA ADPCM encoder, plus the `TalkConfig` resolver shared by the `talk` one-shot and the MQTT `control/talk` topic.
+- Two-way audio (`src/talk/`) — WAV reader and linear resampler, plus the `TalkConfig` resolver shared by the `talk` one-shot and the MQTT `control/talk` topic.
 - TOML configuration loading and validation.
 - Camera orchestrator: spawns per-camera task trees, manages connections.
 - Wake-lock counter with dual `Notify` and Drop-based RAII guards.
@@ -61,7 +61,7 @@ Pure-Rust RTSP server:
 - H.264 RTP packetisation per RFC 6184 (NAL fragmentation, SPS/PPS handling).
 - H.265 RTP packetisation per RFC 7798 (FU fragmentation, VPS/SPS/PPS handling).
 - AAC (RFC 3640 AU-hbr) and G.711 µ-law (RFC 3551 PT 0) audio.
-- ADPCM → G.711 transcode with 16 → 8 kHz resample.
+- ADPCM → G.711 transcode with 16 → 8 kHz resample, and the DVI4 IMA ADPCM encoder for talk.
 - TCP-interleaved transport (RTP-over-RTSP) and UDP-unicast transport. Client `$` frames (RTCP RR) are drained and count as session keepalive; pipelined requests are all answered. Every TCP write is capped at 5 s so a client that stops reading can't pin a session.
 - PLAY writes its response (with `RTP-Info` built from the SETUP-chosen first seq, the replayed keyframe's timestamp and each track's SETUP URL) before releasing media.
 - Unsupported methods get 501 and keep the connection; empty-body SET_PARAMETER is a keepalive.

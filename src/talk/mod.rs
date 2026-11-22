@@ -4,10 +4,9 @@
 //! `control/talk` topic. The flow ports the neolink talk client: query
 //! `TalkAbility`, resolve the `TalkConfig` with a three-tier fallback,
 //! encode the audio to DVI4 IMA ADPCM, and send it with one `talk`
-//! call. GStreamer is replaced by the pure-Rust [`wav`] reader and
-//! [`adpcm`] encoder.
+//! call. GStreamer is replaced by the pure-Rust [`wav`] reader and the
+//! [`adpcm::encode_dvi4`] encoder.
 
-pub mod adpcm;
 pub mod wav;
 
 use std::time::Duration;
@@ -17,7 +16,16 @@ use bairelay_neolink_core::bc::xml::{AudioConfig, TalkAbility, TalkConfig};
 use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as BcError};
 
 use crate::config::{CameraConfig, TalkConfigOverride};
+use bairelay_rtsp::transcode::adpcm;
 use wav::MonoPcm;
+
+/// ADPCM block size in bytes for a camera `length_per_encoder`, as
+/// neolink computes it (`src/talk/mod.rs:98`): `length_per_encoder / 2`
+/// data bytes plus the 4-byte header. The core `BcCamera::talk` chunks
+/// its input by the same size.
+pub fn block_align_for(length_per_encoder: u16) -> usize {
+	usize::from(length_per_encoder / 2) + adpcm::BLOCK_HEADER_LEN
+}
 
 /// Longest clip `talk` accepts. Playback holds the camera awake for
 /// the whole clip, so a mistaken multi-hour file must not drain a
@@ -277,7 +285,7 @@ pub fn encode_for(clip: &MonoPcm, cfg: &TalkConfig, volume: f32) -> Result<Vec<u
 	wav::apply_volume(&mut pcm, volume);
 	Ok(adpcm::encode_dvi4(
 		&pcm,
-		adpcm::block_align_for(ac.length_per_encoder),
+		block_align_for(ac.length_per_encoder),
 	))
 }
 
@@ -345,7 +353,7 @@ pub async fn play(
 		"talk: TalkConfig resolved"
 	);
 	let adpcm = encode_for(clip, &cfg, volume)?;
-	let block_align = adpcm::block_align_for(ac.length_per_encoder);
+	let block_align = block_align_for(ac.length_per_encoder);
 	let summary = TalkSummary {
 		source,
 		sample_rate: ac.sample_rate,
@@ -448,6 +456,11 @@ mod tests {
 			resolve_talk_config(&TalkAbility::default(), Some(&o)),
 			defaults()
 		);
+	}
+
+	#[test]
+	fn reolink_default_block_align() {
+		assert_eq!(block_align_for(1024), 516);
 	}
 
 	#[test]

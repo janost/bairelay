@@ -12,7 +12,7 @@ Two-way audio (talk), ported from the neolink talk client:
 
 - talk: `talk` one-shot and `control/talk` topic
 - talk: three-tier `TalkConfig` resolver (config table, camera `TalkAbility`, Reolink defaults)
-- talk: WAV reader, linear resampler, DVI4 IMA ADPCM encoder
+- talk: WAV reader and linear resampler; DVI4 IMA ADPCM encoder in `bairelay-rtsp` next to the decoder
 - config: `[cameras.talk_config]` table and `talk_dir` (absolute, existing directory), validated by `check-config`
 - core: `talk` and `talk_stop` no longer gate on `two_way_audio` (neolink parity; the binary checks it unless `[cameras.talk_config]` is set); fix underflow on a short last talk payload
 - core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
