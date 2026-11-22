@@ -13,12 +13,65 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::buffer::VideoBurst;
 use crate::server::transport::Transport;
 
-/// Shared slot holding the `(sequence_number, rtp_timestamp)` of the first
-/// video RTP packet sent on a session. Populated by the session send loop
-/// and read by the PLAY handler to emit `RTP-Info:`.
-pub type FirstVideoRtpSlot = Arc<Mutex<Option<(u16, u32)>>>;
+/// Releases a session's send loop on PLAY (RFC 2326 §10.5: no media
+/// before PLAY; HA's go2rtc `ffmpeg:` wrap broke its RECORD pipe when RTP
+/// arrived between its two SETUPs) and hands it the keyframe burst the
+/// PLAY response's `RTP-Info` already describes.
+pub struct PlayGate {
+	open: AtomicBool,
+	notify: Notify,
+	replay: Mutex<Option<VideoBurst>>,
+}
+
+impl PlayGate {
+	/// A closed gate.
+	pub fn new() -> Self {
+		Self {
+			open: AtomicBool::new(false),
+			notify: Notify::new(),
+			replay: Mutex::new(None),
+		}
+	}
+
+	/// Has PLAY already released this session?
+	pub fn is_open(&self) -> bool {
+		self.open.load(Ordering::SeqCst)
+	}
+
+	/// Release the send loop, which replays `replay` first. Only the first
+	/// call has an effect; a repeated PLAY must not re-arm a replay.
+	pub fn open(&self, replay: Option<VideoBurst>) {
+		{
+			let mut slot = self.replay.lock().expect("replay lock poisoned");
+			if self.is_open() {
+				return;
+			}
+			*slot = replay;
+			self.open.store(true, Ordering::SeqCst);
+		}
+		self.notify.notify_waiters();
+	}
+
+	/// Wait for [`open`](Self::open), then take the replay burst.
+	pub async fn wait(&self) -> Option<VideoBurst> {
+		// `notified()` registers for `notify_waiters` on creation, so an
+		// `open` between this line and the flag check is not lost.
+		let notified = self.notify.notified();
+		if !self.is_open() {
+			notified.await;
+		}
+		self.replay.lock().expect("replay lock poisoned").take()
+	}
+}
+
+impl Default for PlayGate {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 
 /// Kind of media carried by a [`TrackEntry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +95,13 @@ pub struct TrackEntry {
 	/// SSRC echoed in the SETUP Transport response and used by the session
 	/// send loop when framing RTP packets for this track.
 	pub ssrc: u32,
+	/// Sequence number of the track's first RTP packet (random per RFC
+	/// 3550), chosen at SETUP so PLAY can report it in `RTP-Info` before
+	/// any packet is sent.
+	pub initial_seq: u16,
+	/// The SETUP request URI. Echoed as `url=` in `RTP-Info`; clients
+	/// match it against the track's control URL.
+	pub control_uri: String,
 }
 
 /// Per-session state tracked by the registry.
@@ -67,35 +127,13 @@ pub struct SessionEntry {
 	/// second SETUP on the next loop iteration, without having to
 	/// restart the task.
 	pub tracks: Arc<Mutex<Vec<TrackEntry>>>,
-	/// `(sequence_number, rtp_timestamp)` of the first RTP packet sent on
-	/// the session's video track. Populated by the session send loop on
-	/// its first `Frame::Video` transmission and read by the PLAY handler
-	/// to render the `RTP-Info:` response header (RFC 2326 §12.33).
-	///
-	/// `None` until the first packet is on the wire. If PLAY is answered
-	/// before that (rare — the send loop starts at SETUP), the header is
-	/// omitted; most clients tolerate the absence.
-	pub first_video_rtp: FirstVideoRtpSlot,
-	/// Gate that releases the session send loop on PLAY, per RFC 2326
-	/// §10.4/§10.5: a server MUST NOT send media data until PLAY.
-	/// Without this gate the send loop replays the cached burst +
-	/// live frames immediately on SETUP, which confuses downstream
-	/// RTSP re-publishers (observed live: HA's go2rtc `ffmpeg:` wrap
-	/// broke its downstream RECORD pipe after the first flushed
-	/// video packet because RTP arrived between the two SETUPs).
-	/// Fired once by the PLAY handler via `mark_playing`.
-	pub play_signal: Arc<tokio::sync::Notify>,
-	/// Has PLAY been issued for this session? Paired with
-	/// `play_signal` so the session task can skip the wait if PLAY
-	/// fired BEFORE the task parked on the notify. Ordering: set
-	/// flag first, then fire notify — the waiter checks the flag
-	/// after registering for the notify, so it can't miss the edge.
-	pub play_fired: Arc<AtomicBool>,
+	/// Opened by the PLAY handler after it has written the PLAY response.
+	pub play: Arc<PlayGate>,
 }
 
 impl SessionEntry {
-	/// Construct a new entry with a fresh `last_activity` and a freshly
-	/// allocated `first_video_rtp` slot. `tracks` holds whatever initial
+	/// Construct a new entry with a fresh `last_activity` and a closed
+	/// [`PlayGate`]. `tracks` holds whatever initial
 	/// tracks the caller has already negotiated (normally exactly one
 	/// Video track from the first SETUP; an audio track may be appended
 	/// later via [`append_track`](Self::append_track)).
@@ -111,9 +149,7 @@ impl SessionEntry {
 			path,
 			last_activity: Mutex::new(Instant::now()),
 			tracks: Arc::new(Mutex::new(tracks)),
-			first_video_rtp: Arc::new(Mutex::new(None)),
-			play_signal: Arc::new(Notify::new()),
-			play_fired: Arc::new(AtomicBool::new(false)),
+			play: Arc::new(PlayGate::new()),
 		}
 	}
 
@@ -126,15 +162,6 @@ impl SessionEntry {
 			.lock()
 			.expect("tracks lock poisoned")
 			.push(track);
-	}
-
-	/// Mark the session as playing and release the session send loop.
-	/// Idempotent — multiple PLAYs on the same session (client resend
-	/// or paused→play) just refresh the notify. The flag survives so
-	/// subsequent send-loop iterations don't re-park.
-	pub fn mark_playing(&self) {
-		self.play_fired.store(true, Ordering::SeqCst);
-		self.play_signal.notify_waiters();
 	}
 }
 
@@ -216,16 +243,11 @@ impl SessionRegistry {
 		entries.get(id).map(|e| e.path.clone())
 	}
 
-	/// Clone the `Arc` holding the first-video-packet (seq, rtptime) slot
-	/// for the given session, if it exists. Returns `None` if the session
-	/// is not registered. The returned Arc may still contain `None`
-	/// inside its mutex until the session task has sent its first video
-	/// packet.
-	pub fn first_video_rtp(&self, id: &str) -> Option<FirstVideoRtpSlot> {
+	/// Run `f` against the session's entry under the registry lock.
+	/// Returns `None` if the session is not registered.
+	pub fn with_entry<R>(&self, id: &str, f: impl FnOnce(&SessionEntry) -> R) -> Option<R> {
 		let entries = self.entries.lock().expect("registry lock poisoned");
-		entries
-			.get(id)
-			.map(|e| std::sync::Arc::clone(&e.first_video_rtp))
+		entries.get(id).map(f)
 	}
 
 	/// Clone the `Arc` holding the track list for the given session, if
@@ -236,24 +258,6 @@ impl SessionRegistry {
 	pub fn tracks_arc(&self, id: &str) -> Option<Arc<Mutex<Vec<TrackEntry>>>> {
 		let entries = self.entries.lock().expect("registry lock poisoned");
 		entries.get(id).map(|e| Arc::clone(&e.tracks))
-	}
-
-	/// Clone the `(Arc<Notify>, Arc<AtomicBool>)` pair that gates the
-	/// session send loop on PLAY. Returned so the spawn can park until
-	/// the PLAY handler fires `mark_playing`.
-	pub fn play_gate_arc(&self, id: &str) -> Option<(Arc<tokio::sync::Notify>, Arc<AtomicBool>)> {
-		let entries = self.entries.lock().expect("registry lock poisoned");
-		entries
-			.get(id)
-			.map(|e| (Arc::clone(&e.play_signal), Arc::clone(&e.play_fired)))
-	}
-
-	/// Mark a session as playing — called by the PLAY handler. Idempotent.
-	pub fn mark_playing(&self, id: &str) {
-		let entries = self.entries.lock().expect("registry lock poisoned");
-		if let Some(e) = entries.get(id) {
-			e.mark_playing();
-		}
 	}
 
 	/// Append a track to an existing session. No-op if the session ID is
@@ -390,6 +394,8 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0x1234_5678,
+			initial_seq: 0,
+			control_uri: String::new(),
 		};
 		let entry = SessionEntry::new(cancel, stub_subscription(), stub_path(), vec![track]);
 		assert_eq!(entry.tracks.lock().expect("tracks lock").len(), 1);
@@ -406,11 +412,15 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xAAAA,
+			initial_seq: 0,
+			control_uri: String::new(),
 		};
 		let audio = TrackEntry {
 			kind: TrackKind::Audio,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xBBBB,
+			initial_seq: 0,
+			control_uri: String::new(),
 		};
 		let entry = SessionEntry::new(cancel, stub_subscription(), stub_path(), vec![video]);
 		entry.append_track(audio);
@@ -427,6 +437,8 @@ mod tests {
 			kind: TrackKind::Video,
 			transport: crate::server::transport::noop_transport_for_tests(),
 			ssrc: 0xABCDEF01,
+			initial_seq: 0,
+			control_uri: String::new(),
 		}
 	}
 

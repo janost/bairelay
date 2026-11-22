@@ -53,21 +53,40 @@ impl TcpInterleavedTransport {
 				"packet too large",
 			));
 		}
-		// Mutex held across all four awaits so the four-byte `$ ch len`
-		// header + payload + flush stay atomic on the wire. Without this,
-		// concurrent senders (parallel video + audio dispatch tasks) would
-		// interleave bytes mid-frame and the receiver would resync at the
-		// next `$` it found, mis-attributing the trailing payload bytes
-		// to the wrong RTP channel. RFC 7826 §14 framing has no recovery
-		// once the boundary is lost. Per-packet locking is the contract;
-		// the lock is held for at most one ≤ MTU packet.
-		let mut w = self.writer.lock().await;
-		w.write_all(&[0x24, channel]).await?;
-		w.write_all(&(packet.len() as u16).to_be_bytes()).await?;
-		w.write_all(packet).await?;
-		w.flush().await?;
-		Ok(())
+		// One buffer, one locked write: the `$ ch len` header and payload
+		// must stay contiguous on the wire. Concurrent senders (parallel
+		// video + audio dispatch tasks) would otherwise interleave bytes
+		// mid-frame, and RFC 7826 §14 framing has no recovery once the
+		// boundary is lost. The lock is held for at most one ≤ MTU packet.
+		let mut frame = Vec::with_capacity(4 + packet.len());
+		frame.extend_from_slice(&[b'$', channel]);
+		frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+		frame.extend_from_slice(packet);
+		write_all_bounded(&self.writer, &frame).await
 	}
+}
+
+/// Upper bound on one write to the RTSP TCP stream. A client that stops
+/// reading (zero TCP window) would otherwise park the writer, and with it
+/// the session task and its camera wake lock, forever.
+pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Write and flush `bytes` under the shared writer's lock, failing with
+/// `TimedOut` after [`WRITE_TIMEOUT`]. The timeout starts once the lock is
+/// held: waiting behind another writer is already bounded by that
+/// writer's own timeout, and a slow-but-live client shouldn't fail a
+/// queued writer.
+pub(crate) async fn write_all_bounded(
+	writer: &Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>,
+	bytes: &[u8],
+) -> io::Result<()> {
+	let mut w = writer.lock().await;
+	tokio::time::timeout(WRITE_TIMEOUT, async {
+		w.write_all(bytes).await?;
+		w.flush().await
+	})
+	.await
+	.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RTSP client write timed out"))?
 }
 
 #[async_trait::async_trait]
@@ -214,6 +233,19 @@ mod tests {
 		let mut body = vec![0u8; len];
 		client_read.read_exact(&mut body).await.unwrap();
 		assert_eq!(&body, payload);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn tcp_interleaved_write_times_out_when_client_stops_reading() {
+		// 16-byte pipe the client never drains: a zero-window TCP peer.
+		let (_client, server) = tokio::io::duplex(16);
+		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
+			Arc::new(Mutex::new(Box::new(server)));
+		let transport = TcpInterleavedTransport::new(Arc::clone(&writer), 0);
+		let started = tokio::time::Instant::now();
+		let err = transport.send_rtp(&[0u8; 100]).await.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert!(started.elapsed() >= WRITE_TIMEOUT);
 	}
 
 	#[tokio::test]

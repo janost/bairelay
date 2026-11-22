@@ -10,7 +10,7 @@
 use std::io;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -385,10 +385,7 @@ pub(crate) async fn dispatch_request(
 }
 
 async fn write_response(state: &Arc<ConnectionState>, resp: &[u8]) -> io::Result<()> {
-	let mut w = state.writer.lock().await;
-	w.write_all(resp).await?;
-	w.flush().await?;
-	Ok(())
+	crate::server::transport::write_all_bounded(&state.writer, resp).await
 }
 
 /// `Public:` header value for OPTIONS and 501 responses.
@@ -842,6 +839,8 @@ async fn handle_setup(
 			kind: track_kind,
 			transport: Arc::clone(&transport_impl),
 			ssrc: track_ssrc,
+			initial_seq: rand::random(),
+			control_uri: parsed.uri.clone(),
 		};
 		state.sessions.append_track(&session_id, track);
 		let resp = crate::rtsp::message::build_response(
@@ -899,65 +898,36 @@ async fn handle_setup(
 		}
 	};
 
-	// Register the session in the registry, then spawn the send loop with
-	// handles pulled back out of the entry. `SessionEntry::new` constructs
-	// the `first_video_rtp` slot internally; we pull the `tracks` Arc and
-	// the first-video slot back out via registry getters. The send loop
-	// reads the shared `Arc<Mutex<Vec<TrackEntry>>>` on every iteration
-	// so a late SETUP that calls `append_track` becomes visible without
-	// restarting the task.
-	let cancel = CancellationToken::new();
-	let frames_rx = subscription.frames.resubscribe();
-	let last_frame = Arc::clone(&subscription.last_frame);
-	let cancel_for_task = cancel.clone();
-	let sessions_for_task = Arc::clone(&state.sessions);
-	let session_id_for_task = session_id.clone();
-
+	// Register the session, then spawn its send loop. The loop shares the
+	// entry's track list (so a later SETUP's `append_track` is visible
+	// without a restart) and parks on its PLAY gate, so no RTP flows
+	// between SETUP and PLAY.
 	let first_track = TrackEntry {
 		kind: track_kind,
 		transport: Arc::clone(&transport_impl),
 		ssrc: track_ssrc,
+		initial_seq: rand::random(),
+		control_uri: parsed.uri.clone(),
 	};
-	state.sessions.insert(
-		session_id.clone(),
-		crate::server::registry::SessionEntry::new(
-			cancel,
-			subscription,
-			resolved,
-			vec![first_track],
-		),
+	let cancel = CancellationToken::new();
+	let frames_rx = subscription.frames.resubscribe();
+	let entry = crate::server::registry::SessionEntry::new(
+		cancel.clone(),
+		subscription,
+		resolved,
+		vec![first_track],
 	);
-	let session_tracks_for_task = state
-		.sessions
-		.tracks_arc(&session_id)
-		.expect("tracks arc missing immediately after insert");
-	// Shared slot populated by the session task on its first video packet
-	// and read by the PLAY handler to emit `RTP-Info:` (RFC 2326 §12.33).
-	let first_video_rtp_for_task = state
-		.sessions
-		.first_video_rtp(&session_id)
-		.expect("session just inserted");
-	// PLAY gate — the session task parks on this until the client
-	// issues PLAY, so no RTP flows between SETUP and PLAY.
-	let (play_signal_for_task, play_fired_for_task) = state
-		.sessions
-		.play_gate_arc(&session_id)
-		.expect("session just inserted");
-
-	tokio::spawn(async move {
-		crate::server::session_task::run(
-			frames_rx,
-			last_frame,
-			session_tracks_for_task,
-			sessions_for_task,
-			session_id_for_task,
-			first_video_rtp_for_task,
-			cancel_for_task,
-			play_signal_for_task,
-			play_fired_for_task,
-		)
-		.await;
-	});
+	let tracks = Arc::clone(&entry.tracks);
+	let play = Arc::clone(&entry.play);
+	state.sessions.insert(session_id.clone(), entry);
+	tokio::spawn(crate::server::session_task::run(
+		frames_rx,
+		tracks,
+		Arc::clone(&state.sessions),
+		session_id.clone(),
+		play,
+		cancel,
+	));
 
 	// Respond 200 OK with Transport and Session headers.
 	let resp = crate::rtsp::message::build_response(
@@ -1047,7 +1017,13 @@ async fn handle_play(
 		);
 		return write_response(state, &resp).await;
 	};
-	if !state.sessions.contains(sid) {
+	let Some((play, last_frame, tracks)) = state.sessions.with_entry(sid, |e| {
+		(
+			Arc::clone(&e.play),
+			Arc::clone(&e.subscription.last_frame),
+			Arc::clone(&e.tracks),
+		)
+	}) else {
 		let resp = crate::rtsp::message::build_response(
 			rtsp_types::StatusCode::SessionNotFound,
 			cseq,
@@ -1055,50 +1031,54 @@ async fn handle_play(
 			None,
 		);
 		return write_response(state, &resp).await;
-	}
-	// Release the session send loop — RFC 2326 §10.5 PLAY starts
-	// media delivery. Must happen BEFORE we wait on first_video_rtp
-	// below, because the task is parked on play_signal and can't
-	// have sent its first video packet yet.
-	state.sessions.mark_playing(sid);
+	};
 
-	// Emit RTP-Info if the session has already sent at least one video
-	// packet (RFC 2326 §12.33). The track URI is echoed from the
-	// request-URI — real clients (VLC/ffmpeg) expect this exact value
-	// when mapping RTP-Info entries to SDP tracks. If the first packet
-	// hasn't been transmitted yet we skip the header; most clients
-	// tolerate the absence. We wait briefly (up to ~200 ms) to let the
-	// send loop record its first packet — after mark_playing the task
-	// unparks and the cached-burst replay typically completes well
-	// within that window.
 	let mut headers: Vec<(&'static str, String)> =
 		vec![("Session", sid.clone()), ("Range", "npt=now-".to_string())];
-	if let Some(slot) = state.sessions.first_video_rtp(sid) {
-		let mut found: Option<(u16, u32)> = None;
-		for _ in 0..10 {
-			if let Ok(guard) = slot.lock()
-				&& let Some(pair) = *guard
-			{
-				found = Some(pair);
-				break;
-			}
-			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-		}
-		if let Some((seq, rtptime)) = found {
-			headers.push((
-				"RTP-Info",
-				format!("url={};seq={};rtptime={}", parsed.uri, seq, rtptime),
-			));
-		} else {
-			tracing::debug!(
-				session = %sid,
-				"no video packet sent yet at PLAY time; omitting RTP-Info"
-			);
-		}
-	}
+	// A repeated PLAY on a running session: media is already flowing, so
+	// there is no "first packet" left to describe.
+	let replay = if play.is_open() {
+		None
+	} else {
+		// Snapshot the burst once: the same value is described in
+		// RTP-Info and handed to the send loop for replay.
+		let replay = last_frame
+			.video_snapshot()
+			.filter(|b| !b.iframe_nals.is_empty());
+		headers.push(("RTP-Info", rtp_info(&tracks, replay.as_ref())));
+		replay
+	};
 	let resp =
 		crate::rtsp::message::build_response(rtsp_types::StatusCode::Ok, cseq, &headers, None);
-	write_response(state, &resp).await
+	write_response(state, &resp).await?;
+	// Only now release media (RFC 2326 §10.5). ffmpeg skips `$` packets
+	// while it waits for the PLAY reply, so a replayed IDR sent earlier
+	// would be thrown away.
+	play.open(replay);
+	Ok(())
+}
+
+/// `RTP-Info` (RFC 2326 §12.33) for a PLAY that is about to start media:
+/// each track's SETUP URI and SETUP-chosen first sequence number, plus
+/// for video the replayed keyframe's timestamp when there is one. Live
+/// first-packet timestamps aren't known yet, so they are omitted.
+fn rtp_info(
+	tracks: &std::sync::Mutex<Vec<crate::server::registry::TrackEntry>>,
+	replay: Option<&crate::buffer::VideoBurst>,
+) -> String {
+	use crate::server::registry::TrackKind;
+	let tracks = tracks.lock().expect("session tracks lock poisoned");
+	tracks
+		.iter()
+		.map(|t| {
+			let mut s = format!("url={};seq={}", t.control_uri, t.initial_seq);
+			if let (TrackKind::Video, Some(b)) = (t.kind, replay) {
+				s.push_str(&format!(";rtptime={}", b.captured_pts_90khz));
+			}
+			s
+		})
+		.collect::<Vec<_>>()
+		.join(",")
 }
 
 /// Subscribe to a camera stream, transparently falling back from `Extern`
@@ -1275,6 +1255,8 @@ mod tests {
 		internal_error: std::sync::atomic::AtomicBool,
 		/// Names of known cameras.
 		known: std::sync::Mutex<Vec<String>>,
+		/// Keyframe burst seeded into each subscription's last-frame buffer.
+		burst: std::sync::Mutex<Option<crate::buffer::VideoBurst>>,
 	}
 
 	impl MockProv {
@@ -1315,6 +1297,10 @@ mod tests {
 				return Err(StreamError::Unavailable("extern-na".into()));
 			}
 			let (_tx, rx) = tokio::sync::broadcast::channel::<Frame>(16);
+			let last_frame = Arc::new(LastFrameBuffer::new());
+			if let Some(burst) = self.burst.lock().unwrap().clone() {
+				last_frame.replace_video(burst);
+			}
 			Ok(SubscriptionHandle {
 				frames: rx,
 				sdp_params: SdpParams {
@@ -1331,7 +1317,7 @@ mod tests {
 					}),
 					audio: None,
 				},
-				last_frame: Arc::new(LastFrameBuffer::new()),
+				last_frame,
 				guard: Box::new(()),
 			})
 		}
@@ -1603,7 +1589,24 @@ mod tests {
 	}
 
 	impl ResponseReader {
+		/// Next RTSP response head; `$` frames before it go to `frames`.
 		async fn next(&mut self, client: &mut tokio::io::DuplexStream) -> String {
+			self.read_until(client, false).await.unwrap()
+		}
+
+		/// Next `$` frame; fails if an RTSP response arrives first.
+		async fn frame(&mut self, client: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+			if self.frames.is_empty() {
+				assert!(self.read_until(client, true).await.is_none());
+			}
+			self.frames.remove(0)
+		}
+
+		async fn read_until(
+			&mut self,
+			client: &mut tokio::io::DuplexStream,
+			want_frame: bool,
+		) -> Option<String> {
 			use tokio::io::AsyncReadExt;
 			loop {
 				if self.buf.first() == Some(&b'$') && self.buf.len() >= 4 {
@@ -1611,6 +1614,9 @@ mod tests {
 					if self.buf.len() >= 4 + len {
 						let frame: Vec<u8> = self.buf.drain(..4 + len).collect();
 						self.frames.push((frame[1], frame[4..].to_vec()));
+						if want_frame {
+							return None;
+						}
 						continue;
 					}
 				} else if let Some(pos) = find_double_crlf(&self.buf) {
@@ -1618,7 +1624,8 @@ mod tests {
 					let cl = parse_content_length(head.as_bytes()).unwrap_or(0);
 					if self.buf.len() >= pos + 4 + cl {
 						self.buf.drain(..pos + 4 + cl);
-						return head;
+						assert!(!want_frame, "expected a $ frame, got {head}");
+						return Some(head);
 					}
 				}
 				let mut tmp = [0u8; 4096];
@@ -2253,6 +2260,63 @@ mod tests {
 		}
 		let tracks = state.sessions.tracks_arc(&sid).unwrap();
 		assert_eq!(tracks.lock().unwrap().len(), 1);
+	}
+
+	#[tokio::test]
+	async fn play_response_precedes_replay_and_rtp_info_describes_it() {
+		use tokio::io::AsyncWriteExt;
+		let provider = MockProv::with_cameras(&["cam1"]);
+		*provider.burst.lock().unwrap() = Some(crate::buffer::VideoBurst {
+			codec: crate::codec::VideoCodec::H264,
+			iframe_nals: vec![vec![0x65, 0xaa, 0xbb]],
+			captured_pts_90khz: 12_345,
+		});
+		let (mut client, cancel, task) = spawn_connection(provider);
+		let mut rr = ResponseReader::default();
+		let video_uri = "rtsp://x/cam1/main/trackID=0";
+		let audio_uri = "rtsp://x/cam1/main/trackID=1";
+		client
+			.write_all(format!("SETUP {video_uri} RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		let sid = session_of(&rr.next(&mut client).await);
+		client
+			.write_all(format!("SETUP {audio_uri} RTSP/1.0\r\nCSeq: 2\r\nSession: {sid}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n").as_bytes())
+			.await
+			.unwrap();
+		assert_eq!(status_of(&rr.next(&mut client).await), 200);
+
+		client
+			.write_all(
+				format!("PLAY rtsp://x/cam1/main/ RTSP/1.0\r\nCSeq: 3\r\nSession: {sid}\r\n\r\n")
+					.as_bytes(),
+			)
+			.await
+			.unwrap();
+		let head = rr.next(&mut client).await;
+		assert_eq!(status_of(&head), 200);
+		assert!(rr.frames.is_empty(), "media arrived before the PLAY reply");
+		let rtp_info = head
+			.split("\r\n")
+			.find_map(|l| l.strip_prefix("RTP-Info: "))
+			.expect("RTP-Info");
+		let (video_info, audio_info) = rtp_info.split_once(',').unwrap();
+		assert!(video_info.starts_with(&format!("url={video_uri};seq=")));
+		assert!(video_info.ends_with(";rtptime=12345"), "{video_info}");
+		assert!(audio_info.starts_with(&format!("url={audio_uri};seq=")));
+		let seq: u16 = video_info
+			.split(';')
+			.find_map(|p| p.strip_prefix("seq="))
+			.unwrap()
+			.parse()
+			.unwrap();
+
+		let (channel, rtp) = rr.frame(&mut client).await;
+		assert_eq!(channel, 0);
+		assert_eq!(u16::from_be_bytes([rtp[2], rtp[3]]), seq);
+		assert_eq!(u32::from_be_bytes([rtp[4], rtp[5], rtp[6], rtp[7]]), 12_345);
+		cancel.cancel();
+		task.await.unwrap();
 	}
 
 	#[tokio::test]
