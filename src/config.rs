@@ -840,12 +840,7 @@ const TOP_LEVEL_SCALAR_KEYS: &[&str] = &[
 /// serde deserialisation so the message is friendlier than serde's
 /// "unknown field" or, worse, a silent drop on a struct that is missing
 /// `deny_unknown_fields`.
-pub fn validate_top_level_key_placement(value: &toml::Value) -> Result<(), String> {
-	let toml::Value::Table(root) = value else {
-		// Not a table at the document root — `parse_config` will surface
-		// the real error from serde. Don't double-report.
-		return Ok(());
-	};
+pub fn validate_top_level_key_placement(root: &toml::Table) -> Result<(), String> {
 	let mut misplaced: Vec<(String, String)> = Vec::new();
 	for (key, child) in root {
 		walk_for_misplaced(key, child, &mut misplaced);
@@ -902,13 +897,16 @@ fn walk_for_misplaced(path: &str, value: &toml::Value, out: &mut Vec<(String, St
 /// Parse a TOML string into a Config. Runs the placement scanner
 /// before serde deserialisation so misplaced top-level keys get a
 /// dedicated diagnostic instead of serde's "unknown field" error.
+///
+/// `Config` deserialises from the source text, not the scanned
+/// `Table`: only the text carries spans, so its errors point at a
+/// line and column.
 pub fn parse_config(toml_str: &str) -> Result<Config, String> {
-	let value: toml::Value =
+	let table: toml::Table =
 		toml::from_str(toml_str).map_err(|e| format!("Failed to parse config: {e}"))?;
-	validate_top_level_key_placement(&value)?;
-	let mut config: Config = value
-		.try_into()
-		.map_err(|e: toml::de::Error| format!("Failed to parse config: {e}"))?;
+	validate_top_level_key_placement(&table)?;
+	let mut config: Config =
+		toml::from_str(toml_str).map_err(|e| format!("Failed to parse config: {e}"))?;
 	// The Reolink account for "cloud" cameras lives at the document root; copy
 	// it onto each camera so the per-camera connect path can mint a bundle.
 	for cam in &mut config.cameras {
@@ -1555,6 +1553,12 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn parse_config_field_errors_name_the_line() {
+		let err = parse_config("cameras = []\nbind_port = \"high\"\n").unwrap_err();
+		assert!(err.contains("line 2"), "{err}");
+	}
 
 	/// A config with `[webhook] enable` and `webhook_advertise`.
 	fn advertising(enable: bool, advertise: &str) -> Config {
