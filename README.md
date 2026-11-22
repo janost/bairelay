@@ -369,7 +369,7 @@ bairelay battery driveway --json
 bairelay reboot driveway
 
 # PTZ:
-bairelay ptz driveway control 32 left            # nudge left, amount 32
+bairelay ptz driveway control 32 left            # move left for amount/speed s (speed 32), then stop
 bairelay ptz driveway preset                     # list presets
 bairelay ptz driveway preset 0                   # go to preset 0
 bairelay ptz driveway assign 1 "Front gate"      # save current pos as preset 1

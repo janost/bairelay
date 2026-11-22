@@ -168,22 +168,7 @@ pub async fn dispatch_control(
 				PtzDirection::Left => Direction::Left,
 				PtzDirection::Right => Direction::Right,
 			};
-			let speed = 32.0_f32;
-			let seconds = (amount / speed).clamp(0.0, 10.0);
-			match timeout(CMD_TIMEOUT, bc.send_ptz(dir, speed)).await {
-				Ok(Err(e)) => {
-					tracing::warn!(camera = %camera_name, error = %e, "PTZ move failed");
-				}
-				Err(_) => {
-					tracing::warn!(camera = %camera_name, "PTZ move timed out");
-				}
-				Ok(Ok(())) => {
-					tokio::time::sleep(Duration::from_secs_f32(seconds)).await;
-				}
-			}
-			// Always try to stop
-			let _ = timeout(CMD_TIMEOUT, bc.send_ptz(Direction::Stop, speed)).await;
-			Ok(())
+			crate::ptz::ptz_move(&*bc, dir, amount, crate::ptz::DEFAULT_SPEED).await
 		}
 		ControlCommand::PtzPreset {
 			ref camera,
@@ -229,9 +214,7 @@ pub async fn dispatch_control(
 		ControlCommand::PtzAssign {
 			preset_id, name, ..
 		} => timeout_to_result(timeout(CMD_TIMEOUT, bc.set_ptz_preset(preset_id, name)).await),
-		ControlCommand::Zoom { level, .. } => {
-			timeout_to_result(timeout(CMD_TIMEOUT, bc.zoom_to((level * 1000.0) as u32)).await)
-		}
+		ControlCommand::Zoom { level, .. } => crate::ptz::zoom(&*bc, level).await,
 		ControlCommand::Siren { state, .. } => {
 			if state {
 				timeout_to_result(timeout(CMD_TIMEOUT, bc.siren()).await)
@@ -1096,7 +1079,7 @@ mod tests {
 		);
 	}
 
-	/// `Zoom { level }` dispatches to `zoom_to((level*1000) as u32)`.
+	/// `Zoom { level }` dispatches to `zoom_to(ptz::zoom_position(level))`.
 	#[tokio::test]
 	async fn dispatch_zoom_scales_level_to_zoom_to() {
 		let fake = FakeCameraBuilder::new().build();

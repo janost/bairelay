@@ -486,7 +486,7 @@ mod tests {
 		assert_eq!(fake.calls().set_ptz_preset.lock().unwrap().len(), 1);
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn dispatch_ptz_control_runs_send_branch() {
 		let fake = FakeCameraBuilder::new().build();
 		let cmd = Command::Ptz {
@@ -498,7 +498,8 @@ mod tests {
 			}),
 		};
 		let _ = dispatch_oneshot(&*fake, &cmd, false).await.unwrap();
-		assert_eq!(fake.calls().send_ptz.lock().unwrap().len(), 1);
+		// The move, then the stop.
+		assert_eq!(fake.calls().send_ptz.lock().unwrap().len(), 2);
 	}
 
 	#[tokio::test]
