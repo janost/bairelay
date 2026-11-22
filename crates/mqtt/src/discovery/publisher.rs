@@ -941,7 +941,7 @@ mod tests {
 			rumqttc::AsyncClient::new(rumqttc::MqttOptions::new("stalled", "127.0.0.1", 1883), 0);
 		Box::leak(Box::new(event_loop));
 		let mut stalled = publisher.clone();
-		stalled.client = SharedMqttClient::for_test(stalled_client);
+		stalled.client = SharedMqttClient::for_test(stalled_client).assume_connected();
 		let stalled_publish = stalled.publish("cam1", None, None, caps, &flags, &[]);
 		let finished = tokio::select! {
 			biased;
@@ -1015,7 +1015,8 @@ mod tests {
 			let (client, event_loop) =
 				rumqttc::AsyncClient::new(rumqttc::MqttOptions::new("seal", "127.0.0.1", 1883), 1);
 			let sink = crate::client::CaptureSink::default();
-			let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&sink));
+			let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&sink))
+				.assume_connected();
 			let publisher = DiscoveryPublisher::new(
 				shared,
 				"bairelay".to_string(),
