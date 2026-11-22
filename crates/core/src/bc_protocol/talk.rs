@@ -132,6 +132,11 @@ impl BcCamera {
 
 		let block_size = talk_config.audio_config.length_per_encoder / 2;
 		let sample_rate = talk_config.audio_config.sample_rate;
+		// The pacing below divides by it; 0 would panic in
+		// `Duration::from_secs_f32(inf)`.
+		if sample_rate == 0 {
+			return Err(Error::Other("talk sample_rate must be greater than 0"));
+		}
 
 		let build_talk_config_msg = |talk_config: TalkConfig| Bc {
 			meta: BcMeta {
@@ -375,6 +380,16 @@ mod tests {
 			.await
 			.expect_err("should fail");
 		assert!(matches!(err, Error::UnknownTalkEncoding));
+	}
+
+	#[tokio::test]
+	async fn talk_rejects_zero_sample_rate_before_network() {
+		let mut cfg = ok_talk_config();
+		cfg.audio_config.sample_rate = 0;
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		let err = cam.talk(&[0u8; 16], cfg).await.expect_err("should fail");
+		assert!(matches!(err, Error::Other(_)));
 	}
 
 	// ── talk: non-200 on TalkConfig reply ─────────────────────────────
