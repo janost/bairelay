@@ -44,6 +44,7 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 | Connect           | 100 s (backstop; the discovery retry loop self-terminates in ~80 s) |
 | Keepalive         | 5 s      |
 | Pollers           | 10 s     |
+| Session setup     | 10 s per request (`get_support`, `get_ptz_preset`, PIR read), abandoned on session cancel |
 | Control commands  | 30 s     |
 | Logout            | 5 s      |
 

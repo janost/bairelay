@@ -994,6 +994,7 @@ impl CameraHandle {
 			// shutdown, the grace period and watchdog requests. The probe
 			// races it too, so a cancel mid-probe preempts at once.
 			let raw = tokio::select! {
+				biased;
 				_ = session.cancelled() => {
 					tracing::info!(camera = %self.config.name, "Session cancelled (shutdown, grace period or watchdog)");
 					return SessionEnd::Requested;
@@ -1062,6 +1063,9 @@ impl CameraHandle {
 	/// small margin so a clean stop_video has time to settle before we
 	/// declare the reader detached.
 	const STREAM_SOURCE_STOP_TIMEOUT: Duration = Duration::from_secs(7);
+	/// Bound on each session-setup request (`get_support`,
+	/// `get_ptz_preset`), matching the pollers' 10 s.
+	const SETUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 	/// Maximum consecutive probe failures before the loop gives up and
 	/// lets the outer reconnect loop take over.
 	pub(crate) const KEEPALIVE_MAX_FAILURES: u32 = 5;
@@ -1103,85 +1107,8 @@ impl CameraHandle {
 			*self.camera_ip.write_recover() = Some(ip);
 		}
 
-		// Populate the capability cache for HA discovery.
-		// `get_support()` is idempotent and read-only. On success we
-		// cache the view; on failure we leave the cache `None` so the
-		// next reconnect re-probes — a transient `get_support` error
-		// must not stick `has_ptz = false` for the whole session (HA
-		// discovery would then never emit PT buttons even for a PT-
-		// capable cam that only fluked one probe).
-		match driver.get_support().await {
-			Ok(support) => {
-				let caps = crate::capabilities::camera_capabilities(
-					&*driver,
-					&support,
-					self.config.channel_id,
-					device_type,
-				)
-				.await;
-				let has_ptz = caps.has_ptz;
-				// Hardware confirmed absent: drop any cached value so a
-				// broker reconnect can't replay it after discovery
-				// retracts the entity.
-				if caps.status_led.is_absent() {
-					self.status_cache.clear_led();
-				}
-				if caps.ir_leds.is_absent() {
-					self.status_cache.clear_ir();
-				}
-				// The AI clear and the caps write share the AI publish
-				// lock, so the reconnect replay reads both or neither.
-				{
-					let _ai_serial = self.status_cache.lock_ai_publish().await;
-					if caps.ai.is_absent() {
-						self.status_cache.clear_ai_objects();
-					}
-					*self.capabilities.write_recover() = Some(caps);
-				}
-
-				// Populate the preset cache for HA discovery's
-				// `PtPreset` select. Only meaningful when has_ptz
-				// — fixed-mount cameras return InvalidXml. Treat
-				// any read error as "no presets" (empty Vec) and
-				// keep the discovery publish going; the select
-				// just won't be emitted.
-				if has_ptz {
-					match driver.get_ptz_preset().await {
-						Ok(p) => {
-							let presets: Vec<(u8, String)> = p
-								.preset_list
-								.preset
-								.into_iter()
-								.filter_map(|preset| preset.name.map(|n| (preset.id, n)))
-								.collect();
-							*self.preset_cache.write_recover() = presets;
-						}
-						Err(e) => {
-							tracing::debug!(
-								camera = %self.config.name,
-								error = %e,
-								"get_ptz_preset failed; leaving preset cache empty"
-							);
-						}
-					}
-				}
-
-				if let Err(e) = self.publish_discovery().await {
-					tracing::warn!(
-						camera = %self.config.name,
-						error = %e,
-						"Failed to publish HA discovery payloads post-connect; will retry on next ConnAck"
-					);
-				}
-			}
-			Err(e) => {
-				tracing::warn!(
-					camera = %self.config.name,
-					error = %e,
-					"Failed to query camera capabilities via get_support(); leaving cache empty for re-probe on next reconnect"
-				);
-			}
-		}
+		self.probe_capabilities(&*driver, device_type, &session)
+			.await;
 
 		// Spawn per-session tasks (motion, pollers, grace period).
 		let tasks = self.spawn_session_tasks(&driver, &session).await;
@@ -1207,6 +1134,115 @@ impl CameraHandle {
 		session.cancel();
 		self.teardown_session_tasks(tasks, concrete).await;
 		end
+	}
+
+	/// Populate the capability and preset caches for HA discovery, then
+	/// publish discovery. On a failed or timed-out `get_support()` the
+	/// cache stays `None` so the next reconnect re-probes: a transient
+	/// error must not stick `has_ptz = false` for the session. Each
+	/// request is bounded and abandoned when `session` ends.
+	async fn probe_capabilities(
+		&self,
+		driver: &dyn CameraDriver,
+		device_type: Option<&str>,
+		session: &CancellationToken,
+	) {
+		let support = match camera_tasks::cancellable(
+			session,
+			Self::SETUP_REQUEST_TIMEOUT,
+			driver.get_support(),
+		)
+		.await
+		{
+			None => return,
+			Some(Ok(Ok(support))) => support,
+			Some(Ok(Err(e))) => {
+				tracing::warn!(
+					camera = %self.config.name,
+					error = %e,
+					"Failed to query camera capabilities via get_support(); leaving cache empty for re-probe on next reconnect"
+				);
+				return;
+			}
+			Some(Err(_)) => {
+				tracing::warn!(
+					camera = %self.config.name,
+					"get_support() timed out; leaving cache empty for re-probe on next reconnect"
+				);
+				return;
+			}
+		};
+		let caps = crate::capabilities::camera_capabilities(
+			driver,
+			&support,
+			self.config.channel_id,
+			device_type,
+		)
+		.await;
+		let has_ptz = caps.has_ptz;
+		// Hardware confirmed absent: drop any cached value so a
+		// broker reconnect can't replay it after discovery
+		// retracts the entity.
+		if caps.status_led.is_absent() {
+			self.status_cache.clear_led();
+		}
+		if caps.ir_leds.is_absent() {
+			self.status_cache.clear_ir();
+		}
+		// The AI clear and the caps write share the AI publish
+		// lock, so the reconnect replay reads both or neither.
+		{
+			let _ai_serial = self.status_cache.lock_ai_publish().await;
+			if caps.ai.is_absent() {
+				self.status_cache.clear_ai_objects();
+			}
+			*self.capabilities.write_recover() = Some(caps);
+		}
+
+		// Populate the preset cache for HA discovery's
+		// `PtPreset` select. Only meaningful when has_ptz
+		// — fixed-mount cameras return InvalidXml. Treat
+		// any read error as "no presets" (empty Vec) and
+		// keep the discovery publish going; the select
+		// just won't be emitted.
+		if has_ptz {
+			match camera_tasks::cancellable(
+				session,
+				Self::SETUP_REQUEST_TIMEOUT,
+				driver.get_ptz_preset(),
+			)
+			.await
+			{
+				None => return,
+				Some(Err(_)) => {
+					tracing::debug!(camera = %self.config.name, "get_ptz_preset timed out; leaving preset cache empty");
+				}
+				Some(Ok(Ok(p))) => {
+					let presets: Vec<(u8, String)> = p
+						.preset_list
+						.preset
+						.into_iter()
+						.filter_map(|preset| preset.name.map(|n| (preset.id, n)))
+						.collect();
+					*self.preset_cache.write_recover() = presets;
+				}
+				Some(Ok(Err(e))) => {
+					tracing::debug!(
+						camera = %self.config.name,
+						error = %e,
+						"get_ptz_preset failed; leaving preset cache empty"
+					);
+				}
+			}
+		}
+
+		if let Err(e) = self.publish_discovery().await {
+			tracing::warn!(
+				camera = %self.config.name,
+				error = %e,
+				"Failed to publish HA discovery payloads post-connect; will retry on next ConnAck"
+			);
+		}
 	}
 
 	/// Spawn the per-session tasks that hold their own clones of the
@@ -1289,14 +1325,14 @@ impl CameraHandle {
 				));
 			}
 			if self.config.mqtt.enable_pir {
-				camera_tasks::publish_pir_state(
+				tasks.spawn(camera_tasks::publish_pir_state(
 					self.config.name.clone(),
 					Arc::clone(driver),
 					mqtt.clone(),
 					self.topic_prefix.clone(),
 					self.status_cache(),
-				)
-				.await;
+					session_cancel.clone(),
+				));
 			}
 			// Status LED and IR LEDs are separate features gated on their
 			// own capability; the read only runs if either is present.
@@ -3449,6 +3485,55 @@ mod tests {
 		.await
 		.expect("grace period path must exit");
 
+		assert_eq!(handle.state(), CameraState::Disconnected);
+	}
+
+	/// A setup request that never answers must not hold the session:
+	/// a disconnect request mid-setup ends it at once, well before the
+	/// request's own timeout.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn disconnect_preempts_a_stalled_session_setup() {
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::Support;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let fake = FakeCameraBuilder::new()
+			.with_support(|| {
+				Ok(Support {
+					ptz_mode: Some("pt".to_string()),
+					..Default::default()
+				})
+			})
+			.with_ptz_preset_pending()
+			.build();
+		let driver: Arc<dyn CameraDriver> = fake;
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam-stall"),
+			CancellationToken::new(),
+			None,
+		));
+
+		let started = tokio::time::Instant::now();
+		let requester = {
+			let handle = Arc::clone(&handle);
+			tokio::spawn(async move {
+				tokio::time::sleep(Duration::from_secs(1)).await;
+				handle.request_disconnect();
+			})
+		};
+		tokio::time::timeout(
+			Duration::from_secs(60),
+			handle.run_connected_session_for_test(driver, None),
+		)
+		.await
+		.expect("a stalled setup request held the session");
+		requester.await.unwrap();
+
+		assert!(
+			started.elapsed() < CameraHandle::SETUP_REQUEST_TIMEOUT,
+			"session held for {:?}",
+			started.elapsed()
+		);
 		assert_eq!(handle.state(), CameraState::Disconnected);
 	}
 

@@ -806,9 +806,15 @@ pub async fn publish_pir_state(
 	mqtt: SharedMqttClient,
 	topic_prefix: String,
 	status_cache: Arc<StatusCache>,
+	cancel: CancellationToken,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
-	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_pirstate()).await {
+	let Some(result) =
+		cancellable(&cancel, Duration::from_secs(10), bc_camera.get_pirstate()).await
+	else {
+		return;
+	};
+	match result {
 		Ok(Ok(pir_state)) => {
 			let enabled = pir_state.enable == 1;
 			tracing::debug!(camera = %camera_name, enabled, "PIR state");
@@ -830,7 +836,7 @@ pub async fn publish_pir_state(
 /// `cancel` fires: `None` when cancelled, else the timeout result. A
 /// poll in flight at shutdown or session end must not hold teardown
 /// for its whole timeout — the camera may already be logged out.
-async fn cancellable<F: std::future::Future>(
+pub(crate) async fn cancellable<F: std::future::Future>(
 	cancel: &CancellationToken,
 	limit: Duration,
 	request: F,
@@ -1880,6 +1886,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		)
 		.await;
 
@@ -3010,6 +3017,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		)
 		.await;
 		assert!(
@@ -3604,6 +3612,7 @@ mod tests {
 			mqtt,
 			"bairelay".to_string(),
 			empty_cache(),
+			CancellationToken::new(),
 		));
 		tokio::time::advance(Duration::from_secs(11)).await;
 		let _ = task.await;
