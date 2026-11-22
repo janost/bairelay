@@ -21,8 +21,8 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::bc::xml::{
 	AbilityInfo, BatteryInfo, FloodlightStatusList, HaCfg, HttpPort, HttpsPort, LedState, LinkType,
-	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, UserList,
-	VersionInfo,
+	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, TalkAbility,
+	TalkConfig, UserList, VersionInfo,
 };
 
 use super::camera_driver::CameraDriver;
@@ -79,6 +79,10 @@ pub struct FakeCalls {
 	pub set_onvif: Mutex<Vec<(Option<bool>, Option<u32>)>>,
 	/// Each `set_ha_cfg(cfg)` call appended.
 	pub set_ha_cfg: Mutex<Vec<HaCfg>>,
+	/// Each `talk(adpcm, cfg)` call appended as `(adpcm bytes, cfg)`.
+	pub talk: Mutex<Vec<(Vec<u8>, TalkConfig)>>,
+	/// Count of `talk_ability` invocations.
+	pub talk_ability: Mutex<u32>,
 }
 
 /// Internal state backing a [`FakeCamera`]. Read-method closures are
@@ -122,6 +126,9 @@ struct FakeState {
 	get_linktype: Option<BoxFn<LinkType>>,
 	get_support: Option<BoxFn<Support>>,
 	get_abilityinfo: Option<BoxFn<AbilityInfo>>,
+	talk_ability: Option<BoxFn<TalkAbility>>,
+	talk_result: Option<BoxFn<()>>,
+	talk_ability_pending: bool,
 	/// One [`MotionData`] per `listen_on_motion` call, in order.
 	motion_stream: Mutex<VecDeque<MotionData>>,
 	floodlight_stream: Mutex<Option<Receiver<FloodlightStatusList>>>,
@@ -393,6 +400,32 @@ impl FakeCameraBuilder {
 		F: Fn() -> Result<AbilityInfo> + Send + Sync + 'static,
 	{
 		self.state.get_abilityinfo = Some(Box::new(f));
+		self
+	}
+
+	/// Install the closure invoked on [`CameraDriver::talk_ability`].
+	pub fn with_talk_ability<F>(mut self, f: F) -> Self
+	where
+		F: Fn() -> Result<TalkAbility> + Send + Sync + 'static,
+	{
+		self.state.talk_ability = Some(Box::new(f));
+		self
+	}
+
+	/// Make `talk_ability` await `pending()` forever, like a battery
+	/// doorbell that never answers message 10.
+	pub fn with_talk_ability_pending(mut self) -> Self {
+		self.state.talk_ability_pending = true;
+		self
+	}
+
+	/// Install the result of [`CameraDriver::talk`]. Unset, `talk`
+	/// records the call and returns `Ok(())`.
+	pub fn with_talk_result<F>(mut self, f: F) -> Self
+	where
+		F: Fn() -> Result<()> + Send + Sync + 'static,
+	{
+		self.state.talk_result = Some(Box::new(f));
 		self
 	}
 
@@ -842,6 +875,40 @@ impl CameraDriver for FakeCamera {
 		match self.inner.get_abilityinfo.as_ref() {
 			Some(f) => f(),
 			None => unset("get_abilityinfo"),
+		}
+	}
+
+	/// Mirrors `BcCamera`'s `two_way_audio` gate when the test set an
+	/// ability list with [`FakeCameraBuilder::with_abilities`].
+	async fn talk_ability(&self) -> Result<TalkAbility> {
+		*self.inner.calls.talk_ability.lock().unwrap() += 1;
+		if self.inner.talk_ability_pending {
+			std::future::pending::<()>().await;
+			unreachable!()
+		}
+		if self.ability_advertised("two_way_audio").await == Some(false) {
+			return Err(Error::MissingAbility {
+				name: "two_way_audio".to_string(),
+				requested: "read".to_string(),
+				actual: "none".to_string(),
+			});
+		}
+		match self.inner.talk_ability.as_ref() {
+			Some(f) => f(),
+			None => unset("talk_ability"),
+		}
+	}
+
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
+		self.inner
+			.calls
+			.talk
+			.lock()
+			.unwrap()
+			.push((adpcm.to_vec(), talk_config));
+		match self.inner.talk_result.as_ref() {
+			Some(f) => f(),
+			None => Ok(()),
 		}
 	}
 }

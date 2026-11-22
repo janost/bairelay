@@ -32,6 +32,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `set_floodlight_manual(bool, u16)`    | Second arg is duration **seconds**. Use 30.               |
 | `zoom_to(u32)`                        | Pre-multiply by 1000 (`ptz::zoom_position`).              |
 | `set_ptz_preset(u8, String)`          | Preset ID + name.                                         |
+| `talk_ability()` / `talk(adpcm, cfg)` | Two-way audio. `talk` sends `TalkConfig` (msg 201), the ADPCM blocks (msg 202, paced at real time) and talk-stop (msg 11). Only `talk_ability` is gated on `two_way_audio` (neolink parity); `talk::play` refuses a camera that reports abilities without it, unless it has `[cameras.talk_config]`. Battery doorbells never answer `TalkAbility` (msg 10). |
 | `start_video(kind, channel, record)` / `stop_video(kind)` | Returns `StreamData`; covered by `VideoStream` trait. |
 | `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly. An Argus answers msg 109 with `400` (`CameraServiceUnavailable`) for several seconds after connect (6 s or more); startup wake and the preview poller retry through `camera_tasks::snapshot_with_retry` (2 s backoff while the next attempt starts within 12 s of the first, cancel-aware, 10 s per attempt). |
 
@@ -46,6 +47,9 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 | Pollers           | 10 s     |
 | Session setup     | 10 s per request (`get_support`, `get_ptz_preset`, PIR read), abandoned on session cancel |
 | Control commands  | 30 s     |
+| Talk `TalkAbility` query | 5 s (falls back to defaults) |
+| Talk WAV load     | 10 s     |
+| Talk playback     | clip length + 30 s |
 | Logout            | 5 s      |
 
 ### Calls that spawn internal tasks
@@ -264,15 +268,20 @@ Match neolink's wire behaviour exactly:
 - **Wakeup.** Acquires a wake lock immediately (triggers the camera connection), then waits for the camera to actually connect before starting the countdown. 2-minute connection timeout, respects the cancellation token.
 - **Reply convention.** After every control command, publish `"OK"` or `"FAIL"` (non-retained) to the same control topic. Enables HA automations to confirm command success.
 - **Retained commands are ignored.** The broker replays a retained message on every subscribe, so a retained `control/reboot` or `control/siren` would fire on every start and reconnect. `mqtt_loop::RetainedFilter` drops every retained control/query publish and warns once per topic; clear it with `mosquitto_pub -r -n -t <topic>`.
+- **Talk.** Payload is an absolute host path to a 16-bit PCM WAV. Refused with `disabled` unless top-level `talk_dir` is set. The path must lie under `talk_dir` by name with no `..` (`outside_talk_dir`, checked before any filesystem access); a path under it that does not canonicalise, or canonicalises outside it via a symlink, is `not_found`, so an MQTT client learns nothing about files outside `talk_dir`. Status goes to `status/talk` (non-retained): `playing`, then `done` or `error: <code>` with code `disabled`, `not_found`, `not_a_file`, `outside_talk_dir`, `decode`, `timeout`, `busy` or `camera` — never the path or OS error text.
 - **Query responses.** `query/battery` and `query/pir` serialise the full struct to XML via `quick_xml::se::to_writer` and publish to `status/battery` and `status/pir` respectively (non-retained).
 
 ---
 
 ## Wire-format gotchas
 
-### ADPCM ser/de asymmetry
+### ADPCM frame padding
 
-`BcMedia::Adpcm` does **not** round-trip byte-exact through `serialize` → `deserialize`. The serialiser pads on `data.len() % 8`; the deserialiser pads on `(data.len() + 4) % 8` (the wire `payload_size` includes the 4-byte sub-header). The capture pipeline writes raw camera-side bytes through a single `serialize` per packet, so on-disk `.bcmedia` files parse cleanly. **Do not** re-serialise captured packets to "normalise" them — the first ADPCM packet desyncs the loop.
+`BcMedia::Adpcm` frames are padded to 8 bytes on the wire `payload_size`, which counts the 4-byte sub-header: `(data.len() + 4) % 8`, as in the camera capture `crates/core/src/bcmedia/samples/adpcm_0.raw`. The serialiser and deserialiser both use it, so ADPCM round-trips byte-exact. Talk depends on it: every 516-byte talk block is sent through `serialize`. `.bcmedia` dumps written before this fix carry 4 extra pad bytes per ADPCM frame and desync the reader at the first one.
+
+### Talk ADPCM block layout (DVI4)
+
+The talk encoder (`encode_dvi4` in `crates/rtsp/src/transcode/adpcm.rs`, next to the RTSP-side decoder and sharing its tables and nibble update) matches GStreamer `adpcmenc layout=dvi blockalign=<n>` as used by the neolink talk client. Block size is `length_per_encoder / 2 + 4` bytes (516 for the default 1024); `BcCamera::talk` chunks its input by the same size. Each mono block is: first sample as `i16` LE, step index (0–88, carried over from the previous block), one reserved zero byte, then `2 * (n - 4)` 4-bit codes, low nibble first — 1025 samples per 516-byte block. The predictor restarts from the header sample each block. The last block is padded with silence.
 
 ### HEVC NAL whitelist (`is_decodable_nal`)
 
@@ -359,6 +368,8 @@ Transient connect failures and lost sessions use the connect ladder (initial 2 s
 - `idle_disconnect`: defaults `false`. Must be explicitly enabled for battery cameras.
 - `gap_threshold_secs`: must be finite + positive.
 - `idle_disconnect_timeout_secs`: must be finite + positive.
+- `talk_dir`: absolute path to an existing directory.
+- `[cameras.talk_config]`: `audio_type = "adpcm"`, `sample_rate > 0`, `length_per_encoder >= 120` and `(length_per_encoder / 2) % 4 == 0`.
 
 ### Neolink-compat fields
 

@@ -200,9 +200,9 @@ let sub = provider.subscribe("cam1", StreamKind::Main, None).await?;
 
 `FakeStreamProvider::from_dir` skips malformed filenames with a `tracing::warn!` rather than failing the scan.
 
-### Wire-format caveat: ADPCM ser/de
+### Wire-format note: ADPCM padding
 
-`BcMedia::Adpcm` does NOT round-trip byte-exact through `serialize` → `deserialize`. The capture pipeline writes raw camera bytes through a single `serialize` per packet, so on-disk `.bcmedia` files parse cleanly. **Do not** re-serialise captured packets to "normalise" them — the first ADPCM packet desyncs the loop. See `docs/implementation.md` § Wire-format gotchas.
+`BcMedia::Adpcm` round-trips byte-exact through `serialize` → `deserialize`. Dumps captured before the padding fix carry 4 extra bytes per ADPCM frame and desync at the first one; re-capture them. See `docs/implementation.md` § Wire-format gotchas.
 
 ### Troubleshooting
 

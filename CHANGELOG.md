@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+Two-way audio (talk), ported from the neolink talk client:
+- `bairelay talk <camera> --file <wav> [--volume <gain>]` plays a 16-bit PCM WAV (up to 60 s) through the camera speaker. Pure-Rust IMA ADPCM (DVI4 block layout) encoder; no GStreamer.
+- MQTT `<prefix>/<cam>/control/talk` (payload: absolute host path to a WAV) with progress on `<prefix>/<cam>/status/talk` (`playing`, `done`, `error: <code>`).
+- `[cameras.talk_config]` pins the `TalkConfig` (duplex, stream mode, ADPCM rate and block size). Required for battery doorbells, which neither answer `TalkAbility` nor advertise `two_way_audio`.
+- Top-level `talk_dir` enables MQTT talk and confines its paths to one directory; without it `control/talk` replies `error: disabled`.
+
+### Changes
+
+- talk: `talk` one-shot and `control/talk` topic
+- talk: three-tier `TalkConfig` resolver (config table, camera `TalkAbility`, Reolink defaults)
+- talk: WAV reader and linear resampler; DVI4 IMA ADPCM encoder in `bairelay-rtsp` next to the decoder
+- config: `[cameras.talk_config]` table and `talk_dir` (absolute, existing directory), validated by `check-config`
+- core: `talk` and `talk_stop` no longer gate on `two_way_audio` (neolink parity; the binary checks it unless `[cameras.talk_config]` is set); fix underflow on a short last talk payload and a panic on `sample_rate = 0`
+- core: pad serialized ADPCM frames on `(data.len() + 4) % 8` like the camera; talk sent 4 stray bytes after every block, and `--dump-bcmedia` captures with ADPCM desynced on replay
+- core: remove the unused `BcCamera::talk_stream` and the `crossbeam-channel` dependency
+
 ## [1.1.2] — 2026-06-08
 
 Maintenance release:

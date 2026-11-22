@@ -111,6 +111,10 @@ rustls = "0.23"
 # of `ps auxww`, shell history, and supervisor argv-capture logs.
 rpassword = "7"
 
+# O_NONBLOCK for the talk WAV open, so a FIFO path cannot hang it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Strip symbols from release builds via rustc itself, not a post-build
 # `strip` step. The cross-compile aarch64-musl release matrix cell can't
 # rely on the runner's host `strip` (x86_64 only), and asking cargo to

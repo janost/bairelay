@@ -13,8 +13,8 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::bc::xml::{
 	AbilityInfo, BatteryInfo, FloodlightStatusList, HaCfg, HttpPort, HttpsPort, LedState, LinkType,
-	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, UserList,
-	VersionInfo,
+	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, TalkAbility,
+	TalkConfig, UserList, VersionInfo,
 };
 
 use super::{BcCamera, Direction, Error, LightState, MotionData, Result};
@@ -66,6 +66,16 @@ pub trait CameraDriver: Send + Sync {
 	async fn reboot(&self) -> Result<()>;
 	/// Trigger the built-in siren.
 	async fn siren(&self) -> Result<()>;
+
+	/// Request the camera's two-way audio `<TalkAbility>`. Gated on the
+	/// `two_way_audio` ability.
+	async fn talk_ability(&self) -> Result<TalkAbility>;
+	/// Send `TalkConfig` (msg 201), then play `adpcm` (DVI4 IMA ADPCM
+	/// blocks of `length_per_encoder / 2 + 4` bytes) through the
+	/// camera speaker, paced at real time, then send talk-stop. Not
+	/// gated: battery doorbells talk without advertising
+	/// `two_way_audio`, so the caller checks the ability.
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()>;
 
 	/// Read `<LedState>`: IR night-vision mode (`state`) and status LED
 	/// (`lightState`) — two unrelated features in one reply. Values for
@@ -231,6 +241,13 @@ impl CameraDriver for BcCamera {
 	}
 	async fn siren(&self) -> Result<()> {
 		BcCamera::siren(self).await
+	}
+
+	async fn talk_ability(&self) -> Result<TalkAbility> {
+		BcCamera::talk_ability(self).await
+	}
+	async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
+		BcCamera::talk(self, adpcm, talk_config).await
 	}
 
 	async fn get_ledstate(&self) -> Result<LedState> {

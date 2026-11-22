@@ -27,7 +27,8 @@ bairelay/
 
 Owns the application lifecycle:
 
-- CLI parsing via `clap` — service modes (`mqtt` / `rtsp` / `mqtt-rtsp`), one-shot camera commands (`reboot`, `snapshot`, `battery`, etc.), and `check-config` (parse + validate + warn, no camera connect).
+- CLI parsing via `clap` — service modes (`mqtt` / `rtsp` / `mqtt-rtsp`), one-shot camera commands (`reboot`, `snapshot`, `battery`, `talk`, etc.), and `check-config` (parse + validate + warn, no camera connect).
+- Two-way audio (`src/talk/`) — WAV reader and linear resampler, plus the `TalkConfig` resolver shared by the `talk` one-shot and the MQTT `control/talk` topic.
 - TOML configuration loading and validation.
 - Camera orchestrator: spawns per-camera task trees, manages connections.
 - Wake-lock counter with dual `Notify` and Drop-based RAII guards.
@@ -60,7 +61,7 @@ Pure-Rust RTSP server:
 - H.264 RTP packetisation per RFC 6184 (NAL fragmentation, SPS/PPS handling).
 - H.265 RTP packetisation per RFC 7798 (FU fragmentation, VPS/SPS/PPS handling).
 - AAC (RFC 3640 AU-hbr) and G.711 µ-law (RFC 3551 PT 0) audio.
-- ADPCM → G.711 transcode with 16 → 8 kHz resample.
+- ADPCM → G.711 transcode with 16 → 8 kHz resample, and the DVI4 IMA ADPCM encoder for talk.
 - TCP-interleaved transport (RTP-over-RTSP) and UDP-unicast transport. Client `$` frames (RTCP RR) are drained and count as session keepalive; pipelined requests are all answered. Every TCP write is capped at 5 s so a client that stops reading can't pin a session.
 - PLAY writes its response (with `RTP-Info` built from the SETUP-chosen first seq, the replayed keyframe's timestamp and each track's SETUP URL) before releasing media.
 - Unsupported methods get 501 and keep the connection; empty-body SET_PARAMETER is a keepalive.
@@ -189,6 +190,20 @@ Two separate notifications:
 Both use `Notify::notify_one()` (not `notify_waiters()`) so a permit is stored when no waiter is registered — late `.notified().await` calls still fire. The grace-period timer listens on `notify_release` and starts a countdown; any new `acquire()` before the countdown expires resets it.
 
 The watchdog also monitors wake-lock state and can force-disconnect via `request_disconnect()`, which cancels the camera's live session token (a child of the camera token). Between sessions it is a no-op, so a request that lands during teardown can't end the next session.
+
+### Talk (two-way audio)
+
+```
+WAV file ──load (10 s, regular file, size cap)──▶ mono PCM
+                                                    │
+TalkConfig ◀── [cameras.talk_config] │ TalkAbility (5 s) │ Reolink defaults
+    │                                               ▼
+    └──────────▶ resample → volume → DVI4 IMA ADPCM blocks ──▶ BcCamera::talk (msg 201, 202, 11)
+```
+
+- **Entry points.** `bairelay talk` runs through the one-shot runner with an op deadline of clip length + 30 s. MQTT `control/talk` runs in its own task, only with `talk_dir` set: the WAV loads before the wake lock is taken, so a bad path never wakes a battery camera. The wake lock is held for the clip plus at most 15 s connect wait and the 30 s margin. Clips are capped at 60 s. Resample and encode run on a blocking thread.
+- **Resolver tiers.** `[cameras.talk_config]` wins. Otherwise the first entry of each `TalkAbility` list, when all three are non-empty and the entry passes the `[cameras.talk_config]` rules (a camera reply we cannot encode falls through). Otherwise FDX / followVideoStream / adpcm / 16000 Hz / 16 bit / 1024 / mono. With the table set, the `TalkAbility` query and the `two_way_audio` ability check are skipped. Without it, a camera whose ability report lacks `two_way_audio` is refused; an unreported ability map lets the query run.
+- **One talk per camera.** A second `control/talk` on a camera that is playing gets `error: busy`; letting it through would make the camera reply 422 and the core's retry would stop the first clip.
 
 ### Watchdog
 

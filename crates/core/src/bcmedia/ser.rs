@@ -24,16 +24,6 @@ impl BcMedia {
 	/// that was passed in is returned on success so callers can chain
 	/// writes.
 	///
-	/// # Known wire-format caveat (ADPCM)
-	///
-	/// [`BcMedia::Adpcm`] does not currently round-trip byte-exact
-	/// through [`BcMedia::deserialize`] because the serializer pads
-	/// based on `data.len() % 8` while the deserializer pads based on
-	/// `(data.len() + 4) % 8` (the sub-header is counted in the wire
-	/// `payload_size`). A fixture replay that concatenates serialized
-	/// ADPCM frames and calls `deserialize` in a loop will desync; a
-	/// replay that feeds the original camera bytes directly to
-	/// `deserialize` is fine. Tracked for future upstream alignment.
 	pub fn serialize<W: Write>(&self, buf: W) -> Result<W, Error> {
 		let (buf, _) = match &self {
 			BcMedia::InfoV1(payload) => r#gen(bcmedia_info_v1(payload), buf)?,
@@ -81,7 +71,11 @@ impl BcMedia {
 				)?
 			}
 			BcMedia::Adpcm(payload) => {
-				let pad_size = match payload.data.len() as u32 % PAD_SIZE {
+				// The wire payload_size counts the 4-byte sub-header, and
+				// the camera pads on that (see `samples/adpcm_0.raw`: a
+				// 244-byte block is followed by the next frame with no
+				// padding).
+				let pad_size = match (payload.data.len() as u32 + 4) % PAD_SIZE {
 					0 => 0,
 					n => PAD_SIZE - n,
 				};
