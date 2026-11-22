@@ -136,11 +136,12 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
 	let (buf, connection_id) = error_context("ACK: Missing connect ID", le_i32).parse(buf)?;
 	let (buf, _unknown_a) =
 		error_context("ACK: Unable to verify UnknowA", verify(le_u32, |&x| x == 0)).parse(buf)?;
-	let (buf, group_id) = error_context(
-		"ACK: Unable to verify UnknowB",
-		verify(le_u32, |&x| x == 0 || x == 0xffffffff),
-	)
-	.parse(buf)?;
+	let (buf, group_id) = error_context("ACK: Missing group_id", le_u32).parse(buf)?;
+	if group_id != 0 && group_id != 0xffffffff {
+		// Only 0 and -1 have been observed; nothing reads the field, so
+		// an unexpected value is no reason to drop the ack.
+		log::debug!("BcUdp ACK with unexpected group_id {group_id:#x}");
+	}
 	let (buf, packet_id) = error_context("Missing packet_id", le_u32).parse(buf)?; // This is the point at which the camera has contigious
 	// packets to
 	let (buf, recv_bytes_per_sec) =

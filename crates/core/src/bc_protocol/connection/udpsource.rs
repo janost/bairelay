@@ -742,6 +742,18 @@ impl UdpPayloadInner {
 								log::info!("Camera sent different device ID in HB");
 							}
 						},
+						// Disconnects only count for this session: a D2C_DISC
+						// for other ids may be stale or for another client.
+						BcUdp::Discovery(UdpDiscovery {
+							payload: UdpXml::D2cDisc(D2cDisc { cid, did }),
+							..
+						}) if cid == self.flow.client_id && did == self.flow.camera_id => {
+							return Err(Error::CameraTerminate);
+						}
+						BcUdp::Discovery(UdpDiscovery {
+							payload: UdpXml::R2cDisc(_),
+							..
+						}) => return Err(Error::RelayTerminate),
 						BcUdp::Discovery(_disc) => {},
 						BcUdp::Ack(ack) => {
 							if ack.connection_id == self.flow.client_id {
@@ -1369,6 +1381,61 @@ mod tests {
 
 		// Drop and let camera task terminate.
 		camera.abort();
+	}
+
+	#[tokio::test]
+	async fn payload_source_survives_junk_and_ends_only_on_our_d2c_disc() {
+		let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server_addr = server.local_addr().unwrap();
+		let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let client_addr = client_sock.local_addr().unwrap();
+		let mut psource = UdpPayloadSource::new(
+			BcUdpSource::new_from_socket(client_sock, server_addr)
+				.await
+				.unwrap(),
+			1,
+			2,
+		)
+		.await;
+		let encode = |pkt: BcUdp| {
+			let mut out = BytesMut::new();
+			BcUdpCodex::new().encode(pkt, &mut out).unwrap();
+			out
+		};
+		let disc = |cid, did| {
+			BcUdp::Discovery(UdpDiscovery {
+				tid: 1,
+				payload: UdpXml::D2cDisc(D2cDisc { cid, did }),
+			})
+		};
+
+		server.send_to(b"junk", client_addr).await.unwrap();
+		server
+			.send_to(&encode(disc(1, 99)), client_addr)
+			.await
+			.unwrap();
+		server
+			.send_to(&encode(data_packet(1, 0, vec![7])), client_addr)
+			.await
+			.unwrap();
+		let got = tokio::time::timeout(T, psource.next())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(got, vec![7]);
+
+		server
+			.send_to(&encode(disc(1, 2)), client_addr)
+			.await
+			.unwrap();
+		let err = tokio::time::timeout(T, psource.next())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap_err();
+		let inner = err.get_ref().and_then(|e| e.downcast_ref::<Error>());
+		assert!(matches!(inner, Some(Error::CameraTerminate)), "got {err:?}");
 	}
 
 	#[tokio::test(start_paused = true)]
