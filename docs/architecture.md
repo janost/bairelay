@@ -201,7 +201,7 @@ TalkConfig ◀── [cameras.talk_config] │ TalkAbility (5 s) │ Reolink def
     └──────────▶ resample → volume → DVI4 IMA ADPCM blocks ──▶ BcCamera::talk (msg 201, 202, 11)
 ```
 
-- **Entry points.** `bairelay talk` runs through the one-shot runner with an op deadline of clip length + 30 s. MQTT `control/talk` runs in its own task, only with `talk_dir` set: the WAV loads before the wake lock is taken, so a bad path never wakes a battery camera. The wake lock is held for the clip plus at most 15 s connect wait and the 30 s margin. Clips are capped at 600 s.
+- **Entry points.** `bairelay talk` runs through the one-shot runner with an op deadline of clip length + 30 s. MQTT `control/talk` runs in its own task, only with `talk_dir` set: the WAV loads before the wake lock is taken, so a bad path never wakes a battery camera. The wake lock is held for the clip plus at most 15 s connect wait and the 30 s margin. Clips are capped at 60 s. Resample and encode run on a blocking thread.
 - **Resolver tiers.** `[cameras.talk_config]` wins. Otherwise the first entry of each `TalkAbility` list, when all three are non-empty and the entry passes the `[cameras.talk_config]` rules (a camera reply we cannot encode falls through). Otherwise FDX / followVideoStream / adpcm / 16000 Hz / 16 bit / 1024 / mono. With the table set, the `TalkAbility` query and the `two_way_audio` ability check are skipped. Without it, a camera whose ability report lacks `two_way_audio` is refused; an unreported ability map lets the query run.
 - **One talk per camera.** A second `control/talk` on a camera that is playing gets `error: busy`; letting it through would make the camera reply 422 and the core's retry would stop the first clip.
 

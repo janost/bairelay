@@ -28,9 +28,9 @@ pub fn block_align_for(length_per_encoder: u16) -> usize {
 }
 
 /// Longest clip `talk` accepts. Playback holds the camera awake for
-/// the whole clip, so a mistaken multi-hour file must not drain a
-/// battery camera.
-pub const MAX_CLIP: Duration = Duration::from_secs(600);
+/// the whole clip, so a mistaken long file must not drain a battery
+/// camera; a doorbell announcement is seconds long.
+pub const MAX_CLIP: Duration = Duration::from_secs(60);
 
 /// Margin above the clip length for the connect-free part of a talk
 /// operation (TalkAbility query, TalkConfig handshake, talk-stop).
@@ -372,7 +372,14 @@ pub async fn play(
 		length_per_encoder = ac.length_per_encoder,
 		"talk: TalkConfig resolved"
 	);
-	let adpcm = encode_for(clip, &cfg, volume)?;
+	// Resampling and encoding a full clip is CPU-bound work; keep it
+	// off the async workers.
+	let adpcm = {
+		let (clip, cfg) = (clip.clone(), cfg.clone());
+		tokio::task::spawn_blocking(move || encode_for(&clip, &cfg, volume))
+			.await
+			.context("talk encode task failed")??
+	};
 	let block_align = block_align_for(ac.length_per_encoder);
 	let summary = TalkSummary {
 		source,

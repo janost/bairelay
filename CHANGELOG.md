@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 Two-way audio (talk), ported from the neolink talk client:
-- `bairelay talk <camera> --file <wav> [--volume <gain>]` plays a 16-bit PCM WAV through the camera speaker. Pure-Rust IMA ADPCM (DVI4 block layout) encoder; no GStreamer.
+- `bairelay talk <camera> --file <wav> [--volume <gain>]` plays a 16-bit PCM WAV (up to 60 s) through the camera speaker. Pure-Rust IMA ADPCM (DVI4 block layout) encoder; no GStreamer.
 - MQTT `<prefix>/<cam>/control/talk` (payload: absolute host path to a WAV) with progress on `<prefix>/<cam>/status/talk` (`playing`, `done`, `error: <code>`).
 - `[cameras.talk_config]` pins the `TalkConfig` (duplex, stream mode, ADPCM rate and block size). Required for battery doorbells, which neither answer `TalkAbility` nor advertise `two_way_audio`.
 - Top-level `talk_dir` enables MQTT talk and confines its paths to one directory; without it `control/talk` replies `error: disabled`.
