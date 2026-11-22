@@ -557,27 +557,29 @@ async fn authenticate(
 		AuthError, build_basic_challenge, build_digest_challenge, verify_basic, verify_digest,
 	};
 	let nonce = state.current_nonce.lock().await.clone();
+	// Basic sends the password in cleartext, so only offer it when TLS
+	// protects the connection. A client that sends Basic unprompted on
+	// plain TCP is still verified: the password is already on the wire
+	// and refusing it would only break preemptive-Basic clients.
+	let challenge = |nonce: &crate::rtsp::auth::Nonce, stale: bool| {
+		let mut headers = vec![(
+			"WWW-Authenticate",
+			build_digest_challenge(&state.realm, nonce, stale),
+		)];
+		if state.is_tls {
+			headers.push(("WWW-Authenticate", build_basic_challenge(&state.realm)));
+		}
+		AuthOutcome::Challenge(headers)
+	};
 	let Some(authz) = parsed.authorization.as_deref() else {
-		// No credentials provided → challenge.
-		return AuthOutcome::Challenge(vec![
-			(
-				"WWW-Authenticate",
-				build_digest_challenge(&state.realm, &nonce, false),
-			),
-			("WWW-Authenticate", build_basic_challenge(&state.realm)),
-		]);
+		return challenge(&nonce, false);
 	};
 	if authz.to_ascii_lowercase().starts_with("basic ") {
-		match verify_basic(authz, &state.users) {
-			Ok(user) => return AuthOutcome::Ok(user.to_string()),
-			Err(AuthError::BadCredentials) => return AuthOutcome::Forbidden,
-			Err(_) => {
-				return AuthOutcome::Challenge(vec![(
-					"WWW-Authenticate",
-					build_basic_challenge(&state.realm),
-				)]);
-			}
-		}
+		return match verify_basic(authz, &state.users) {
+			Ok(user) => AuthOutcome::Ok(user.to_string()),
+			Err(AuthError::BadCredentials) => AuthOutcome::Forbidden,
+			Err(_) => challenge(&nonce, false),
+		};
 	}
 	match verify_digest(
 		authz,
@@ -591,16 +593,10 @@ async fn authenticate(
 		Err(AuthError::StaleNonce) => {
 			let fresh = crate::rtsp::auth::Nonce::random();
 			*state.current_nonce.lock().await = fresh.clone();
-			AuthOutcome::Challenge(vec![(
-				"WWW-Authenticate",
-				build_digest_challenge(&state.realm, &fresh, true),
-			)])
+			challenge(&fresh, true)
 		}
 		Err(AuthError::BadCredentials) => AuthOutcome::Forbidden,
-		Err(_) => AuthOutcome::Challenge(vec![(
-			"WWW-Authenticate",
-			build_digest_challenge(&state.realm, &nonce, false),
-		)]),
+		Err(_) => challenge(&nonce, false),
 	}
 }
 
@@ -1276,6 +1272,14 @@ mod tests {
 		provider: Arc<dyn crate::provider::StreamProvider>,
 		users: Vec<UserCred>,
 	) -> (Arc<ConnectionState>, tokio::io::DuplexStream) {
+		make_state_full(provider, users, false)
+	}
+
+	fn make_state_full(
+		provider: Arc<dyn crate::provider::StreamProvider>,
+		users: Vec<UserCred>,
+		is_tls: bool,
+	) -> (Arc<ConnectionState>, tokio::io::DuplexStream) {
 		let (client, server) = tokio::io::duplex(64 * 1024);
 		let writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>> =
 			Arc::new(Mutex::new(Box::new(server)));
@@ -1289,7 +1293,7 @@ mod tests {
 			server_bind_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
 			peer_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
 			local_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-			is_tls: false,
+			is_tls,
 			writer,
 		});
 		(state, client)
@@ -1605,7 +1609,27 @@ mod tests {
 		dispatch_request(&state, req).await.unwrap();
 		let (head, _) = read_response(&mut client).await;
 		assert_eq!(status_of(&head), 401);
-		assert!(head.contains("WWW-Authenticate"));
+		assert!(head.contains("WWW-Authenticate: Digest"));
+		assert!(
+			!head.contains("Basic realm"),
+			"Basic must not be offered over plain TCP: {head}"
+		);
+	}
+
+	#[tokio::test]
+	async fn describe_challenge_offers_basic_only_over_tls() {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let users = vec![UserCred {
+			name: "alice".into(),
+			password: "pw".into(),
+		}];
+		let (state, mut client) = make_state_full(provider, users, true);
+		let req = b"DESCRIBE rtsps://x/cam1/main RTSP/1.0\r\nCSeq: 4\r\n\r\n";
+		dispatch_request(&state, req).await.unwrap();
+		let (head, _) = read_response(&mut client).await;
+		assert_eq!(status_of(&head), 401);
+		assert!(head.contains("WWW-Authenticate: Digest"));
+		assert!(head.contains("Basic realm"), "{head}");
 	}
 
 	#[tokio::test]

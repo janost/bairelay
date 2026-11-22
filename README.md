@@ -256,7 +256,7 @@ Set `tls = true` in `[mqtt]` to connect over TLS (port is usually 8883). By defa
 
 Bairelay assumes a **trusted LAN** as its deployment context. That assumption shows up in a few places worth calling out:
 
-- **RTSP authentication is opt-in.** Without a `[[users]]` block, the RTSP server accepts anonymous connections. Add a `[[users]]` with name + pass (and optional per-camera `permitted_users` allow-list) to require Digest / Basic auth. Digest enforces a 5-minute nonce TTL and binds the digest URI to the request line per RFC 7616; Basic is offered alongside on plain transport for drop-in compatibility with permissive clients but is, of course, plaintext.
+- **RTSP authentication is opt-in.** Without a `[[users]]` block, the RTSP server accepts anonymous connections. Add a `[[users]]` with name + pass (and optional per-camera `permitted_users` allow-list) to require Digest / Basic auth. Digest enforces a 5-minute nonce TTL and binds the digest URI to the request line per RFC 7616; Digest accepts both the `qop=auth` form and the RFC 2069 no-qop form that VLC/openRTSP (live555) send. Basic is only offered in the challenge on `rtsps://` connections; a client that sends Basic unprompted over plain TCP is still accepted, but its password crosses the network in cleartext.
 - **Push listener trusts source IP.** Any TCP connection from a registered camera's IP is treated as motion. This is correct on a trusted LAN behind NAT, and the listener intentionally rejects when `[push_listener]` is enabled without `[wake_server] enable = true` (the registry would otherwise be empty).
 
 ### Cloud ("account device") cameras
