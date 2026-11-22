@@ -1,8 +1,9 @@
 //! Middleman UDP loop on port 9999 (default). Handles `C2M_Q` (clients)
 //! and `D2M_Q` (cameras) queries and replies pointing the peer at our
-//! register listener. No state — the loop owns nothing beyond its socket.
+//! register listener. Its only state is the session anchors it issues
+//! for configured cameras.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bairelay_neolink_core::bcudp::xml::{EmptyTag, IpPort, M2cQr, M2dQr, UdpXml};
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::WakeServerError;
+use crate::config::RuntimeConfig;
 use crate::packet::{decode_discovery, encode_discovery};
 use crate::registry::SessionAnchors;
 use crate::route::advertise_ip;
@@ -19,12 +21,12 @@ use crate::route::advertise_ip;
 pub(crate) async fn run(
 	sock: Arc<UdpSocket>,
 	register_addr: SocketAddr,
-	bind: IpAddr,
+	cfg: RuntimeConfig,
 	anchors: Arc<SessionAnchors>,
 	cancel: CancellationToken,
 ) -> Result<(), WakeServerError> {
 	let local = sock.local_addr().ok();
-	tracing::info!(?local, register = %register_addr, %bind, "wake-server middleman listening");
+	tracing::info!(?local, register = %register_addr, bind = %cfg.bind, "wake-server middleman listening");
 	let mut buf = vec![0u8; 4096];
 	loop {
 		tokio::select! {
@@ -37,7 +39,7 @@ pub(crate) async fn run(
 					Ok(p) => p,
 					Err(e) => { warn!(error = %e, "middleman recv_from"); continue; }
 				};
-				handle(&sock, register_addr, bind, &anchors, src, &buf[..n]).await;
+				handle(&sock, register_addr, &cfg, &anchors, src, &buf[..n]).await;
 			}
 		}
 	}
@@ -46,7 +48,7 @@ pub(crate) async fn run(
 async fn handle(
 	sock: &UdpSocket,
 	register_addr: SocketAddr,
-	bind: IpAddr,
+	cfg: &RuntimeConfig,
 	anchors: &SessionAnchors,
 	src: SocketAddr,
 	raw: &[u8],
@@ -62,7 +64,7 @@ async fn handle(
 	// `bind` is `0.0.0.0` we ask the kernel which interface IP it would
 	// use to reach `src`; advertising the wildcard makes Argus firmware
 	// silently reject the reply.
-	let advertise = advertise_ip(bind, src).to_string();
+	let advertise = advertise_ip(cfg.bind, src).to_string();
 	let reg_port = register_addr.port();
 	match payload {
 		UdpXml::C2mQ(q) => {
@@ -98,6 +100,10 @@ async fn handle(
 		}
 		UdpXml::D2mQ(q) => {
 			debug!(%src, uid = %q.uid, revision = ?q.revision, advertise = %advertise, "D2M_Q");
+			if !cfg.allows_uid(&q.uid) {
+				debug!(%src, uid = %q.uid, "D2M_Q for unconfigured UID; dropping packet");
+				return;
+			}
 			// Verified shape from a real Reolink cloud capture (			// live-verify): reg + log addresses, empty `<timer/>` and
 			// `<retry/>` markers, rsp/token/ac. Token + ac are
 			// session-bound; the cloud generates fresh values per query,
@@ -106,7 +112,9 @@ async fn handle(
 			// `R2D_R_R` (cameras anchor to that value).
 			let token = rand::random::<u64>();
 			let ac = rand::random::<u32>();
-			if !anchors.issue(&q.uid, token, ac, std::time::Instant::now()) {
+			// Tokio's clock, like the register loop's purge and lookup.
+			let now = tokio::time::Instant::now().into_std();
+			if !anchors.issue(&q.uid, token, ac, now) {
 				// Full UID is in the D2M_Q debug line above.
 				warn!(
 					%src, uid = %UidTail(&q.uid),

@@ -285,7 +285,7 @@ When the session ends, the camera sends `D2R_DISC` with diagnostic counters; the
 
 ### I.6.2 Long-form vs short-form UIDs
 
-Argus firmware reports a 20-character UID in `D2R_HB` / `D2M_Q` / `D2R_R` — the 16-character UID printed on the camera's sticker plus a 4-character firmware-version suffix. Bairelay's config and `C2R_C` carry the short form. To find the registry entry from a `C2R_C`, do a prefix-match: `stored_uid.starts_with(request_uid)`. Implemented in `CameraRegistry::lookup_fresh`.
+Argus firmware reports a 20-character UID in `D2R_HB` / `D2M_Q` / `D2R_R` — the 16-character UID printed on the camera's sticker plus a 4-character firmware-version suffix. Bairelay's config and `C2R_C` carry the short form. A reported UID matches a configured one if it is equal, or the configured UID plus exactly 4 more characters (`registry::uid_matches`). `D2M_Q` and `D2R_HB` for UIDs that match no configured camera are dropped (`RuntimeConfig::allows_uid`). `CameraRegistry::lookup_fresh` finds the registry entry for a `C2R_C` the same way and refuses UIDs shorter than 16 characters: a plain `starts_with` let an empty UID from any LAN peer pick an arbitrary camera, wake it and learn its address.
 
 ### I.6.3 `rsp = -4` is informational
 

@@ -1,6 +1,8 @@
 //! Register UDP loop on port 58200 (default). Handles D2R_HB, C2R_C,
-//! D2R_DISC, D2R_C_R, C2R_CFM. The wake burst is fire-and-forget.
+//! D2R_DISC, D2R_C_R, C2R_CFM. The wake burst is fire-and-forget, at
+//! most one in flight per camera.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,6 +23,36 @@ use crate::registry::{CameraRegistry, SessionAnchors};
 
 const WAKE_BURST_COUNT: usize = 10;
 const WAKE_BURST_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a burst lasts. A `C2R_C` for a camera whose burst started
+/// within this window joins it instead of starting another.
+const WAKE_BURST_WINDOW: Duration = WAKE_BURST_INTERVAL.saturating_mul(WAKE_BURST_COUNT as u32);
+
+/// The most recent wake burst per camera address. `C2R_C` is
+/// unauthenticated; without coalescing every packet would spawn its own
+/// 10-packet burst at the camera.
+#[derive(Default)]
+struct Bursts(HashMap<SocketAddr, (std::time::Instant, u32)>);
+
+impl Bursts {
+	/// `(sid, true)` for a new burst to `cam` the caller must start, or
+	/// `(sid, false)` with the sid of the burst already in flight.
+	fn join_or_start(&mut self, cam: SocketAddr, now: std::time::Instant) -> (u32, bool) {
+		let live = |started: std::time::Instant| {
+			now.saturating_duration_since(started) < WAKE_BURST_WINDOW
+		};
+		if let Some(&(started, sid)) = self.0.get(&cam)
+			&& live(started)
+		{
+			return (sid, false);
+		}
+		// Only registered (configured) cameras get here, so this stays
+		// small; drop finished bursts anyway.
+		self.0.retain(|_, (started, _)| live(*started));
+		let sid = random_sid();
+		self.0.insert(cam, (now, sid));
+		(sid, true)
+	}
+}
 
 pub(crate) async fn run(
 	sock: Arc<UdpSocket>,
@@ -32,6 +64,7 @@ pub(crate) async fn run(
 	let local = sock.local_addr().ok();
 	info!(?local, "wake-server register listening");
 	let stale = Duration::from_millis(cfg.stale_after_ms);
+	let mut bursts = Bursts::default();
 	let mut buf = vec![0u8; 4096];
 	loop {
 		tokio::select! {
@@ -44,7 +77,8 @@ pub(crate) async fn run(
 					Ok(p) => p,
 					Err(e) => { warn!(error = %e, "register recv_from"); continue; }
 				};
-				handle(&sock, &registry, &anchors, &cfg, stale, src, &buf[..n], &cancel).await;
+				handle(&sock, &registry, &anchors, &mut bursts, &cfg, stale, src, &buf[..n], &cancel)
+					.await;
 			}
 		}
 	}
@@ -55,6 +89,7 @@ async fn handle(
 	sock: &Arc<UdpSocket>,
 	registry: &Arc<CameraRegistry>,
 	anchors: &Arc<SessionAnchors>,
+	bursts: &mut Bursts,
 	cfg: &RuntimeConfig,
 	stale_after: Duration,
 	src: SocketAddr,
@@ -73,9 +108,20 @@ async fn handle(
 			handle_heartbeat(sock, registry, anchors, cfg, stale_after, src, tid, hb).await
 		}
 		UdpXml::C2rC(c) => {
-			handle_connect(sock, registry, cfg, stale_after, src, tid, c, cancel).await
+			handle_connect(
+				sock,
+				registry,
+				bursts,
+				cfg,
+				stale_after,
+				src,
+				tid,
+				c,
+				cancel,
+			)
+			.await
 		}
-		UdpXml::D2rR(r) => handle_register(sock, anchors, src, tid, r).await,
+		UdpXml::D2rR(r) => handle_register(sock, anchors, stale_after, src, tid, r).await,
 		UdpXml::D2rDisc(disc) => {
 			debug!(%src, sid = disc.sid, "D2R_DISC");
 			let reply = UdpXml::R2dDcr(R2dDcr {
@@ -102,15 +148,15 @@ async fn handle(
 async fn handle_register(
 	sock: &UdpSocket,
 	anchors: &Arc<SessionAnchors>,
+	stale_after: Duration,
 	src: SocketAddr,
 	tid: u32,
 	r: D2rR,
 ) {
-	let now = std::time::Instant::now();
-	// Anchors live for as long as a session does; reuse the heartbeat
-	// stale window as a generous TTL.
-	let lookup_ttl = Duration::from_secs(60 * 60);
-	let ac = match anchors.lookup(&r.uid, now, lookup_ttl) {
+	// `D2R_R` follows `M2D_Q_R` within moments, and every heartbeat
+	// purges anchors older than `stale_after` anyway.
+	let now = tokio::time::Instant::now().into_std();
+	let ac = match anchors.lookup(&r.uid, now, stale_after) {
 		Some(a) if a.token == r.token => a.ac,
 		Some(a) => {
 			// Token mismatch: someone is replaying or guessing. Drop
@@ -143,6 +189,7 @@ async fn handle_register(
 async fn handle_connect(
 	sock: &Arc<UdpSocket>,
 	registry: &CameraRegistry,
+	bursts: &mut Bursts,
 	cfg: &RuntimeConfig,
 	stale_after: Duration,
 	src: SocketAddr,
@@ -171,12 +218,18 @@ async fn handle_connect(
 			send_reply(sock, src, tid, reply, "register: encode R2C_C_R(unknown)").await;
 		}
 		Some(entry) => {
-			let sid = random_sid();
+			let cam_addr = entry.addr;
+			// A burst already in flight keeps its sid and cli; this
+			// client still gets the replies, so it can reach the camera
+			// once that burst wakes it.
+			let (sid, start_burst) = bursts.join_or_start(cam_addr, now);
+			if !start_burst {
+				debug!(%src, %cam_addr, sid, "C2R_C joins the wake burst in flight");
+			}
 			// Spawn the wake burst before replying so the client has the
 			// strongest chance of seeing the camera awake by the time it
 			// tries TCP 9000.
 			let burst_sock = Arc::clone(sock);
-			let cam_addr = entry.addr;
 			// `c.cli` is the client's self-reported "talk back to me at
 			// this address" hint, but we replace its IP with the actual
 			// UDP source IP — otherwise a malicious or buggy client can
@@ -213,55 +266,57 @@ async fn handle_connect(
 			};
 			let cid = c.cid;
 			let cancel = cancel.clone();
-			// Outer supervisor task: spawns the burst, awaits its
-			// JoinHandle, and surfaces any panic at warn level. Without
-			// this, a panic inside the burst (e.g. encode_discovery
-			// regression, future contributor's `unwrap`) is silently
-			// swallowed by tokio — operators see "wake commands
-			// intermittently fail" with no log signal.
-			tokio::spawn(async move {
-				let burst = tokio::spawn(async move {
-					for i in 0..WAKE_BURST_COUNT {
-						let wake = UdpXml::R2dC(R2dC {
-							cli: cli.clone(),
-							cmap: cmap.clone(),
-							relay: relay.clone(),
-							sid,
-							cid,
-						});
-						match encode_discovery(tid, wake) {
-							Ok(bytes) => {
-								if let Err(e) = burst_sock.send_to(&bytes, cam_addr).await {
-									warn!(%cam_addr, i, error = %e, "wake burst send failed; aborting");
-									break;
+			if start_burst {
+				// Outer supervisor task: spawns the burst, awaits its
+				// JoinHandle, and surfaces any panic at warn level. Without
+				// this, a panic inside the burst (e.g. encode_discovery
+				// regression, future contributor's `unwrap`) is silently
+				// swallowed by tokio — operators see "wake commands
+				// intermittently fail" with no log signal.
+				tokio::spawn(async move {
+					let burst = tokio::spawn(async move {
+						for i in 0..WAKE_BURST_COUNT {
+							let wake = UdpXml::R2dC(R2dC {
+								cli: cli.clone(),
+								cmap: cmap.clone(),
+								relay: relay.clone(),
+								sid,
+								cid,
+							});
+							match encode_discovery(tid, wake) {
+								Ok(bytes) => {
+									if let Err(e) = burst_sock.send_to(&bytes, cam_addr).await {
+										warn!(%cam_addr, i, error = %e, "wake burst send failed; aborting");
+										break;
+									}
+									debug!(%cam_addr, i, "R2D_C ->");
 								}
-								debug!(%cam_addr, i, "R2D_C ->");
-							}
-							Err(e) => {
-								warn!(error = %e, "wake burst encode failed");
-								break;
-							}
-						}
-						if i + 1 < WAKE_BURST_COUNT {
-							tokio::select! {
-								_ = sleep(WAKE_BURST_INTERVAL) => {}
-								_ = cancel.cancelled() => {
-									debug!(%cam_addr, "wake burst cancelled mid-flight");
+								Err(e) => {
+									warn!(error = %e, "wake burst encode failed");
 									break;
 								}
 							}
+							if i + 1 < WAKE_BURST_COUNT {
+								tokio::select! {
+									_ = sleep(WAKE_BURST_INTERVAL) => {}
+									_ = cancel.cancelled() => {
+										debug!(%cam_addr, "wake burst cancelled mid-flight");
+										break;
+									}
+								}
+							}
 						}
+					});
+					if let Err(e) = burst.await
+						&& e.is_panic()
+					{
+						warn!(
+							%cam_addr, sid, cid,
+							"wake burst task panicked; camera will not receive R2D_C — operator should check logs",
+						);
 					}
 				});
-				if let Err(e) = burst.await
-					&& e.is_panic()
-				{
-					warn!(
-						%cam_addr, sid, cid,
-						"wake burst task panicked; camera will not receive R2D_C — operator should check logs",
-					);
-				}
-			});
+			}
 
 			// R2C_C_R reply to the client.
 			let cam_ip = entry.addr.ip().to_string();
@@ -336,6 +391,10 @@ async fn handle_heartbeat(
 	hb: D2rHb,
 ) {
 	debug!(%src, uid = %hb.uid, token = hb.token, "D2R_HB");
+	if !cfg.allows_uid(&hb.uid) {
+		debug!(%src, uid = %hb.uid, "D2R_HB for unconfigured UID; dropping packet");
+		return;
+	}
 	// CRITICAL: use the UDP source addr, not hb.dev (which is the camera's
 	// own LAN IP — useless for sending a reply back to a NAT'd camera).
 	// Tokio's `Instant::now()` honours `tokio::time::pause` / `advance`,
@@ -395,7 +454,3 @@ async fn handle_heartbeat(
 		}
 	}
 }
-
-// `IpPort`, `R2cCr`, `R2cT`, `R2dC`, `R2dDcr`, `random_sid`, `WAKE_BURST_*`
-// are imported above so subsequent tasks slot into this module without
-// re-touching the import list.

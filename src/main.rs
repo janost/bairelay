@@ -514,8 +514,11 @@ async fn async_main() -> Result<()> {
 			let bind_ip: std::net::IpAddr = rtsp_bind_addr
 				.parse()
 				.with_context(|| format!("Invalid wake-server bind IP {}", rtsp_bind_addr))?;
+			let uids = orchestrator
+				.cameras()
+				.filter_map(|c| c.config().uid.clone());
 			let runtime =
-				bairelay_wake_server::config::RuntimeConfig::from_block(&ws_block, bind_ip)
+				bairelay_wake_server::config::RuntimeConfig::from_block(&ws_block, bind_ip, uids)
 					.map_err(|e| anyhow::anyhow!("[wake_server] {e}"))?;
 			let middleman_addr = std::net::SocketAddr::new(runtime.bind, runtime.middleman_port);
 			let register_addr = std::net::SocketAddr::new(runtime.bind, runtime.register_port);
