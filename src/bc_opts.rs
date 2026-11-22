@@ -1,6 +1,6 @@
 //! `BcCameraOpt` builder shared by the camera connect loop and CLI.
 
-use crate::config::{self, CameraConfig};
+use crate::config::{self, CameraConfig, Power};
 use bairelay_neolink_core::bc_protocol::Error as CoreError;
 use bairelay_neolink_core::bc_protocol::{
 	BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, MaxEncryption,
@@ -122,7 +122,11 @@ pub async fn resolve_host(host: &str) -> anyhow::Result<Vec<IpAddr>> {
 /// Build a `BcCameraOpt` from the service `CameraConfig` using the same
 /// rules the long-running camera connect loop uses. Hostnames are not
 /// resolved here; see [`build_bc_opts_resolved`].
-pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
+///
+/// `power` is the camera's effective power source. A mains camera with
+/// an `address` connects over TCP only: when it is down, UID discovery
+/// would otherwise end up on the Reolink relay.
+pub fn build_bc_opts(cfg: &CameraConfig, power: Power) -> BcCameraOpt {
 	let mut addrs = vec![];
 	let mut port = None;
 
@@ -148,7 +152,11 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 		addrs,
 		uid: cfg.uid.clone(),
 		port,
-		protocol: ConnectionProtocol::TcpUdp,
+		protocol: if power == Power::Mains && cfg.address.is_some() {
+			ConnectionProtocol::Tcp
+		} else {
+			ConnectionProtocol::TcpUdp
+		},
 		discovery,
 		// 5 rounds with exponential backoff (1,2,4,8,16 s) is plenty for
 		// Reolink's lazy registration to catch up / a battery cam to wake;
@@ -172,8 +180,11 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 /// connect continues with empty `addrs` so UID discovery runs. Without
 /// one, the failure is returned unlogged, naming the host, for the
 /// caller to report as a connect failure.
-pub async fn build_bc_opts_resolved(cfg: &CameraConfig) -> anyhow::Result<BcCameraOpt> {
-	let mut opts = build_bc_opts(cfg);
+pub async fn build_bc_opts_resolved(
+	cfg: &CameraConfig,
+	power: Power,
+) -> anyhow::Result<BcCameraOpt> {
+	let mut opts = build_bc_opts(cfg, power);
 	if let Some(Ok(ParsedAddress {
 		host: AddressHost::Name(host),
 		..
@@ -226,7 +237,7 @@ mod tests {
 	#[test]
 	fn build_bc_opts_pins_every_field() {
 		let cfg = sample_cfg();
-		let opts = build_bc_opts(&cfg);
+		let opts = build_bc_opts(&cfg, Power::Unknown);
 
 		assert_eq!(opts.name, "driveway");
 		assert_eq!(opts.channel_id, 0);
@@ -240,6 +251,32 @@ mod tests {
 		assert!(!opts.debug);
 		// Address parse: 192.168.1.187 must be present.
 		assert!(opts.addrs.iter().any(|a| a.to_string() == "192.168.1.187"));
+	}
+
+	/// Mains with an address is TCP-only, so a down camera never falls
+	/// through to UID discovery and the relay; without an address the
+	/// UID path is all there is.
+	#[test]
+	fn mains_with_address_connects_tcp_only() {
+		let cfg = sample_cfg();
+		assert!(matches!(
+			build_bc_opts(&cfg, Power::Mains).protocol,
+			ConnectionProtocol::Tcp
+		));
+		for power in [Power::Battery, Power::Unknown] {
+			assert!(matches!(
+				build_bc_opts(&cfg, power).protocol,
+				ConnectionProtocol::TcpUdp
+			));
+		}
+		let uid_only = CameraConfig {
+			address: None,
+			..sample_cfg()
+		};
+		assert!(matches!(
+			build_bc_opts(&uid_only, Power::Mains).protocol,
+			ConnectionProtocol::TcpUdp
+		));
 	}
 
 	#[test]
@@ -292,7 +329,10 @@ mod tests {
 				"#
 			))
 			.unwrap();
-			assert!(build_bc_opts(&cfg).debug, "{knob} should wire through");
+			assert!(
+				build_bc_opts(&cfg, Power::Unknown).debug,
+				"{knob} should wire through"
+			);
 		}
 	}
 
@@ -310,7 +350,7 @@ mod tests {
 			"#,
 		)
 		.unwrap();
-		let opts = build_bc_opts(&cfg);
+		let opts = build_bc_opts(&cfg, Power::Unknown);
 
 		assert_eq!(opts.port, None);
 		assert!(opts.addrs.iter().any(|a| a.to_string() == "10.0.0.5"));
@@ -341,7 +381,7 @@ mod tests {
 				"#
 			))
 			.unwrap();
-			let opts = build_bc_opts(&cfg);
+			let opts = build_bc_opts(&cfg, Power::Unknown);
 			assert!(
 				std::mem::discriminant(&opts.discovery) == std::mem::discriminant(&expected),
 				"discovery {name} should map to {expected:?}"
@@ -363,7 +403,7 @@ mod tests {
 			"#,
 		)
 		.unwrap();
-		let opts = build_bc_opts(&cfg);
+		let opts = build_bc_opts(&cfg, Power::Unknown);
 
 		assert!(opts.addrs.is_empty());
 		assert_eq!(opts.port, None);
@@ -417,7 +457,7 @@ mod tests {
 	fn build_bc_opts_keeps_hostname_port_without_ips() {
 		let mut cfg = sample_cfg();
 		cfg.address = Some("cam1.example.com:9100".into());
-		let opts = build_bc_opts(&cfg);
+		let opts = build_bc_opts(&cfg, Power::Unknown);
 		assert!(opts.addrs.is_empty());
 		assert_eq!(opts.port, Some(9100));
 	}
@@ -439,7 +479,7 @@ mod tests {
 	async fn build_bc_opts_resolved_fills_addrs_for_hostname() {
 		let mut cfg = sample_cfg();
 		cfg.address = Some("localhost:9000".into());
-		let opts = build_bc_opts_resolved(&cfg).await.unwrap();
+		let opts = build_bc_opts_resolved(&cfg, Power::Unknown).await.unwrap();
 		assert!(opts.addrs.iter().any(|ip| ip.is_loopback()));
 		assert_eq!(opts.port, Some(9000));
 	}
@@ -459,7 +499,7 @@ mod tests {
 		let mut cfg = sample_cfg();
 		cfg.uid = None;
 		cfg.address = Some("nonexistent.invalid".into());
-		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg)).await;
+		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg, Power::Unknown)).await;
 		let err = res.unwrap_err();
 		assert!(
 			format!("{err:#}").contains("nonexistent.invalid"),
@@ -475,7 +515,7 @@ mod tests {
 		let mut cfg = sample_cfg();
 		cfg.uid = Some("UIDCAM1".into());
 		cfg.address = Some("nonexistent.invalid:9000".into());
-		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg)).await;
+		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg, Power::Unknown)).await;
 		let opts = res.unwrap();
 		assert!(opts.addrs.is_empty());
 		assert_eq!(opts.uid.as_deref(), Some("UIDCAM1"));

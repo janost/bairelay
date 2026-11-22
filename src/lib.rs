@@ -15,6 +15,7 @@ pub mod mqtt_dispatch;
 pub mod mqtt_loop;
 pub mod oneshot;
 pub mod orchestrator;
+pub mod power;
 pub mod preview_overlay;
 pub mod preview_state;
 pub mod ptz;

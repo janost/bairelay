@@ -36,16 +36,13 @@ pub struct HassioCamera {
 	#[serde(default = "default_username")]
 	pub username: String,
 	pub password: String,
-	#[serde(default = "default_idle_disconnect")]
-	pub idle_disconnect: bool,
+	/// Unset (the form's default) lets the camera's power source decide.
+	#[serde(default)]
+	pub idle_disconnect: Option<bool>,
 }
 
 fn default_username() -> String {
 	"admin".into()
-}
-
-fn default_idle_disconnect() -> bool {
-	true
 }
 
 fn default_topic_prefix() -> String {
@@ -145,7 +142,10 @@ mod tests {
 		assert!(opts.cameras[0].uid.is_none());
 		assert_eq!(opts.cameras[0].username, "admin");
 		assert_eq!(opts.cameras[0].password, "secret");
-		assert!(opts.cameras[0].idle_disconnect, "default true");
+		assert_eq!(
+			opts.cameras[0].idle_disconnect, None,
+			"unset: the power source decides"
+		);
 	}
 
 	#[test]
@@ -184,7 +184,7 @@ mod tests {
 				uid: None,
 				username: "admin".into(),
 				password: "secret".into(),
-				idle_disconnect: true,
+				idle_disconnect: Some(true),
 			}],
 		};
 		let mqtt = MqttServiceFlags {
@@ -224,7 +224,7 @@ mod tests {
 				uid: Some("9527000ABCDEF123".into()),
 				username: "admin".into(),
 				password: "p".into(),
-				idle_disconnect: true,
+				idle_disconnect: Some(true),
 			}],
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
@@ -247,7 +247,7 @@ mod tests {
 				uid: Some("ABC".into()),
 				username: "admin".into(),
 				password: "p".into(),
-				idle_disconnect: true,
+				idle_disconnect: Some(true),
 			}],
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());

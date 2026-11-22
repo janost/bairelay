@@ -147,7 +147,7 @@ fn pause_config_new_shape_roundtrips() {
 		preview_overlay = false
 	"#;
 	let cfg: PauseConfig = toml::from_str(toml).expect("parse");
-	assert!(cfg.bridge_gaps);
+	assert_eq!(cfg.bridge_gaps, Some(true));
 	assert!((cfg.gap_threshold_secs - 2.5).abs() < f64::EPSILON);
 	assert!(!cfg.preview_overlay);
 }
@@ -155,7 +155,7 @@ fn pause_config_new_shape_roundtrips() {
 #[test]
 fn pause_config_defaults() {
 	let cfg: PauseConfig = toml::from_str("").expect("parse");
-	assert!(cfg.bridge_gaps);
+	assert_eq!(cfg.bridge_gaps, None, "unset follows the power source");
 	assert!((cfg.gap_threshold_secs - 3.0).abs() < f64::EPSILON);
 	assert!(cfg.preview_overlay);
 }
@@ -289,7 +289,7 @@ fn pause_config_neolink_compat_fields_parse() {
 	assert_eq!(cfg.mode.as_deref(), Some("still"));
 	assert_eq!(cfg.timeout, Some(45.0));
 	// Defaults for the real fields stay intact.
-	assert!(cfg.bridge_gaps);
+	assert_eq!(cfg.bridge_gaps, None);
 	assert_eq!(cfg.gap_threshold_secs, 3.0);
 	assert!(cfg.preview_overlay);
 }
@@ -573,7 +573,7 @@ fn camera_config_default_values() {
 	assert_eq!(cam.stream, StreamConfig::All);
 	assert_eq!(cam.discovery, DiscoveryMethod::Relay);
 	assert_eq!(cam.max_encryption, MaxEncryption::Aes);
-	assert!(!cam.idle_disconnect);
+	assert_eq!(cam.idle_disconnect, None);
 	assert!(cam.enabled);
 }
 
@@ -648,10 +648,10 @@ preview_overlay = false
 	assert_eq!(cam.uid, Some("ABCDEF1234567890".to_string()));
 	assert!(cam.address.is_none());
 	assert_eq!(cam.channel_id, 2);
-	assert!(cam.idle_disconnect);
+	assert_eq!(cam.idle_disconnect, Some(true));
 	assert!(!cam.mqtt.enable_light);
 	assert_eq!(cam.mqtt.battery_update, 3000);
-	assert!(!cam.pause.bridge_gaps);
+	assert_eq!(cam.pause.bridge_gaps, Some(false));
 	assert!((cam.pause.gap_threshold_secs - 2.0).abs() < f64::EPSILON);
 	assert!(!cam.pause.preview_overlay);
 
@@ -1198,7 +1198,7 @@ fn validate_rejects_negative_gap_threshold() {
 		cameras: vec![test_helpers::minimal_camera_config("cam1")],
 		..Default::default()
 	};
-	cfg.cameras[0].pause.bridge_gaps = true;
+	cfg.cameras[0].pause.bridge_gaps = Some(true);
 	cfg.cameras[0].pause.gap_threshold_secs = -1.0;
 	let err = validate_config(&cfg).expect_err("must reject");
 	assert!(err.contains("gap_threshold_secs"), "error: {err}");
@@ -1210,7 +1210,7 @@ fn validate_rejects_nan_gap_threshold() {
 		cameras: vec![test_helpers::minimal_camera_config("cam1")],
 		..Default::default()
 	};
-	cfg.cameras[0].pause.bridge_gaps = true;
+	cfg.cameras[0].pause.bridge_gaps = Some(true);
 	cfg.cameras[0].pause.gap_threshold_secs = f64::NAN;
 	let err = validate_config(&cfg).expect_err("must reject");
 	assert!(err.contains("gap_threshold_secs"), "error: {err}");
@@ -1582,7 +1582,7 @@ fn idle_disc_alias_maps_to_idle_disconnect() {
 		idle_disc = true
 	"#;
 	let cfg = parse_config(toml_str).expect("parses");
-	assert!(cfg.cameras[0].idle_disconnect);
+	assert_eq!(cfg.cameras[0].idle_disconnect, Some(true));
 }
 
 #[test]

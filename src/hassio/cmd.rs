@@ -152,7 +152,7 @@ mod tests {
 			name: "cam1".into(),
 			username: "admin".into(),
 			password: Some("pw".into()),
-			idle_disconnect: true,
+			idle_disconnect: Some(true),
 			..CameraConfig::default()
 		});
 		let out = minimize_render(&cfg).unwrap();

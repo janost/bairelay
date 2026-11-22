@@ -78,10 +78,11 @@ pub fn merge_cameras(base: Vec<CameraConfig>, overlay: Vec<CameraConfig>) -> Vec
 			overlay_field!(entry, over, defs, stream);
 			overlay_field!(entry, over, defs, discovery);
 			overlay_field!(entry, over, defs, max_encryption);
-			overlay_field!(entry, over, defs, idle_disconnect);
+			overlay_field!(entry, over, power @opt);
+			overlay_field!(entry, over, idle_disconnect @opt);
 			overlay_field!(entry, over, idle_disconnect_timeout_secs @opt);
 			overlay_field!(entry, over, defs, motion_wake_hold_secs);
-			overlay_field!(entry, over, defs, stream_latency_ms);
+			overlay_field!(entry, over, stream_latency_ms @opt);
 			overlay_field!(entry, over, defs, enabled);
 			overlay_field!(entry, over, defs, webhook);
 			// Whole-struct override: relies on build_base_config leaving
@@ -366,6 +367,37 @@ mod tests {
 		assert_eq!(merged[0].address.as_deref(), Some("ABC123"));
 	}
 
+	/// The form's `idle_disconnect = true` used to survive an overlay
+	/// `idle_disconnect = false`: the default-diff rule read `false` as
+	/// "not set". Both `Option` fields now take any value the overlay
+	/// sets, and an overlay that leaves them unset keeps the form's.
+	#[test]
+	fn overlay_false_overrides_form_idle_disconnect_true() {
+		let base = vec![CameraConfig {
+			name: "Hallway".into(),
+			idle_disconnect: Some(true),
+			..CameraConfig::default()
+		}];
+		let overlay = parse_overlay(
+			r#"
+			[[cameras]]
+			name = "Hallway"
+			idle_disconnect = false
+			stream_latency_ms = 1500
+			power = "mains"
+		"#,
+		)
+		.unwrap();
+		let merged = merge_cameras(base.clone(), overlay.cameras);
+		assert_eq!(merged[0].idle_disconnect, Some(false));
+		assert_eq!(merged[0].stream_latency_ms, Some(1500));
+		assert_eq!(merged[0].power, Some(crate::config::PowerSource::Mains));
+
+		let silent = parse_overlay("[[cameras]]\nname = \"Hallway\"\n").unwrap();
+		let merged = merge_cameras(base, silent.cameras);
+		assert_eq!(merged[0].idle_disconnect, Some(true));
+	}
+
 	#[test]
 	fn end_to_end_merge_validates_clean() {
 		use crate::hassio::options::{
@@ -381,7 +413,7 @@ mod tests {
 				uid: None,
 				username: "admin".into(),
 				password: "secret".into(),
-				idle_disconnect: true,
+				idle_disconnect: Some(true),
 			}],
 		};
 		let mqtt = MqttServiceFlags {

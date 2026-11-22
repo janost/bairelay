@@ -15,11 +15,14 @@ use crate::audio_presence::AudioPresence;
 use crate::bcmedia_dump::BcMediaDumpConfig;
 use crate::camera_tasks;
 use crate::capabilities::CameraCapabilities;
-use crate::config::CameraConfig;
+use crate::config::{CameraConfig, Power};
 use crate::grace_period::GracePeriod;
 use crate::preview_state::PreviewState;
 use crate::status_cache::StatusCache;
-use crate::stream_source::{MutexPoisonRecover as _, RwLockPoisonRecover as _, StreamSource};
+use crate::stream_source::{
+	MutexPoisonRecover as _, RwLockPoisonRecover as _, SourceTuning, StallBudget, StallGuard,
+	StreamSource,
+};
 use crate::wake_lock::WakeLockCounter;
 use crate::webhook_listener::WebhookTarget;
 
@@ -254,6 +257,13 @@ pub struct CameraHandle {
 	/// `spawn_session_tasks` consults it so a reconnect doesn't restart
 	/// the poller and re-run the same futile probes on every wake.
 	battery_unsupported: Arc<AtomicBool>,
+	/// Power source detected from the `<Support>` reply, kept across
+	/// sessions like `battery_unsupported`. Read through [`Self::power`],
+	/// which lets an explicit `power` setting win.
+	detected_power: Mutex<Power>,
+	/// Media-stall restarts left for this camera's stream sources; see
+	/// [`StallBudget`].
+	stall_budget: Arc<StallBudget>,
 	/// Serialises `control/ir` / `control/led`. Both are read-modify-
 	/// write of one `<LedState>` on the camera, so overlapping commands
 	/// would otherwise undo each other's field.
@@ -362,6 +372,8 @@ impl CameraHandle {
 			preview_state_rx,
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
+			detected_power: Mutex::new(Power::Unknown),
+			stall_budget: Arc::new(StallBudget::default()),
 			led_write_lock: tokio::sync::Mutex::new(()),
 			talk_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
@@ -516,7 +528,7 @@ impl CameraHandle {
 				&self.config.name,
 				self.config.address.as_deref(),
 				self.config.uid.as_deref(),
-				caps.into(),
+				self.discovery_view(caps),
 				&flags,
 				&presets,
 			)
@@ -612,6 +624,46 @@ impl CameraHandle {
 		self.battery_unsupported.load(Ordering::Acquire)
 	}
 
+	/// The power source to act on: the explicit `power` setting, else
+	/// the detected one, else `Unknown`.
+	pub fn power(&self) -> Power {
+		self.config
+			.effective_power(*self.detected_power.lock_recover())
+	}
+
+	/// `idle_disconnect` resolved against [`Self::power`].
+	pub fn idle_disconnect(&self) -> bool {
+		self.config.effective_idle_disconnect(self.power())
+	}
+
+	/// Fold one session's detection into the stored result, and drop
+	/// cached battery state once mains is known so a broker reconnect
+	/// can't replay it after discovery retracts the entity.
+	fn record_power(&self, evidence: crate::power::Evidence) {
+		{
+			let mut detected = self.detected_power.lock_recover();
+			*detected = evidence.fold(*detected);
+		}
+		if self.power() == Power::Mains {
+			self.status_cache.clear_battery_level();
+		}
+	}
+
+	/// HA discovery view of `caps` plus the battery presence implied by
+	/// [`Self::power`].
+	fn discovery_view(
+		&self,
+		caps: CameraCapabilities,
+	) -> bairelay_mqtt::discovery::CameraCapabilitiesView {
+		let mut view: bairelay_mqtt::discovery::CameraCapabilitiesView = caps.into();
+		view.battery = match self.power() {
+			Power::Battery => crate::capabilities::Presence::Present,
+			Power::Mains => crate::capabilities::Presence::Absent,
+			Power::Unknown => crate::capabilities::Presence::Unknown,
+		};
+		view
+	}
+
 	/// Re-emit every cached MQTT status value via retained publishes.
 	/// Called by `mqtt_loop::handle_connack` after the discovery
 	/// republish so HA recovers full state when the broker has lost
@@ -685,7 +737,7 @@ impl CameraHandle {
 				&self.config.name,
 				self.config.address.as_deref(),
 				self.config.uid.as_deref(),
-				caps.into(),
+				self.discovery_view(caps),
 				&flags,
 				&presets,
 			)
@@ -759,19 +811,19 @@ impl CameraHandle {
 
 	/// Get (or lazily create) the [`StreamSource`] for the given stream kind.
 	///
-	/// Waits up to 30 seconds for the camera to reach `Connected` state,
-	/// polling every 100 ms. Once connected, the source is started via
+	/// Waits for the camera to reach `Connected` state (30 s, 10 s for
+	/// mains; see [`Power::timeouts`]), polling every 100 ms. Once connected, the source is started via
 	/// `StreamSource::start` and cached in the per-camera registry so
 	/// subsequent subscribers share one Baichuan video stream.
 	pub async fn stream_source(
 		&self,
 		kind: RtspStreamKind,
 	) -> Result<Arc<StreamSource>, StreamError> {
-		// Poll for Connected state up to 30s. Scope guards tightly so no
-		// RwLock guard is held across `.await` (clippy::await_holding_lock).
+		// Poll for Connected state. Scope guards tightly so no RwLock
+		// guard is held across `.await` (clippy::await_holding_lock).
 		const POLL_INTERVAL: Duration = Duration::from_millis(100);
-		const MAX_WAIT: Duration = Duration::from_secs(30);
-		let deadline = std::time::Instant::now() + MAX_WAIT;
+		let max_wait = self.power().timeouts().wait_connected;
+		let deadline = std::time::Instant::now() + max_wait;
 		loop {
 			if self.cancel.is_cancelled() {
 				return Err(StreamError::Unavailable(
@@ -785,7 +837,7 @@ impl CameraHandle {
 				return Err(StreamError::Unavailable(format!(
 					"camera '{}' did not reach Connected state within {}s",
 					self.config.name,
-					MAX_WAIT.as_secs()
+					max_wait.as_secs()
 				)));
 			}
 			tokio::time::sleep(POLL_INTERVAL).await;
@@ -856,15 +908,27 @@ impl CameraHandle {
 		// source for this camera writes to the same buffer (one JPEG per
 		// camera, not per stream).
 		//
-		// Gap threshold: Task 5 will read this in
-		// `reader_task` to drive placeholder-frame emission when the
-		// camera goes silent. `bridge_gaps = false` folds to
-		// `Duration::MAX` so the ticker never fires — no separate
-		// "disabled" code path needed.
-		let gap_threshold = if self.config.pause.bridge_gaps {
-			Duration::from_secs_f64(self.config.pause.gap_threshold_secs)
-		} else {
-			Duration::MAX
+		// The session has already run power detection, so the defaults
+		// below see it. Gap bridging off folds the threshold to
+		// `Duration::MAX` so the ticker never fires, and arms the stall
+		// restart instead: with no replay frames, a silent camera would
+		// otherwise leave clients hanging.
+		let power = self.power();
+		let bridge_gaps = self.config.effective_bridge_gaps(power);
+		let tuning = SourceTuning {
+			gap_threshold: if bridge_gaps {
+				Duration::from_secs_f64(self.config.pause.gap_threshold_secs)
+			} else {
+				Duration::MAX
+			},
+			stream_latency: Duration::from_millis(
+				self.config.effective_stream_latency_ms(power).into(),
+			),
+			start_video_timeout: power.timeouts().start_video,
+			stall: (!bridge_gaps).then(|| StallGuard {
+				timeout: crate::stream_source::MEDIA_STALL_TIMEOUT,
+				budget: Arc::clone(&self.stall_budget),
+			}),
 		};
 		let source = StreamSource::start(
 			camera,
@@ -873,8 +937,7 @@ impl CameraHandle {
 			Arc::clone(&self.last_frame_main),
 			self.bcmedia_dump.clone(),
 			self.audio_presence(),
-			gap_threshold,
-			Duration::from_millis(self.config.stream_latency_ms.into()),
+			tuning,
 		);
 
 		// Insert the new source under the sync lock.
@@ -990,7 +1053,7 @@ impl CameraHandle {
 	/// Attempt to connect and login to the camera. Returns the camera
 	/// and the device type its login `DeviceInfo` reports.
 	async fn try_connect(&self) -> anyhow::Result<(Arc<BcCamera>, Option<String>)> {
-		let opts = crate::bc_opts::build_bc_opts_resolved(&self.config).await?;
+		let opts = crate::bc_opts::build_bc_opts_resolved(&self.config, self.power()).await?;
 		let max_enc = crate::bc_opts::max_encryption(&self.config);
 		let camera = BcCamera::new(&opts).await?;
 		let device_info = camera.login_with_maxenc(max_enc).await?;
@@ -1112,9 +1175,33 @@ impl CameraHandle {
 		// The token exists before state turns Connected, so a watchdog
 		// that sees Connected always has a session to cancel.
 		let session = self.begin_session();
+		// Support goes first: power detection decides the defaults that
+		// stream sources started once Connected pick up.
+		let support = self.fetch_support(&*driver, &session).await;
+		let evidence = match &support {
+			Some(support) => Some(
+				crate::power::detect(&*driver, support.as_ref().ok(), self.config.channel_id).await,
+			),
+			None => None,
+		};
+		if let Some(evidence) = evidence {
+			self.record_power(evidence);
+		}
+		// Install the driver before Connected: a SETUP waiting on the
+		// state reads `bc_camera_concrete` as soon as it flips.
+		*self.bc_camera.write_recover() = Some(Arc::clone(&driver));
+		*self.bc_camera_concrete.write_recover() = concrete.clone();
+		if let Some(ip) = driver.camera_ip() {
+			*self.camera_ip.write_recover() = Some(ip);
+		}
 		self.set_state(CameraState::Connected);
 		self.set_preview_state(PreviewState::Live);
-		tracing::info!(camera = %self.config.name, "Connected");
+		self.log_connected(
+			evidence,
+			device_type,
+			concrete.as_ref().and_then(|c| c.session_path()),
+			driver.camera_ip(),
+		);
 
 		// Publish connected status via MQTT.
 		if let Some(ref mqtt) = self.mqtt_client {
@@ -1125,14 +1212,10 @@ impl CameraHandle {
 			}
 		}
 
-		*self.bc_camera.write_recover() = Some(Arc::clone(&driver));
-		*self.bc_camera_concrete.write_recover() = concrete.clone();
-		if let Some(ip) = driver.camera_ip() {
-			*self.camera_ip.write_recover() = Some(ip);
+		if let Some(Ok(support)) = support {
+			self.probe_capabilities(&*driver, &support, device_type, &session)
+				.await;
 		}
-
-		self.probe_capabilities(&*driver, device_type, &session)
-			.await;
 
 		// Spawn per-session tasks (motion, pollers, grace period).
 		let tasks = self.spawn_session_tasks(&driver, &session).await;
@@ -1149,7 +1232,7 @@ impl CameraHandle {
 		// so a slow reconnect doesn't flash SLEEPING on the HA
 		// overlay.
 		self.set_preview_state(post_keepalive_preview_state(
-			self.config.idle_disconnect,
+			self.idle_disconnect(),
 			self.wake_lock.is_idle(),
 		));
 
@@ -1160,45 +1243,87 @@ impl CameraHandle {
 		end
 	}
 
-	/// Populate the capability and preset caches for HA discovery, then
-	/// publish discovery. On a failed or timed-out `get_support()` the
+	/// The per-session `Connected` line: the effective power source and
+	/// where it came from (with this session's Support `battery` value,
+	/// or why detection found nothing), plus the login device type and
+	/// how the session reaches the camera.
+	fn log_connected(
+		&self,
+		evidence: Option<crate::power::Evidence>,
+		device_type: Option<&str>,
+		path: Option<bairelay_neolink_core::bc_protocol::SessionPath>,
+		camera_ip: Option<IpAddr>,
+	) {
+		use crate::config::PowerSource;
+		use crate::power::Evidence;
+		let configured = !matches!(self.config.power, None | Some(PowerSource::Auto));
+		let (support_battery, power_reason) = match evidence {
+			_ if configured => (None, None),
+			Some(Evidence::SupportBattery(n)) => (Some(n), None),
+			Some(e) => (None, Some(e)),
+			None => (None, None),
+		};
+		tracing::info!(
+			camera = %self.config.name,
+			power = %self.power().as_str(),
+			power_from = %if configured { "configured" } else { "detected" },
+			support_battery,
+			power_reason = power_reason.map(tracing::field::display),
+			device_type = device_type.map(tracing::field::display),
+			path = path
+				.map(bairelay_neolink_core::bc_protocol::SessionPath::as_str)
+				.map(tracing::field::display),
+			camera_ip = camera_ip.map(tracing::field::display),
+			"Connected"
+		);
+	}
+
+	/// Fetch the `<Support>` reply, bounded by
+	/// [`Self::SETUP_REQUEST_TIMEOUT`]. `None` when `session` ended
+	/// first; `Some(Err(()))` when the request failed or timed out
+	/// (logged here).
+	async fn fetch_support(
+		&self,
+		driver: &dyn CameraDriver,
+		session: &CancellationToken,
+	) -> Option<Result<bairelay_neolink_core::bc::xml::Support, ()>> {
+		match camera_tasks::cancellable(session, Self::SETUP_REQUEST_TIMEOUT, driver.get_support())
+			.await?
+		{
+			Ok(Ok(support)) => Some(Ok(support)),
+			Ok(Err(e)) => {
+				tracing::warn!(
+					camera = %self.config.name,
+					error = %e,
+					"Failed to query camera capabilities via get_support(); leaving cache empty for re-probe on next reconnect"
+				);
+				Some(Err(()))
+			}
+			Err(_) => {
+				tracing::warn!(
+					camera = %self.config.name,
+					"get_support() timed out; leaving cache empty for re-probe on next reconnect"
+				);
+				Some(Err(()))
+			}
+		}
+	}
+
+	/// Populate the capability and preset caches for HA discovery from
+	/// `support`, then publish discovery. Without a `support` reply the
 	/// cache stays `None` so the next reconnect re-probes: a transient
 	/// error must not stick `has_ptz = false` for the session. Each
 	/// request is bounded and abandoned when `session` ends.
 	async fn probe_capabilities(
 		&self,
 		driver: &dyn CameraDriver,
+		support: &bairelay_neolink_core::bc::xml::Support,
 		device_type: Option<&str>,
 		session: &CancellationToken,
 	) {
-		let support = match camera_tasks::cancellable(
-			session,
-			Self::SETUP_REQUEST_TIMEOUT,
-			driver.get_support(),
-		)
-		.await
-		{
-			None => return,
-			Some(Ok(Ok(support))) => support,
-			Some(Ok(Err(e))) => {
-				tracing::warn!(
-					camera = %self.config.name,
-					error = %e,
-					"Failed to query camera capabilities via get_support(); leaving cache empty for re-probe on next reconnect"
-				);
-				return;
-			}
-			Some(Err(_)) => {
-				tracing::warn!(
-					camera = %self.config.name,
-					"get_support() timed out; leaving cache empty for re-probe on next reconnect"
-				);
-				return;
-			}
-		};
 		let caps = crate::capabilities::camera_capabilities(
 			driver,
-			&support,
+			support,
 			self.config.channel_id,
 			device_type,
 		)
@@ -1316,8 +1441,12 @@ impl CameraHandle {
 			// `battery_unsupported` latches when the poller concludes the
 			// camera has no battery. Skipping the respawn is what makes
 			// that verdict permanent rather than per-session — see
-			// `camera_tasks::battery_poller`.
-			if self.config.mqtt.enable_battery && !self.battery_unsupported() {
+			// `camera_tasks::battery_poller`. A mains camera never gets
+			// a poller: its `battery_info` probes would only fail.
+			if self.config.mqtt.enable_battery
+				&& !self.battery_unsupported()
+				&& self.power() != Power::Mains
+			{
 				tasks.spawn(camera_tasks::battery_poller(
 					self.config.name.clone(),
 					Arc::clone(driver),
@@ -1380,7 +1509,7 @@ impl CameraHandle {
 		// drops to zero, count down `idle_disconnect_timeout_secs`
 		// (default 45 s) and then cancel the session, releasing the
 		// camera back to sleep.
-		if self.config.idle_disconnect {
+		if self.idle_disconnect() {
 			let grace =
 				crate::config::resolve_idle_disconnect_timeout(&self.config, self.prune_grace);
 			let gp = GracePeriod::new(self.wake_lock.clone(), grace);
@@ -1557,7 +1686,10 @@ impl CameraHandle {
 			// This is the "parked" state — surface it to the preview overlay as
 			// `Sleeping` so subscribers (MQTT preview publisher) can caption the
 			// cached JPEG while the wake lock is zero.
-			if self.config.idle_disconnect && self.wake_lock.is_idle() {
+			// Before the first detection an unset `idle_disconnect` is off,
+			// so a battery camera connects once (the startup wake), is
+			// detected, and parks from then on.
+			if self.idle_disconnect() && self.wake_lock.is_idle() {
 				self.set_preview_state(PreviewState::Sleeping);
 				tracing::info!(camera = %self.config.name, "Idle disconnect enabled, waiting for wake lock...");
 				tokio::select! {
@@ -1971,7 +2103,7 @@ mod tests {
 		// Disable idle_disconnect so the loop does NOT park in
 		// `Sleeping` waiting for a wake lock — we want it to march
 		// straight into the connect attempt.
-		config.idle_disconnect = false;
+		config.idle_disconnect = Some(false);
 
 		let cancel = CancellationToken::new();
 		let handle = Arc::new(CameraHandle::new(config, cancel.clone(), None));
@@ -2493,7 +2625,7 @@ mod tests {
 		use tokio_util::sync::CancellationToken;
 
 		let mut config = minimal_camera_config("cam-park");
-		config.idle_disconnect = true;
+		config.idle_disconnect = Some(true);
 		// Unroutable address: if the park arm races our assertion,
 		// the test still won't reach the live network.
 		config.address = Some("127.0.0.1:1".to_string());
@@ -2537,7 +2669,7 @@ mod tests {
 
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let mut config = minimal_camera_config("cam-init");
-		config.idle_disconnect = true;
+		config.idle_disconnect = Some(true);
 		let cancel = CancellationToken::new();
 		let handle = Arc::new(CameraHandle::new(config, cancel.clone(), Some(mqtt)));
 
@@ -2582,7 +2714,7 @@ mod tests {
 		use tokio_util::sync::CancellationToken;
 
 		let mut config = minimal_camera_config("cam-fail");
-		config.idle_disconnect = false;
+		config.idle_disconnect = Some(false);
 		config.address = Some("127.0.0.1:1".to_string());
 
 		let cancel = CancellationToken::new();
@@ -2627,7 +2759,7 @@ mod tests {
 		use tokio_util::sync::CancellationToken;
 
 		let mut config = minimal_camera_config("cam-midconnect");
-		config.idle_disconnect = false;
+		config.idle_disconnect = Some(false);
 		// TEST-NET-1 blackholes rather than refusing, so the connect
 		// stays in flight instead of failing fast like a closed port.
 		config.address = Some("192.0.2.1:9000".to_string());
@@ -3270,6 +3402,64 @@ mod tests {
 		assert_eq!(handle.state(), CameraState::Disconnected);
 	}
 
+	/// The session detects the power source before `Connected` and logs
+	/// it on that line; a later session whose Support request fails keeps
+	/// the earlier result. Mains turns the unset defaults to the mains
+	/// values.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn run_connected_session_detects_power_and_keeps_it() {
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::{Support, SupportItem};
+		use bairelay_neolink_core::bc_protocol::{Error, FakeCameraBuilder};
+
+		let logs = crate::test_logs::capture_at(tracing::Level::INFO);
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam"),
+			CancellationToken::new(),
+			None,
+		));
+		assert_eq!(handle.power(), Power::Unknown);
+
+		let mains = FakeCameraBuilder::new()
+			.with_support(|| {
+				Ok(Support {
+					items: vec![SupportItem {
+						battery: Some(0),
+						..Default::default()
+					}],
+					..Default::default()
+				})
+			})
+			.with_linktype(|| Err(Error::Other("link fail")))
+			.build();
+		handle.run_connected_session_for_test(mains, None).await;
+		assert_eq!(handle.power(), Power::Mains);
+		assert!(!handle.idle_disconnect());
+		assert_eq!(
+			handle.discovery_view(CameraCapabilities::default()).battery,
+			crate::capabilities::Presence::Absent,
+			"mains retracts the battery entity"
+		);
+		let text = logs.text();
+		assert!(
+			text.contains("Connected camera=cam power=mains power_from=detected support_battery=0"),
+			"{text}"
+		);
+
+		let failing = FakeCameraBuilder::new()
+			.with_support(|| Err(Error::Other("support refused")))
+			.with_linktype(|| Err(Error::Other("link fail")))
+			.build();
+		handle.run_connected_session_for_test(failing, None).await;
+		assert_eq!(handle.power(), Power::Mains, "a failed probe keeps mains");
+		assert!(
+			logs.text()
+				.contains("power=mains power_from=detected power_reason=Support request failed"),
+			"{}",
+			logs.text()
+		);
+	}
+
 	/// The channel `<Support>` item decides AI + doorbell presence at
 	/// connect; a confirmed-absent AI detector drops cached AI states
 	/// so a broker reconnect can't replay them after retraction.
@@ -3462,7 +3652,7 @@ mod tests {
 		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 
 		let mut config = minimal_camera_config("cam-idle");
-		config.idle_disconnect = true;
+		config.idle_disconnect = Some(true);
 		config.idle_disconnect_timeout_secs = Some(1.0);
 
 		let fake = FakeCameraBuilder::new()

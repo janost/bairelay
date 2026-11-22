@@ -67,13 +67,13 @@ async fn watchdog_does_not_panic_with_cameras() {
 
 #[tokio::test]
 async fn watchdog_skips_camera_with_idle_disconnect_false() {
-	// Camera with idle_disconnect=false should never be flagged by the
+	// Camera with idle_disconnect unset (unknown power: off) should never be flagged by the
 	// watchdog, regardless of connection or wake-lock state.
 	let cancel = CancellationToken::new();
 	let watchdog = Watchdog::new(Duration::from_millis(50), Duration::ZERO, cancel.clone());
 
 	let config = minimal_camera_config("no_idle");
-	assert!(!config.idle_disconnect);
+	assert_eq!(config.idle_disconnect, None);
 	let cam = Arc::new(CameraHandle::new(config, cancel.clone(), None));
 	assert!(cam.state().is_disconnected());
 
@@ -106,7 +106,7 @@ async fn watchdog_skips_disconnected_camera_with_zero_wake_locks() {
 	let watchdog = Watchdog::new(Duration::from_millis(50), Duration::ZERO, cancel.clone());
 
 	let mut config = minimal_camera_config("idle_cam");
-	config.idle_disconnect = true;
+	config.idle_disconnect = Some(true);
 
 	let cam = Arc::new(CameraHandle::new(config, cancel.clone(), None));
 	// Camera is Disconnected with 0 wake locks — watchdog should skip
@@ -145,7 +145,7 @@ async fn watchdog_does_not_disconnect_camera_with_active_wake_lock() {
 	let watchdog = Watchdog::new(Duration::from_millis(50), Duration::ZERO, cancel.clone());
 
 	let mut config = minimal_camera_config("held_cam");
-	config.idle_disconnect = true;
+	config.idle_disconnect = Some(true);
 	let cam = Arc::new(CameraHandle::new(config, cancel.clone(), None));
 
 	// Hold a wake lock

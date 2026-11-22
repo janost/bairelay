@@ -78,6 +78,9 @@ impl StatusCache {
 	pub fn battery_level(&self) -> Option<u8> {
 		*self.battery_level.read_recover()
 	}
+	pub fn clear_battery_level(&self) {
+		*self.battery_level.write_recover() = None;
+	}
 
 	pub fn set_motion(&self, detected: bool) {
 		*self.motion.write_recover() = Some(detected);

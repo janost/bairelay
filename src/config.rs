@@ -507,8 +507,22 @@ pub struct CameraConfig {
 	#[serde(default)]
 	pub max_encryption: MaxEncryption,
 
-	#[serde(default, alias = "idle", alias = "idle_disc")]
-	pub idle_disconnect: bool,
+	/// How the camera is powered. `auto` (the default) uses what the
+	/// camera's Support XML reports; see [`CameraConfig::effective_power`].
+	/// Several defaults below follow the effective power source.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub power: Option<PowerSource>,
+
+	/// Disconnect when nothing holds a wake lock, so a battery camera can
+	/// sleep. Unset follows the power source: on for battery, off for
+	/// mains or unknown. See [`CameraConfig::effective_idle_disconnect`].
+	#[serde(
+		default,
+		alias = "idle",
+		alias = "idle_disc",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub idle_disconnect: Option<bool>,
 
 	/// Seconds to wait after the last wake lock drops before the camera
 	/// is told to sleep. `None` uses the 45 s default. A `[cameras.pause]
@@ -527,12 +541,14 @@ pub struct CameraConfig {
 	/// Startup buffer, in milliseconds, the video pacer holds before the
 	/// first frame of a stream goes out; audio uses the same value capped
 	/// at 500 ms. Battery cameras (Argus) deliver each GOP as a ~900 ms
-	/// burst followed by ~1.1 s of silence, and the default 1500 ms keeps
-	/// playback continuous across those gaps. Cameras that stream steadily
-	/// can go much lower. `0` disables pacing: frames reach clients as the
-	/// camera delivers them. At most [`MAX_STREAM_LATENCY_MS`].
-	#[serde(default = "default_stream_latency_ms")]
-	pub stream_latency_ms: u32,
+	/// burst followed by ~1.1 s of silence, and 1500 ms keeps playback
+	/// continuous across those gaps; mains cameras stream steadily. Unset
+	/// follows the power source, see
+	/// [`CameraConfig::effective_stream_latency_ms`]. `0` disables
+	/// pacing: frames reach clients as the camera delivers them. At most
+	/// [`MAX_STREAM_LATENCY_MS`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stream_latency_ms: Option<u32>,
 
 	#[serde(default = "default_true", alias = "enable")]
 	pub enabled: bool,
@@ -691,10 +707,11 @@ impl Default for CameraConfig {
 			stream: StreamConfig::default(),
 			discovery: DiscoveryMethod::default(),
 			max_encryption: MaxEncryption::default(),
-			idle_disconnect: false,
+			power: None,
+			idle_disconnect: None,
 			idle_disconnect_timeout_secs: None,
 			motion_wake_hold_secs: default_motion_wake_hold_secs(),
-			stream_latency_ms: default_stream_latency_ms(),
+			stream_latency_ms: None,
 			enabled: true,
 			mqtt: MqttConfig::default(),
 			pause: PauseConfig::default(),
@@ -711,6 +728,99 @@ impl Default for CameraConfig {
 			strict: None,
 			talk_config: None,
 		}
+	}
+}
+
+// ── Power source ──────────────────────────────────────────────────────
+
+/// Per-camera `power` setting.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerSource {
+	/// Use what the camera reports (`<Support>` `battery`).
+	#[default]
+	Auto,
+	Battery,
+	Mains,
+}
+
+/// The power source bairelay acts on: the explicit `power` setting,
+/// else what the camera reported, else `Unknown`. `Unknown` keeps the
+/// battery-safe behaviour except where noted on each default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+	Battery,
+	Mains,
+	Unknown,
+}
+
+impl Power {
+	/// Lower-case name for logs.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Power::Battery => "battery",
+			Power::Mains => "mains",
+			Power::Unknown => "unknown",
+		}
+	}
+
+	/// Deadlines that cover a battery camera waking. A mains camera is
+	/// already awake, so it gets short ones and a dead camera fails fast.
+	pub fn timeouts(self) -> PowerTimeouts {
+		match self {
+			Power::Mains => PowerTimeouts {
+				start_video: std::time::Duration::from_secs(10),
+				wait_connected: std::time::Duration::from_secs(10),
+				sdp_ready: std::time::Duration::from_secs(5),
+			},
+			Power::Battery | Power::Unknown => PowerTimeouts {
+				start_video: std::time::Duration::from_secs(30),
+				wait_connected: std::time::Duration::from_secs(30),
+				sdp_ready: std::time::Duration::from_secs(15),
+			},
+		}
+	}
+}
+
+/// Stream-setup deadlines picked by [`Power::timeouts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerTimeouts {
+	/// `start_video` reply.
+	pub start_video: std::time::Duration,
+	/// A SETUP waiting for the camera session to reach `Connected`.
+	pub wait_connected: std::time::Duration,
+	/// A SETUP waiting for the first keyframe's SDP parameters.
+	pub sdp_ready: std::time::Duration,
+}
+
+impl CameraConfig {
+	/// The explicit `power` setting, else `detected`.
+	pub fn effective_power(&self, detected: Power) -> Power {
+		match self.power.unwrap_or_default() {
+			PowerSource::Auto => detected,
+			PowerSource::Battery => Power::Battery,
+			PowerSource::Mains => Power::Mains,
+		}
+	}
+
+	/// `idle_disconnect`, else on only for battery. Unknown stays off:
+	/// the startup wake connects a battery camera anyway, detection runs
+	/// in that session, and later sessions park.
+	pub fn effective_idle_disconnect(&self, power: Power) -> bool {
+		self.idle_disconnect.unwrap_or(power == Power::Battery)
+	}
+
+	/// `stream_latency_ms`, else 200 for mains and 1500 otherwise.
+	pub fn effective_stream_latency_ms(&self, power: Power) -> u32 {
+		self.stream_latency_ms.unwrap_or(match power {
+			Power::Mains => MAINS_STREAM_LATENCY_MS,
+			Power::Battery | Power::Unknown => BATTERY_STREAM_LATENCY_MS,
+		})
+	}
+
+	/// `[cameras.pause] bridge_gaps`, else off only for mains.
+	pub fn effective_bridge_gaps(&self, power: Power) -> bool {
+		self.pause.bridge_gaps.unwrap_or(power != Power::Mains)
 	}
 }
 
@@ -793,8 +903,10 @@ impl From<&MqttConfig> for bairelay_mqtt::discovery::CameraEnableFlags {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PauseConfig {
-	#[serde(default = "default_true")]
-	pub bridge_gaps: bool,
+	/// Fill upstream silences with the last frame. Unset follows the
+	/// power source; see [`CameraConfig::effective_bridge_gaps`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bridge_gaps: Option<bool>,
 
 	#[serde(default = "default_gap_threshold")]
 	pub gap_threshold_secs: f64,
@@ -836,7 +948,7 @@ pub struct PauseConfig {
 impl Default for PauseConfig {
 	fn default() -> Self {
 		PauseConfig {
-			bridge_gaps: true,
+			bridge_gaps: None,
 			gap_threshold_secs: default_gap_threshold(),
 			preview_overlay: true,
 			on_motion: None,
@@ -891,9 +1003,13 @@ const fn default_prune_grace_secs() -> u64 {
 	30
 }
 
-const fn default_stream_latency_ms() -> u32 {
-	1500
-}
+/// `stream_latency_ms` when unset, for battery or unknown power: covers
+/// the Argus burst-idle pattern.
+pub const BATTERY_STREAM_LATENCY_MS: u32 = 1500;
+
+/// `stream_latency_ms` when unset, for mains power: steady streams need
+/// only a small cushion.
+pub const MAINS_STREAM_LATENCY_MS: u32 = 200;
 
 /// Upper bound on `stream_latency_ms`. The video pacer queue holds 300
 /// frames, so a longer cushion would overflow it on 60 fps streams.
@@ -1530,7 +1646,9 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		let cam_secs = |what: &str, secs: f64, allow_zero: bool| {
 			check_duration_secs(&format!("Camera '{}': {what}", cam.name), secs, allow_zero)
 		};
-		if cam.pause.bridge_gaps {
+		// Checked unless explicitly off: an unset value turns on for
+		// battery cameras, which is only known at runtime.
+		if cam.pause.bridge_gaps != Some(false) {
 			cam_secs(
 				"pause.gap_threshold_secs",
 				cam.pause.gap_threshold_secs,
@@ -1545,10 +1663,12 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 		// 0 releases the wake lock as soon as motion stops.
 		cam_secs("motion_wake_hold_secs", cam.motion_wake_hold_secs, true)?;
-		if cam.stream_latency_ms > MAX_STREAM_LATENCY_MS {
+		if let Some(ms) = cam.stream_latency_ms
+			&& ms > MAX_STREAM_LATENCY_MS
+		{
 			return Err(format!(
-				"Camera '{}': stream_latency_ms must be at most {MAX_STREAM_LATENCY_MS} (got {})",
-				cam.name, cam.stream_latency_ms
+				"Camera '{}': stream_latency_ms must be at most {MAX_STREAM_LATENCY_MS} (got {ms})",
+				cam.name
 			));
 		}
 	}
@@ -1810,15 +1930,62 @@ mod tests {
 		config
 	}
 
+	/// Unset knobs follow the effective power source; an explicit
+	/// setting wins over both the detected and the configured power.
+	#[test]
+	fn power_based_defaults_and_explicit_wins() {
+		let unset = CameraConfig::default();
+		assert_eq!(unset.effective_power(Power::Mains), Power::Mains);
+		assert_eq!(unset.effective_power(Power::Unknown), Power::Unknown);
+		for (power, idle, latency, bridge) in [
+			(Power::Battery, true, 1500, true),
+			(Power::Mains, false, 200, false),
+			(Power::Unknown, false, 1500, true),
+		] {
+			assert_eq!(unset.effective_idle_disconnect(power), idle, "{power:?}");
+			assert_eq!(
+				unset.effective_stream_latency_ms(power),
+				latency,
+				"{power:?}"
+			);
+			assert_eq!(unset.effective_bridge_gaps(power), bridge, "{power:?}");
+		}
+
+		let explicit = CameraConfig {
+			power: Some(PowerSource::Battery),
+			idle_disconnect: Some(false),
+			stream_latency_ms: Some(0),
+			pause: PauseConfig {
+				bridge_gaps: Some(false),
+				..PauseConfig::default()
+			},
+			..CameraConfig::default()
+		};
+		let power = explicit.effective_power(Power::Mains);
+		assert_eq!(power, Power::Battery, "configured power beats detection");
+		assert!(!explicit.effective_idle_disconnect(power));
+		assert_eq!(explicit.effective_stream_latency_ms(power), 0);
+		assert!(!explicit.effective_bridge_gaps(power));
+		let auto = CameraConfig {
+			power: Some(PowerSource::Auto),
+			..CameraConfig::default()
+		};
+		assert_eq!(auto.effective_power(Power::Mains), Power::Mains);
+		assert_eq!(
+			Power::Mains.timeouts().sdp_ready,
+			std::time::Duration::from_secs(5)
+		);
+	}
+
 	#[test]
 	fn stream_latency_ms_defaults_and_bounds() {
 		let mut config = test_helpers::two_camera_config();
-		assert_eq!(config.cameras[0].stream_latency_ms, 1500);
+		assert_eq!(config.cameras[0].stream_latency_ms, None);
 		for ok in [0, 200, MAX_STREAM_LATENCY_MS] {
-			config.cameras[0].stream_latency_ms = ok;
+			config.cameras[0].stream_latency_ms = Some(ok);
 			validate_config(&config).expect("in range");
 		}
-		config.cameras[0].stream_latency_ms = MAX_STREAM_LATENCY_MS + 1;
+		config.cameras[0].stream_latency_ms = Some(MAX_STREAM_LATENCY_MS + 1);
 		let err = validate_config(&config).expect_err("over the cap");
 		assert!(err.contains("stream_latency_ms"), "{err}");
 	}

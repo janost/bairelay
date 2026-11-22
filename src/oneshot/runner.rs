@@ -56,7 +56,10 @@ where
 		// roughly the same number of poll cycles.
 		_ = cancel.cancelled() => Err(InterruptedError::new().into()),
 		res = async move {
-			let opts = build_bc_opts_resolved(cfg).await?;
+			// No detection in a one-shot: only an explicit `power` counts.
+			let opts =
+				build_bc_opts_resolved(cfg, cfg.effective_power(crate::config::Power::Unknown))
+					.await?;
 			let camera = timeout(CONNECT_TIMEOUT, BcCamera::new(&opts))
 				.await
 				.context("connect timed out")?

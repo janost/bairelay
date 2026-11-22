@@ -56,9 +56,6 @@ use crate::bcmedia_dump::{BcMediaDumpConfig, FrameDumper};
 /// consumers.
 const BROADCAST_CAPACITY: usize = 64;
 
-/// Timeout applied to `BcCamera::start_video`.
-const START_VIDEO_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Timeout applied to `BcCamera::stop_video` during graceful shutdown.
 const STOP_VIDEO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,6 +73,65 @@ pub(crate) const SDP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// most this interval; long enough that the ticker itself is cheap
 /// (roughly five wake-ups per second per source).
 const GAP_DETECTION_TICK: Duration = Duration::from_millis(200);
+
+/// How long a source without gap bridging may go without a video frame
+/// before its reader ends; see [`StallGuard`].
+pub const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-source settings the camera handle picks from its config and
+/// power source.
+pub struct SourceTuning {
+	/// Silence before the reader starts bridging; `Duration::MAX` when
+	/// bridging is off.
+	pub gap_threshold: Duration,
+	/// Pacer startup buffer; zero disables pacing.
+	pub stream_latency: Duration,
+	/// Deadline for the camera's `start_video` reply.
+	pub start_video_timeout: Duration,
+	/// Media-stall restart, armed when gap bridging is off.
+	pub stall: Option<StallGuard>,
+}
+
+/// Ends a reader that has had no video frame for `timeout`, so the
+/// source turns dead, subscribers see the channel close, and the next
+/// SETUP starts a fresh `start_video`. Bridged sources don't need it:
+/// the replay frames keep clients fed through a silence.
+#[derive(Clone)]
+pub struct StallGuard {
+	pub timeout: Duration,
+	/// Shared by every source of one camera.
+	pub budget: Arc<StallBudget>,
+}
+
+/// Per-camera cap on stall restarts: at most [`Self::MAX`] in any
+/// [`Self::WINDOW`]. A stalled reader past the cap keeps running until
+/// the oldest restart leaves the window, so a camera whose streams keep
+/// wedging isn't hammered with `start_video` / `stop_video`.
+#[derive(Debug, Default)]
+pub struct StallBudget {
+	restarts: Mutex<std::collections::VecDeque<tokio::time::Instant>>,
+}
+
+impl StallBudget {
+	pub const MAX: usize = 3;
+	pub const WINDOW: Duration = Duration::from_secs(60);
+
+	/// Spend one restart at `now`, if the cap allows it.
+	pub fn try_take(&self, now: tokio::time::Instant) -> bool {
+		let mut restarts = lock_recover(&self.restarts);
+		while restarts
+			.front()
+			.is_some_and(|&t| now.saturating_duration_since(t) >= Self::WINDOW)
+		{
+			restarts.pop_front();
+		}
+		if restarts.len() >= Self::MAX {
+			return false;
+		}
+		restarts.push_back(now);
+		true
+	}
+}
 
 /// Acquire a `Mutex` guard, recovering from poisoning rather than
 /// panicking. `expect("... poisoned")` cascades a single bug across
@@ -298,6 +354,8 @@ struct ReaderTaskArgs {
 	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
 	last_emitted_pts_90khz: Arc<Mutex<Option<u32>>>,
 	last_emit_wallclock_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+	start_video_timeout: Duration,
+	stall: Option<StallGuard>,
 }
 
 /// Mutable state owned by the reader task's translator loop.
@@ -361,9 +419,7 @@ impl StreamSource {
 	/// `kind` is the bairelay-side stream kind (mapped to the underlying
 	/// `bairelay_neolink_core::StreamKind` internally), and `last_frame` is the
 	/// camera-scoped buffer shared across all sources for this camera.
-	/// `stream_latency` is the camera's `stream_latency_ms`: the pacers'
-	/// startup buffer, with zero disabling pacing.
-	#[allow(clippy::too_many_arguments)]
+	/// `tuning` carries the per-camera timing; see [`SourceTuning`].
 	pub fn start(
 		camera: Arc<BcCamera>,
 		camera_name: String,
@@ -371,9 +427,14 @@ impl StreamSource {
 		last_frame: Arc<LastFrameBuffer>,
 		bcmedia_dump: Option<Arc<BcMediaDumpConfig>>,
 		audio_presence: Arc<RwLock<crate::audio_presence::AudioPresence>>,
-		gap_threshold: Duration,
-		stream_latency: Duration,
+		tuning: SourceTuning,
 	) -> Arc<Self> {
+		let SourceTuning {
+			gap_threshold,
+			stream_latency,
+			start_video_timeout,
+			stall,
+		} = tuning;
 		let parts =
 			StreamSourceParts::new(&camera_name, kind, Arc::clone(&last_frame), gap_threshold);
 		let core_kind = map_stream_kind(kind);
@@ -425,6 +486,8 @@ impl StreamSource {
 			last_live_frame_at: Arc::clone(&parts.last_live_frame_at),
 			last_emitted_pts_90khz: Arc::clone(&parts.last_emitted_pts_90khz),
 			last_emit_wallclock_at: Arc::clone(&parts.last_emit_wallclock_at),
+			start_video_timeout,
+			stall,
 		};
 		let task = tokio::spawn(async move {
 			reader_task(reader_args).await;
@@ -475,6 +538,7 @@ impl StreamSource {
 			last_live_frame_at: Arc::clone(&parts.last_live_frame_at),
 			last_emitted_pts_90khz: Arc::clone(&parts.last_emitted_pts_90khz),
 			last_emit_wallclock_at: Arc::clone(&parts.last_emit_wallclock_at),
+			stall: None,
 		};
 		let stop_on_exit = parts.cancel.clone().drop_guard();
 		let task = tokio::spawn(async move {
@@ -1275,13 +1339,15 @@ async fn reader_task(args: ReaderTaskArgs) {
 		last_live_frame_at,
 		last_emitted_pts_90khz,
 		last_emit_wallclock_at,
+		start_video_timeout,
+		stall,
 	} = args;
 	// Every exit path, early return or not, marks the source dead so
 	// `CameraHandle::stream_source` replaces it instead of handing out
 	// a source that will never produce a frame.
 	let _stop_on_exit = cancel.clone().drop_guard();
 	let start_video_future =
-		tokio::time::timeout(START_VIDEO_TIMEOUT, camera.start_video(core_kind, 0, false));
+		tokio::time::timeout(start_video_timeout, camera.start_video(core_kind, 0, false));
 	let stream_data = tokio::select! {
 		_ = cancel.cancelled() => {
 			tracing::debug!(camera = %camera_name, stream = ?core_kind,
@@ -1326,6 +1392,7 @@ async fn reader_task(args: ReaderTaskArgs) {
 		last_live_frame_at,
 		last_emitted_pts_90khz,
 		last_emit_wallclock_at,
+		stall,
 	};
 	// Run the translator loop on a dedicated task and await its
 	// JoinHandle so a panic inside `drive_translator_loop` (mutex
@@ -1398,6 +1465,8 @@ struct TranslatorLoopArgs {
 	last_live_frame_at: Arc<Mutex<tokio::time::Instant>>,
 	last_emitted_pts_90khz: Arc<Mutex<Option<u32>>>,
 	last_emit_wallclock_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+	/// See [`StallGuard`]; `None` disables the stall restart.
+	stall: Option<StallGuard>,
 }
 
 /// Abstract "next packet" source for the translator loop. Production
@@ -1450,12 +1519,17 @@ async fn drive_translator_loop<S: PacketSource>(args: TranslatorLoopArgs, source
 		last_live_frame_at,
 		last_emitted_pts_90khz,
 		last_emit_wallclock_at,
+		stall,
 	} = args;
 
 	let mut dumper: Option<FrameDumper> = None;
 	let mut dumper_init_failed = false;
 	let mut gap_ticker = tokio::time::interval(GAP_DETECTION_TICK);
 	gap_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	// The stall clock starts with the loop, not at source creation:
+	// `start_video` may have taken most of its timeout.
+	let loop_started = tokio::time::Instant::now();
+	let mut stall_cap_logged = false;
 
 	loop {
 		tokio::select! {
@@ -1473,6 +1547,24 @@ async fn drive_translator_loop<S: PacketSource>(args: TranslatorLoopArgs, source
 					&last_emitted_pts_90khz,
 					&last_emit_wallclock_at,
 				);
+				if let Some(stall) = &stall {
+					let video_at = (*lock_recover(&last_live_frame_at)).max(loop_started);
+					let now = tokio::time::Instant::now();
+					if now.saturating_duration_since(video_at) >= stall.timeout {
+						if stall.budget.try_take(now) {
+							tracing::warn!(camera = %camera_name, stream = ?core_kind,
+								"no video frame for {}s; ending the stream so clients reconnect to a fresh one",
+								stall.timeout.as_secs());
+							break;
+						}
+						if !stall_cap_logged {
+							stall_cap_logged = true;
+							tracing::warn!(camera = %camera_name, stream = ?core_kind,
+								"no video frame for {}s, but this camera already had {} stall restarts in the last {}s; holding the stream until the limit frees up",
+								stall.timeout.as_secs(), StallBudget::MAX, StallBudget::WINDOW.as_secs());
+						}
+					}
+				}
 			}
 			result = source.get_data() => {
 				if !process_stream_result(
@@ -5281,7 +5373,51 @@ mod tests {
 			last_live_frame_at: Arc::new(Mutex::new(tokio::time::Instant::now())),
 			last_emitted_pts_90khz: Arc::new(Mutex::new(None)),
 			last_emit_wallclock_at: Arc::new(Mutex::new(None)),
+			stall: None,
 		}
+	}
+
+	/// A source without gap bridging ends its reader after
+	/// `MEDIA_STALL_TIMEOUT` with no video, and past the per-camera cap
+	/// it waits for the oldest restart to leave the window.
+	#[tokio::test(start_paused = true)]
+	async fn drive_translator_loop_ends_on_media_stall_within_budget() {
+		let budget = Arc::new(StallBudget::default());
+		let spawn_loop = |budget: &Arc<StallBudget>| {
+			let (tx, _rx) = broadcast::channel::<Frame>(4);
+			let mut args = translator_args(
+				tx,
+				Arc::new(LastFrameBuffer::new()),
+				Duration::MAX,
+				CancellationToken::new(),
+			);
+			args.stall = Some(StallGuard {
+				timeout: MEDIA_STALL_TIMEOUT,
+				budget: Arc::clone(budget),
+			});
+			tokio::spawn(async move {
+				let mut source = ScriptedSource {
+					queue: std::collections::VecDeque::new(),
+				};
+				drive_translator_loop(args, &mut source).await;
+			})
+		};
+
+		let first = spawn_loop(&budget);
+		tokio::time::sleep(MEDIA_STALL_TIMEOUT - Duration::from_secs(1)).await;
+		assert!(!first.is_finished(), "no restart before the timeout");
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert!(first.is_finished(), "stall ends the reader");
+
+		// Spend the rest of the cap, then stall a fourth source.
+		assert!(budget.try_take(tokio::time::Instant::now()));
+		assert!(budget.try_take(tokio::time::Instant::now()));
+		let capped = spawn_loop(&budget);
+		tokio::time::sleep(MEDIA_STALL_TIMEOUT + Duration::from_secs(5)).await;
+		assert!(!capped.is_finished(), "past the cap the reader is held");
+		// The first restart, ~30 s in, leaves the window at ~90 s.
+		tokio::time::sleep(StallBudget::WINDOW).await;
+		assert!(capped.is_finished(), "ends once the cap frees up");
 	}
 
 	#[tokio::test]

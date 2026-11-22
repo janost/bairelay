@@ -10,18 +10,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bairelay_rtsp::provider::{StreamError, StreamProvider, SubscriptionHandle};
 use bairelay_rtsp::url::StreamKind;
 
 use crate::camera::CameraHandle;
 use crate::wake_lock::WakeLockGuard;
-
-/// Deadline the provider waits for the first video SDP parameters before
-/// giving up and returning `StreamError::Unavailable`. Must cover a cold
-/// battery-camera wake followed by the first keyframe.
-const SDP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Return (should_await_audio, audio_bonus_window) based on the camera's
 /// current `AudioPresence`. `wait_audio = true` means subscribe must wait
@@ -84,6 +78,10 @@ impl StreamProvider for CameraProvider {
 		let guard: WakeLockGuard = handle.wake_lock().acquire();
 
 		let source = handle.stream_source(kind).await?;
+		// How long to wait for the first video SDP parameters before
+		// answering 503: covers a cold battery wake plus the first
+		// keyframe, and is short for mains (`Power::timeouts`).
+		let sdp_ready_timeout = handle.power().timeouts().sdp_ready;
 
 		// Branch on the camera's observed audio presence. On timeout we
 		// surface Unavailable → 503, which is the appropriate user-visible
@@ -97,9 +95,9 @@ impl StreamProvider for CameraProvider {
 
 		let sdp_params = if wait_audio {
 			// Present { codec }: wait for both video AND audio within
-			// the same 15 s budget.
+			// the same budget.
 			source
-				.await_sdp_both_ready(SDP_READY_TIMEOUT)
+				.await_sdp_both_ready(sdp_ready_timeout)
 				.await
 				.map_err(|e| StreamError::Unavailable(e.to_string()))?
 		} else {
@@ -107,7 +105,7 @@ impl StreamProvider for CameraProvider {
 			// returned snapshot — we re-read `sdp_params()` below so the
 			// Unknown bonus window's result is reflected.
 			source
-				.await_sdp_ready(SDP_READY_TIMEOUT)
+				.await_sdp_ready(sdp_ready_timeout)
 				.await
 				.map_err(|e| StreamError::Unavailable(e.to_string()))?;
 			if !bonus_window.is_zero() {

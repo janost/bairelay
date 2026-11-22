@@ -59,7 +59,7 @@ impl Watchdog {
 						// the watchdog only fires when grace_period.rs
 						// failed (didn't get spawned, panicked, etc.) —
 						// the safety-net role its docs always claimed.
-						if cam.config().idle_disconnect && cam.state().is_connected() {
+						if cam.idle_disconnect() && cam.state().is_connected() {
 							let grace = crate::config::resolve_idle_disconnect_timeout(
 								cam.config(),
 								self.prune_grace,
@@ -112,7 +112,7 @@ mod tests {
 		// The test asserts the sweep completes one tick and cancel works.
 		let cancel = CancellationToken::new();
 		let mut cfg = minimal_camera_config("cam-wd");
-		cfg.idle_disconnect = true;
+		cfg.idle_disconnect = Some(true);
 		let cam = Arc::new(CameraHandle::new(cfg, cancel.clone(), None));
 		let mut map: HashMap<String, Arc<CameraHandle>> = HashMap::new();
 		map.insert("cam-wd".to_string(), cam);
@@ -149,7 +149,7 @@ mod tests {
 
 		let cancel = CancellationToken::new();
 		let mut cfg = minimal_camera_config("cam-idle");
-		cfg.idle_disconnect = true;
+		cfg.idle_disconnect = Some(true);
 		cfg.idle_disconnect_timeout_secs = Some(0.05);
 		let cam = Arc::new(CameraHandle::new(cfg, cancel.clone(), None));
 		let fake = FakeCameraBuilder::new().build();
