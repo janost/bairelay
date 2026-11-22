@@ -528,24 +528,40 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn unhandle_msg_removes_registered_handler() {
-		// Register via handle_msg, then unhandle, then register again —
-		// second register should succeed (Vacant path), proving the
-		// Remove command landed.
-		let mock = MockConnection::new().build().await;
+	async fn duplicate_handle_msg_is_rejected_and_connection_survives() {
+		let mock = MockConnection::new()
+			.expect_msg(1)
+			.reply_with(reply_200_empty)
+			.build()
+			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
 		let conn = cam.get_connection();
 		conn.handle_msg(42, |_bc| Box::pin(async { None }))
 			.await
 			.unwrap();
-		// Re-registering without unhandle first would fail with
-		// SimultaneousSubscriptionId — not directly here because
-		// AddHandler errors flow through the poller result channel,
-		// not the send().
-		conn.unhandle_msg(42).await.unwrap();
-		conn.handle_msg(42, |_bc| Box::pin(async { None }))
+		let err = conn
+			.handle_msg(42, |_bc| Box::pin(async { None }))
 			.await
-			.unwrap();
+			.expect_err("second handler for the same msg_id");
+		assert!(matches!(
+			err,
+			Error::SimultaneousSubscriptionId { msg_id: 42 }
+		));
+
+		// The poller is still routing.
+		let msg_num = cam.new_message_num();
+		let mut sub = conn.subscribe(1, msg_num).await.unwrap();
+		sub.send(Bc::new_from_meta(BcMeta {
+			msg_id: 1,
+			channel_id: 0,
+			msg_num,
+			stream_type: 0,
+			response_code: 0,
+			class: 0x6414,
+		}))
+		.await
+		.unwrap();
+		assert_eq!(sub.recv().await.unwrap().meta.response_code, 200);
 	}
 
 	/// reply_with_many emits multiple scripted replies.

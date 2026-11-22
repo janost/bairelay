@@ -658,13 +658,6 @@ impl BcCamera {
 		}
 	}
 
-	/// Wait for all thread to finish
-	///
-	/// If an error is returned in any thread it will return the first error
-	pub async fn join(&self) -> Result<()> {
-		self.connection.join().await
-	}
-
 	/// Disconnect from the camera. This is done by sending cancel to
 	/// all threads then waiting for the join
 	pub async fn shutdown(&self) -> Result<()> {
@@ -910,16 +903,6 @@ mod bccamera_helpers_tests {
 			post, 0,
 			"shutdown left {post} tasks alive in rx JoinSet — leak / missing cancel?",
 		);
-	}
-
-	#[tokio::test]
-	async fn join_on_mock_connection_returns_ok() {
-		// Covers BcCamera::join(). After a clean shutdown the
-		// underlying task set is empty so join returns Ok.
-		let mock = MockConnection::new().build().await;
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.shutdown().await.expect("clean shutdown");
-		cam.join().await.expect("join returns ok after shutdown");
 	}
 
 	#[tokio::test]

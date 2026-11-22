@@ -7,7 +7,8 @@ use log::*;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::sync::Arc;
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +67,12 @@ impl BcConnection {
 					while let Some(bc) = source.next().await {
 						sender.send(PollCommand::Bc(Box::new(bc))).await?;
 					}
+					// A clean EOF still has to reach the poller: it fans the
+					// error out so subscribers fail fast instead of waiting
+					// on a socket that will never deliver again.
+					sender
+						.send(PollCommand::Bc(Box::new(Err(Error::DroppedConnection))))
+						.await?;
 					Result::Ok(())
 				} => v
 			}
@@ -89,14 +96,10 @@ impl BcConnection {
 		rx_thread.spawn(async move {
 			tokio::select! {
 				_ = thread_cancel.cancelled() => Result::Ok(()),
-				v = async {
-					loop {
-						if let n @ Err(_) = poller.run().await {
-							trace!("Polling has ended");
-							return n;
-						}
-					}
-				}=> v
+				v = poller.run() => {
+					trace!("Polling has ended");
+					v
+				}
 			}
 		});
 
@@ -124,23 +127,18 @@ impl BcConnection {
 	/// Some messages are initiated by the camera. This creates a handler for them
 	/// It requires a closure that will be used to handle the message
 	/// and return either None or Some(Bc) reply
+	///
+	/// Fails with [`Error::SimultaneousSubscriptionId`] if `msg_id` already
+	/// has a handler; the existing handler and the connection are kept.
 	pub async fn handle_msg<T>(&self, msg_id: u32, handler: T) -> Result<()>
 	where
 		T: 'static + Send + Sync + for<'a> Fn(&'a Bc) -> BoxFuture<'a, Option<Bc>>,
 	{
+		let (reply, added) = oneshot::channel();
 		self.poll_commander
-			.send(PollCommand::AddHandler(msg_id, Arc::new(handler)))
+			.send(PollCommand::AddHandler(msg_id, Arc::new(handler), reply))
 			.await?;
-		Ok(())
-	}
-
-	/// Stop a message handler created using [`handle_msg`]
-	#[allow(dead_code)] // Currently unused but added for future use
-	pub async fn unhandle_msg(&self, msg_id: u32) -> Result<()> {
-		self.poll_commander
-			.send(PollCommand::RemoveHandler(msg_id))
-			.await?;
-		Ok(())
+		added.await.map_err(|_| Error::DroppedConnection)?
 	}
 
 	/// Some times we want to wait for a reply on a new message ID
@@ -158,27 +156,11 @@ impl BcConnection {
 		Ok(BcSubscription::new(rx, None, self))
 	}
 
-	pub(crate) async fn join(&self) -> Result<()> {
-		let mut locked_threads = self.rx_thread.write().await;
-		while let Some(res) = locked_threads.join_next().await {
-			match res {
-				Err(e) => {
-					locked_threads.abort_all();
-					return Err(e.into());
-				}
-				Ok(Err(e)) => {
-					locked_threads.abort_all();
-					return Err(e);
-				}
-				Ok(Ok(())) => {}
-			}
-		}
-		Ok(())
-	}
-
 	pub async fn shutdown(&self) -> Result<()> {
-		let _ = self.poll_commander.send(PollCommand::Disconnect).await;
+		// Cancel first: awaiting a send into a full command channel would
+		// stall shutdown behind the very backlog it is meant to clear.
 		self.cancel.cancel();
+		let _ = self.poll_commander.try_send(PollCommand::Disconnect);
 		let mut locked_threads = self.rx_thread.write().await;
 		while locked_threads.join_next().await.is_some() {}
 		Ok(())
@@ -213,7 +195,7 @@ impl Drop for BcConnection {
 		let _gt = handle.enter();
 		let mut threads = std::mem::take(&mut self.rx_thread);
 		tokio::task::spawn(async move {
-			let _ = poll_commander.send(PollCommand::Disconnect).await;
+			let _ = poll_commander.try_send(PollCommand::Disconnect);
 			let locked_threads = threads.get_mut();
 			while locked_threads.join_next().await.is_some() {}
 			log::trace!("Dropped BcConnection");
@@ -223,8 +205,7 @@ impl Drop for BcConnection {
 
 enum PollCommand {
 	Bc(Box<Result<Bc>>),
-	AddHandler(u32, Arc<MsgHandler>),
-	RemoveHandler(u32),
+	AddHandler(u32, Arc<MsgHandler>, oneshot::Sender<Result<()>>),
 	AddSubscriber(u32, Option<u16>, Sender<Result<Bc>>),
 	Disconnect,
 }
@@ -233,8 +214,7 @@ impl std::fmt::Debug for PollCommand {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			PollCommand::Bc(_) => f.write_str("PollCommand::Bc"),
-			PollCommand::AddHandler(_, _) => f.write_str("PollCommand::AddHandler"),
-			PollCommand::RemoveHandler(_) => f.write_str("PollCommand::RemoveHandler"),
+			PollCommand::AddHandler(..) => f.write_str("PollCommand::AddHandler"),
 			PollCommand::AddSubscriber(_, _, _) => f.write_str("PollCommand::AddSubscriber"),
 			PollCommand::Disconnect => f.write_str("PollCommand::Disconnect"),
 		}
@@ -341,25 +321,21 @@ impl Poller {
 										None
 									};
 									if let Some(sender) = sender {
-										if sender.capacity() == 0 {
-											warn!("Reaching limit of channel");
-											warn!(
-												"Remaining: {} of {} message space for {} (ID: {})",
-												sender.capacity(),
-												sender.max_capacity(),
-												msg_num,
-												msg_id
-											);
-										} else {
-											trace!(
-												"Remaining: {} of {} message space for {} (ID: {})",
-												sender.capacity(),
-												sender.max_capacity(),
-												msg_num,
-												msg_id
-											);
+										// Never await a subscriber: one stalled
+										// consumer would block routing for every
+										// other one, keepalive replies included.
+										match sender.try_send(Ok(response)) {
+											Ok(()) => {}
+											Err(TrySendError::Full(_)) => {
+												error!(
+													"Subscriber for msg_id {msg_id} (num {msg_num}) is not keeping up; dropping it"
+												);
+												occ.remove(&Some(msg_num));
+											}
+											Err(TrySendError::Closed(_)) => {
+												occ.remove(&Some(msg_num));
+											}
 										}
-										let _ = sender.send(Ok(response)).await;
 									} else {
 										trace!(
 											"Ignoring uninteresting message id {} (number: {})",
@@ -378,9 +354,16 @@ impl Poller {
 							}
 						}
 						Err(e) => {
-							for sub in self.subscribers.num.values() {
-								for sender in sub.values() {
-									let _ = sender.send(Err(e.clone())).await;
+							for (msg_id, sub) in &self.subscribers.num {
+								for (msg_num, sender) in sub {
+									if let Err(TrySendError::Full(_)) =
+										sender.try_send(Err(e.clone()))
+									{
+										// Dropped below either way; it sees end of stream.
+										error!(
+											"Subscriber for msg_id {msg_id} (num {msg_num:?}) is full; dropping it without the error"
+										);
+									}
 								}
 							}
 							self.subscribers.num.clear();
@@ -389,18 +372,20 @@ impl Poller {
 						}
 					}
 				}
-				PollCommand::AddHandler(msg_id, handler) => {
-					match self.subscribers.id.entry(msg_id) {
+				PollCommand::AddHandler(msg_id, handler, reply) => {
+					// A duplicate is the caller's error, not the connection's:
+					// report it back and keep polling.
+					let added = match self.subscribers.id.entry(msg_id) {
 						Entry::Vacant(vac_entry) => {
 							vac_entry.insert(handler);
+							Ok(())
 						}
 						Entry::Occupied(_) => {
-							return Err(Error::SimultaneousSubscriptionId { msg_id });
+							warn!("A handler for msg_id {msg_id} already exists; keeping it");
+							Err(Error::SimultaneousSubscriptionId { msg_id })
 						}
 					};
-				}
-				PollCommand::RemoveHandler(msg_id) => {
-					self.subscribers.id.remove(&msg_id);
+					let _ = reply.send(added);
 				}
 				PollCommand::AddSubscriber(msg_id, msg_num, tx) => {
 					match self
@@ -418,9 +403,8 @@ impl Poller {
 								occ_entry.insert(tx);
 							} else {
 								// log::error!("Failed to subscribe in bcconn to {:?} for {:?}", msg_num, msg_id);
-								let _ = tx
-									.send(Err(Error::SimultaneousSubscription { msg_num }))
-									.await;
+								let _ =
+									tx.try_send(Err(Error::SimultaneousSubscription { msg_num }));
 							}
 						}
 					};
@@ -431,5 +415,67 @@ impl Poller {
 			}
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use futures::sink::drain;
+	use std::time::Duration;
+
+	/// A connection whose inbound side is fed by the returned sender and
+	/// whose outbound side discards everything.
+	async fn conn() -> (BcConnection, Sender<Result<Bc>>) {
+		let (tx, rx) = channel::<Result<Bc>>(1000);
+		let sink: BcConnSink = Box::new(drain().sink_map_err(|never| match never {}));
+		let source: BcConnSource = Box::new(ReceiverStream::new(rx));
+		(BcConnection::new(sink, source).await.unwrap(), tx)
+	}
+
+	fn msg(msg_id: u32, msg_num: u16) -> Bc {
+		Bc::new_from_meta(BcMeta {
+			msg_id,
+			channel_id: 0,
+			stream_type: 0,
+			response_code: 200,
+			msg_num,
+			class: 0x6414,
+		})
+	}
+
+	#[tokio::test]
+	async fn clean_eof_fails_subscribers() {
+		let (conn, tx) = conn().await;
+		let mut sub = conn.subscribe(5, 1).await.unwrap();
+		drop(tx);
+		let got = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+			.await
+			.expect("subscriber must not hang on EOF");
+		assert!(matches!(got, Err(Error::DroppedConnection)), "{got:?}");
+	}
+
+	#[tokio::test]
+	async fn stalled_subscriber_does_not_block_others() {
+		let (conn, tx) = conn().await;
+		let mut stalled = conn.subscribe(5, 1).await.unwrap();
+		let mut live = conn.subscribe(6, 1).await.unwrap();
+		for _ in 0..150 {
+			tx.send(Ok(msg(5, 1))).await.unwrap();
+		}
+		tx.send(Ok(msg(6, 1))).await.unwrap();
+		let got = tokio::time::timeout(Duration::from_secs(2), live.recv())
+			.await
+			.expect("routing blocked behind a full subscriber");
+		assert_eq!(got.unwrap().meta.msg_id, 6);
+
+		// The stalled one keeps what was queued, then sees its end.
+		for _ in 0..100 {
+			stalled.recv().await.unwrap();
+		}
+		assert!(matches!(
+			stalled.recv().await,
+			Err(Error::DroppedSubscriber)
+		));
 	}
 }
