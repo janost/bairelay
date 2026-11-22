@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use bairelay_neolink_core::bc_protocol::{BcCamera, CameraDriver};
@@ -143,6 +143,15 @@ pub(crate) fn advance_keepalive_counter(
 	}
 }
 
+/// Why a connected session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+	/// The session token fired: shutdown, grace period or watchdog.
+	Requested,
+	/// Keepalive gave up on the connection.
+	Lost,
+}
+
 // ── CameraHandle ──────────────────────────────────────────────────────
 
 pub struct CameraHandle {
@@ -162,7 +171,10 @@ pub struct CameraHandle {
 	/// same root. Holds the default `"bairelay"` when MQTT is disabled
 	/// — no task consults it in that case.
 	topic_prefix: String,
-	disconnect_signal: Arc<Notify>,
+	/// Cancel token of the live session, a child of `cancel`; `None`
+	/// between sessions. [`Self::request_disconnect`] cancels it, so a
+	/// request outside a session is a no-op and can't end the next one.
+	session_cancel: Mutex<Option<CancellationToken>>,
 	stream_sources: std::sync::RwLock<HashMap<RtspStreamKind, Arc<StreamSource>>>,
 	/// Serialises the create-and-insert path in [`Self::stream_source`] so
 	/// two concurrent SETUPs for the same camera don't each spawn a
@@ -319,7 +331,7 @@ impl CameraHandle {
 			bc_camera_concrete: std::sync::RwLock::new(None),
 			mqtt_client,
 			topic_prefix,
-			disconnect_signal: Arc::new(Notify::new()),
+			session_cancel: Mutex::new(None),
 			stream_sources: std::sync::RwLock::new(HashMap::new()),
 			stream_source_create_lock: tokio::sync::Mutex::new(()),
 			last_frame_main: Arc::new(LastFrameBuffer::new()),
@@ -695,18 +707,26 @@ impl CameraHandle {
 		self.bc_camera.read_recover().clone()
 	}
 
-	/// Signal the camera to disconnect (used by the watchdog for idle cameras).
+	/// End the live session, if any (used by the watchdog for idle
+	/// cameras). A no-op between sessions.
 	pub fn request_disconnect(&self) {
-		self.disconnect_signal.notify_one();
+		if let Some(session) = self.session_cancel.lock_recover().as_ref() {
+			session.cancel();
+		}
 	}
 
-	/// Test-only accessor that returns a clone of the disconnect-signal
-	/// `Notify`. Tests can `.notified().await` (with a small timeout)
-	/// to assert that `request_disconnect` actually fired — much
-	/// stronger than asserting the function "didn't panic".
+	/// Install a fresh session token, child of the camera token.
+	fn begin_session(&self) -> CancellationToken {
+		let session = self.cancel.child_token();
+		*self.session_cancel.lock_recover() = Some(session.clone());
+		session
+	}
+
+	/// Test helper: start a session as [`Self::run_connected_session`]
+	/// does and return its token.
 	#[cfg(test)]
-	pub(crate) fn disconnect_signal_for_test(&self) -> Arc<Notify> {
-		Arc::clone(&self.disconnect_signal)
+	pub(crate) fn begin_session_for_test(&self) -> CancellationToken {
+		self.begin_session()
 	}
 
 	fn set_state(&self, new: CameraState) {
@@ -944,71 +964,52 @@ impl CameraHandle {
 	/// Uses [`CameraDriver::keepalive_probe`] (a lenient wrapper over
 	/// `get_linktype()` matching neolink's choice) and tolerates up to
 	/// [`Self::KEEPALIVE_MAX_FAILURES`] consecutive failures before
-	/// disconnecting. Cadence and per-probe timeout are both
-	/// [`Self::KEEPALIVE_INTERVAL`].
-	async fn keepalive_loop(&self, camera: &dyn CameraDriver, session_cancel: &CancellationToken) {
+	/// disconnecting. Probes every [`Self::KEEPALIVE_INTERVAL`], each
+	/// bounded by [`Self::KEEPALIVE_PROBE_TIMEOUT`]. Returns once
+	/// `session` fires or the connection is judged lost.
+	async fn keepalive_loop(
+		&self,
+		camera: &dyn CameraDriver,
+		session: &CancellationToken,
+	) -> SessionEnd {
 		let mut interval = tokio::time::interval(Self::KEEPALIVE_INTERVAL);
 		let mut consecutive_failures: u32 = 0;
 
-		'outer: loop {
-			tokio::select! {
-				_ = self.cancel.cancelled() => break,
-				_ = session_cancel.cancelled() => {
-					tracing::info!(camera = %self.config.name, "Session cancelled (grace period or disconnect)");
-					break;
+		loop {
+			// `session` is a child of `self.cancel`, so this one arm covers
+			// shutdown, the grace period and watchdog requests. The probe
+			// races it too, so a cancel mid-probe preempts at once.
+			let raw = tokio::select! {
+				_ = session.cancelled() => {
+					tracing::info!(camera = %self.config.name, "Session cancelled (shutdown, grace period or watchdog)");
+					return SessionEnd::Requested;
 				}
-				_ = self.disconnect_signal.notified() => {
-					tracing::info!(camera = %self.config.name, "Watchdog requested disconnect");
-					break;
-				}
-				_ = interval.tick() => {
-					// Race the probe against cancel / disconnect signals so a
-					// shutdown that arrives mid-probe preempts immediately
-					// instead of stalling for the full
-					// `KEEPALIVE_PROBE_TIMEOUT`. Without the inner select,
-					// shutdown latency was bounded by the per-probe timeout
-					// (previously equal to the interval, so up to 5 s).
-					let raw = tokio::select! {
-						v = tokio::time::timeout(Self::KEEPALIVE_PROBE_TIMEOUT, camera.keepalive_probe()) => v,
-						_ = self.cancel.cancelled() => break 'outer,
-						_ = session_cancel.cancelled() => {
-							tracing::info!(
-								camera = %self.config.name,
-								"Session cancelled mid-probe"
-							);
-							break 'outer;
-						}
-						_ = self.disconnect_signal.notified() => {
-							tracing::info!(
-								camera = %self.config.name,
-								"Watchdog requested disconnect mid-probe"
-							);
-							break 'outer;
-						}
-					};
-					let outcome = classify_keepalive_tick(raw);
-					let (next, should_break) = advance_keepalive_counter(
-						consecutive_failures,
-						outcome,
-						Self::KEEPALIVE_MAX_FAILURES,
-					);
-					consecutive_failures = next;
-					if outcome == KeepaliveTickOutcome::Failed {
-						tracing::debug!(
-							camera = %self.config.name,
-							failures = consecutive_failures,
-							"Keepalive probe failed",
-						);
-					}
-					if should_break {
-						tracing::warn!(
-							camera = %self.config.name,
-							"Keepalive failed {} times, disconnecting",
-							Self::KEEPALIVE_MAX_FAILURES,
-						);
-						break;
-					}
-				}
+				raw = async {
+					interval.tick().await;
+					tokio::time::timeout(Self::KEEPALIVE_PROBE_TIMEOUT, camera.keepalive_probe()).await
+				} => raw,
+			};
+			let outcome = classify_keepalive_tick(raw);
+			let (next, should_break) = advance_keepalive_counter(
+				consecutive_failures,
+				outcome,
+				Self::KEEPALIVE_MAX_FAILURES,
+			);
+			consecutive_failures = next;
+			if outcome == KeepaliveTickOutcome::Failed {
+				tracing::debug!(
+					camera = %self.config.name,
+					failures = consecutive_failures,
+					"Keepalive probe failed",
+				);
+			}
+			if should_break {
+				tracing::warn!(
+					camera = %self.config.name,
+					"Keepalive failed {} times, disconnecting",
+					Self::KEEPALIVE_MAX_FAILURES,
+				);
+				return SessionEnd::Lost;
 			}
 		}
 	}
@@ -1061,7 +1062,10 @@ impl CameraHandle {
 		driver: Arc<dyn CameraDriver>,
 		concrete: Option<Arc<BcCamera>>,
 		device_type: Option<&str>,
-	) {
+	) -> SessionEnd {
+		// The token exists before state turns Connected, so a watchdog
+		// that sees Connected always has a session to cancel.
+		let session = self.begin_session();
 		self.set_state(CameraState::Connected);
 		self.set_preview_state(PreviewState::Live);
 		tracing::info!(camera = %self.config.name, "Connected");
@@ -1162,10 +1166,14 @@ impl CameraHandle {
 		}
 
 		// Spawn per-session tasks (motion, pollers, grace period).
-		let session_cancel = CancellationToken::new();
-		let tasks = self.spawn_session_tasks(&driver, &session_cancel).await;
+		let tasks = self.spawn_session_tasks(&driver, &session).await;
 
-		self.keepalive_loop(&*driver, &session_cancel).await;
+		let end = self.keepalive_loop(&*driver, &session).await;
+
+		// Leave Connected before teardown: the watchdog and new SETUPs
+		// key off it, and teardown can take seconds.
+		*self.session_cancel.lock_recover() = None;
+		self.set_state(CameraState::Disconnected);
 
 		// Close the PreviewState gap: the Live arm is over. Sleeping
 		// only if the next iteration will park; otherwise Connecting
@@ -1178,8 +1186,9 @@ impl CameraHandle {
 
 		// Connection lost or shutdown -- cancel all session tasks
 		// and tear down everything that depends on the live driver.
-		session_cancel.cancel();
+		session.cancel();
 		self.teardown_session_tasks(tasks, concrete).await;
+		end
 	}
 
 	/// Spawn the per-session tasks that hold their own clones of the
@@ -1343,7 +1352,7 @@ impl CameraHandle {
 	/// clear the camera's driver/concrete slots, and publish the
 	/// disconnected MQTT status. Symmetric with
 	/// [`spawn_session_tasks`]; the caller is expected to have
-	/// already cancelled `session_cancel` before invoking this.
+	/// already cancelled the session token and left `Connected`.
 	async fn teardown_session_tasks(
 		self: &Arc<Self>,
 		mut tasks: tokio::task::JoinSet<()>,
@@ -1401,7 +1410,6 @@ impl CameraHandle {
 		// connection threads can shut down.
 		drop(concrete);
 
-		self.set_state(CameraState::Disconnected);
 		tracing::info!(camera = %self.config.name, "Disconnected");
 
 		// Publish disconnected status via MQTT.
@@ -1780,7 +1788,7 @@ impl CameraHandle {
 		driver: Arc<dyn CameraDriver>,
 		device_type: Option<&str>,
 	) {
-		self.run_connected_session(driver, None, device_type).await
+		self.run_connected_session(driver, None, device_type).await;
 	}
 }
 
@@ -2641,15 +2649,23 @@ mod tests {
 		assert!(!handle.cancel_token().is_cancelled());
 	}
 
+	/// A request between sessions (e.g. a watchdog tick during teardown)
+	/// must not survive to end the next session the moment it starts.
 	#[test]
-	fn request_disconnect_fires_notify_without_panicking() {
+	fn request_disconnect_between_sessions_does_not_end_the_next() {
 		use crate::config::test_helpers::minimal_camera_config;
-		use tokio_util::sync::CancellationToken;
 
-		let cancel = CancellationToken::new();
-		let handle = CameraHandle::new(minimal_camera_config("cam-rd"), cancel, None);
-		// Safe to call with no waiter — notify_one is edge-triggered.
+		let handle = CameraHandle::new(
+			minimal_camera_config("cam-rd"),
+			CancellationToken::new(),
+			None,
+		);
 		handle.request_disconnect();
+		let session = handle.begin_session_for_test();
+		assert!(!session.is_cancelled());
+
+		handle.request_disconnect();
+		assert!(session.is_cancelled());
 	}
 
 	#[test]

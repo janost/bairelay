@@ -186,7 +186,7 @@ Two separate notifications:
 
 Both use `Notify::notify_one()` (not `notify_waiters()`) so a permit is stored when no waiter is registered — late `.notified().await` calls still fire. The grace-period timer listens on `notify_release` and starts a countdown; any new `acquire()` before the countdown expires resets it.
 
-The watchdog also monitors wake-lock state and can force-disconnect via a `disconnect_signal: Notify` on each camera.
+The watchdog also monitors wake-lock state and can force-disconnect via `request_disconnect()`, which cancels the camera's live session token (a child of the camera token). Between sessions it is a no-op, so a request that lands during teardown can't end the next session.
 
 ### Watchdog
 

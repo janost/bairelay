@@ -136,20 +136,14 @@ mod tests {
 	#[tokio::test]
 	async fn watchdog_requests_disconnect_for_idle_connected_camera() {
 		// Drive the inner branch (idle_disconnect && is_connected &&
-		// idle_since past grace) — the watchdog must call
-		// `request_disconnect()`, which fires the camera's
-		// `disconnect_signal` Notify. Uses `set_driver_for_test` to
-		// flip state to Connected without a real socket. The
-		// observable assertion is that `disconnect_signal.notified()`
-		// resolves within the test budget — proves the watchdog
-		// walked the branch *and* called `request_disconnect`, not
-		// just that it didn't panic.
+		// idle_since past grace): the watchdog must call
+		// `request_disconnect()`, which cancels the live session token.
+		// Uses `set_driver_for_test` to flip state to Connected without a
+		// real socket, plus `begin_session_for_test` for the token.
 		//
-		// Set a tiny grace (50 ms) and acquire+release a wake-lock so
-		// `idle_since` returns a timestamp the watchdog can compare
-		// against. With the grace gate added 2026-05-01, a camera
-		// whose wake-lock was never acquired returns `idle_since =
-		// None` and the watchdog correctly leaves it alone.
+		// A tiny grace (50 ms) and an acquire+release give `idle_since`
+		// a timestamp; a never-acquired lock returns `None` and the
+		// watchdog leaves the camera alone.
 		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
 
 		let cancel = CancellationToken::new();
@@ -167,13 +161,7 @@ mod tests {
 		tokio::time::sleep(Duration::from_millis(80)).await;
 		assert!(cam.wake_lock().is_idle());
 
-		// Subscribe to the Notify *before* the watchdog runs so we
-		// don't miss the signal. `Notify::notified()` returns a future
-		// that captures a permit at await-poll time; pre-creating it
-		// guards against the watchdog firing-then-no-listener race.
-		let signal = cam.disconnect_signal_for_test();
-		let notified = signal.notified();
-		tokio::pin!(notified);
+		let session = cam.begin_session_for_test();
 
 		let mut map: HashMap<String, Arc<CameraHandle>> = HashMap::new();
 		map.insert("cam-idle".to_string(), Arc::clone(&cam));
@@ -196,7 +184,7 @@ mod tests {
 
 		// Wait for the watchdog to fire request_disconnect, with a
 		// generous budget for the 20 ms ticker on a loaded runner.
-		let signal_seen = tokio::time::timeout(Duration::from_millis(500), notified.as_mut())
+		let signal_seen = tokio::time::timeout(Duration::from_millis(500), session.cancelled())
 			.await
 			.is_ok();
 		cancel_task.cancel();
