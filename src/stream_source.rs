@@ -380,6 +380,33 @@ pub struct StreamTranslatorState {
 	/// pacer. Used by `video_frame_duration` to compute the next pacer
 	/// emission interval. `None` until the first video frame.
 	pub last_video_pts_90khz: Option<u32>,
+	/// Raw `BcMedia` µs timestamp of the previous video frame.
+	last_video_raw_us: Option<u32>,
+	/// The camera's u32 µs clock (wraps every ~71.6 min) extended to a
+	/// monotonic u64; see [`StreamTranslatorState::video_pts_90khz`].
+	video_us: u64,
+}
+
+impl StreamTranslatorState {
+	/// 90 kHz RTP timestamp for a video frame stamped `raw_us` by the
+	/// camera. The raw clock is a u32 of µs, so mapping it directly
+	/// would jump backwards every 2^32 µs; instead each frame advances a
+	/// u64 accumulator by the wrapping delta, and the 90 kHz value is
+	/// truncated to u32 (RTP's own, clean 2^32-tick wrap). A backward
+	/// step (delta above 2^31: reordering or a clock reset) advances by
+	/// zero rather than leaping ahead by most of 2^32.
+	fn video_pts_90khz(&mut self, raw_us: u32) -> u32 {
+		self.video_us = match self.last_video_raw_us {
+			None => u64::from(raw_us),
+			Some(prev) => {
+				let delta = raw_us.wrapping_sub(prev);
+				let delta = if delta > 1 << 31 { 0 } else { delta };
+				self.video_us.wrapping_add(u64::from(delta))
+			}
+		};
+		self.last_video_raw_us = Some(raw_us);
+		(self.video_us.wrapping_mul(9) / 100) as u32
+	}
 }
 
 impl StreamSource {
@@ -1151,12 +1178,6 @@ const VIDEO_PACER_QUEUE: usize = 300;
 
 // ── Reader task ──────────────────────────────────────────────────────
 
-/// Converts microseconds (from `BcMedia` packets) to a 90 kHz RTP clock
-/// via `µs * 9 / 100`. Wrapping arithmetic is the desired RTP behaviour.
-fn micros_to_90khz(micros: u32) -> u32 {
-	((micros as u64).wrapping_mul(9) / 100) as u32
-}
-
 /// Check whether the gap threshold has elapsed since the last live
 /// frame; flip `gap_state` to `Bridging` if so. Called on every
 /// gap-detection tick from both [`reader_task`] and its test stand-in
@@ -1841,7 +1862,7 @@ fn handle_iframe(
 	// non-slice-then-slice ordering that marker-bit placement depends on.
 	// captured_pts_90khz lets the session send loop replay with a
 	// timestamp continuous with the live stream — see buffer.rs.
-	let burst_pts = micros_to_90khz(iframe.microseconds);
+	let burst_pts = state.video_pts_90khz(iframe.microseconds);
 	let burst = VideoBurst {
 		codec,
 		parameter_sets: parameter_sets.clone(),
@@ -1885,7 +1906,7 @@ fn handle_iframe(
 		return None;
 	}
 
-	let pts_90khz = micros_to_90khz(iframe.microseconds);
+	let pts_90khz = burst_pts;
 	let frame = Frame::Video {
 		codec,
 		nals: nals_bytes,
@@ -2087,7 +2108,7 @@ fn handle_pframe(
 		.iter()
 		.map(|n| Bytes::copy_from_slice(n))
 		.collect();
-	let pts_90khz = micros_to_90khz(pframe.microseconds);
+	let pts_90khz = state.video_pts_90khz(pframe.microseconds);
 	let frame = Frame::Video {
 		codec,
 		nals: nals_bytes,
@@ -3150,11 +3171,36 @@ mod tests {
 	}
 
 	#[test]
-	fn micros_to_90khz_matches_reference() {
-		// 1 second = 1_000_000 µs → 90_000 ticks.
-		assert_eq!(micros_to_90khz(1_000_000), 90_000);
-		// 0 stays 0.
-		assert_eq!(micros_to_90khz(0), 0);
+	fn video_pts_first_frame_maps_raw_micros() {
+		let pts = |us| StreamTranslatorState::default().video_pts_90khz(us);
+		assert_eq!(pts(1_000_000), 90_000);
+		assert_eq!(pts(0), 0);
+		assert_eq!(pts(100), 9);
+	}
+
+	/// The camera's u32 µs clock wraps every ~71.6 min. Across the wrap
+	/// the 90 kHz timestamp keeps advancing by the real interval instead
+	/// of jumping back to near zero.
+	#[test]
+	fn video_pts_stays_monotonic_across_the_micros_wrap() {
+		let mut s = StreamTranslatorState::default();
+		let frame_us = 33_333u32;
+		let before = s.video_pts_90khz(u32::MAX - 10_000);
+		let after = s.video_pts_90khz((u32::MAX - 10_000).wrapping_add(frame_us));
+		// 33 333 µs is 2 999.97 ticks; integer division lands on either side.
+		assert!((2_999..=3_000).contains(&after.wrapping_sub(before)));
+		// The pre-fix mapping restarted near zero here.
+		assert!(after > before);
+	}
+
+	/// A backward step (reordered frame, clock reset) holds the
+	/// timestamp instead of leaping ahead by most of 2^32 µs.
+	#[test]
+	fn video_pts_holds_on_a_backward_step() {
+		let mut s = StreamTranslatorState::default();
+		let t = s.video_pts_90khz(10_000_000);
+		assert_eq!(s.video_pts_90khz(9_000_000), t);
+		assert_eq!(s.video_pts_90khz(9_100_000), t + 9_000);
 	}
 
 	/// Build a minimal H.265 Annex-B access unit containing VPS + SPS +
@@ -4211,18 +4257,6 @@ mod tests {
 			map_stream_kind(RtspStreamKind::Extern),
 			CoreStreamKind::Extern
 		));
-	}
-
-	#[test]
-	fn micros_to_90khz_edge_cases() {
-		assert_eq!(micros_to_90khz(0), 0);
-		assert_eq!(micros_to_90khz(1_000_000), 90_000);
-		// 100 µs = 9 ticks.
-		assert_eq!(micros_to_90khz(100), 9);
-		// Large-but-representable value wraps cleanly inside u32.
-		let big = u32::MAX / 10;
-		// Must not panic (wrapping arithmetic).
-		let _ = micros_to_90khz(big);
 	}
 
 	#[tokio::test]
