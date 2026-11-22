@@ -19,6 +19,9 @@ base64 = "0.23"
 # rumqttc already pulls in.
 rustls-native-certs = "0.8"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util", "test-util"] }
 

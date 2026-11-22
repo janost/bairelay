@@ -12,6 +12,57 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// The configured (sticker) UID every test server allows.
+const CAM: &str = "9527000TESTCAM01";
+/// `CAM` as Argus firmware reports it, with the 4-char firmware suffix.
+const CAM_LONG: &str = "9527000TESTCAM010123";
+
+fn runtime(mid: SocketAddr, reg: SocketAddr) -> RuntimeConfig {
+	RuntimeConfig {
+		bind: LOOPBACK,
+		middleman_port: mid.port(),
+		register_port: reg.port(),
+		heartbeat_ms: 20000,
+		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
+	}
+}
+
+fn heartbeat(tid: u32, uid: &str) -> Vec<u8> {
+	encode_discovery(
+		tid,
+		UdpXml::D2rHb(D2rHb {
+			uid: uid.into(),
+			dev: None,
+			needrsp: Some(1),
+			token: 7,
+		}),
+	)
+	.unwrap()
+}
+
+fn wake_request(tid: u32, uid: &str, reg_port: u16) -> Vec<u8> {
+	encode_discovery(
+		tid,
+		UdpXml::C2rC(C2rC {
+			uid: uid.into(),
+			cli: IpPort {
+				ip: "127.0.0.1".into(),
+				port: 12345,
+			},
+			relay: IpPort {
+				ip: "127.0.0.1".into(),
+				port: reg_port,
+			},
+			cid: 42,
+			debug: false,
+			family: 4,
+			os: "MAC".into(),
+			revision: None,
+		}),
+	)
+	.unwrap()
+}
 
 async fn recv_one(sock: &UdpSocket) -> (Vec<u8>, SocketAddr) {
 	let mut buf = vec![0u8; 4096];
@@ -39,6 +90,7 @@ async fn middleman_replies_to_c2m_q_with_register_addr() {
 		register_port: register_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
@@ -96,6 +148,7 @@ async fn heartbeat_records_and_replies() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -109,7 +162,7 @@ async fn heartbeat_records_and_replies() {
 	let hb = encode_discovery(
 		0x42,
 		UdpXml::D2rHb(D2rHb {
-			uid: "UIDX".into(),
+			uid: CAM.into(),
 			dev: None,
 			needrsp: Some(1),
 			token: 999,
@@ -145,6 +198,7 @@ async fn heartbeat_without_needrsp_records_silently() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -158,7 +212,7 @@ async fn heartbeat_without_needrsp_records_silently() {
 	let hb = encode_discovery(
 		0x99,
 		UdpXml::D2rHb(D2rHb {
-			uid: "QUIET".into(),
+			uid: CAM.into(),
 			dev: None,
 			needrsp: None,
 			token: 1,
@@ -189,6 +243,7 @@ async fn c2r_c_for_known_uid_emits_burst_and_replies() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -204,7 +259,7 @@ async fn c2r_c_for_known_uid_emits_burst_and_replies() {
 	let hb = encode_discovery(
 		0x1,
 		UdpXml::D2rHb(D2rHb {
-			uid: "CAM1".into(),
+			uid: CAM_LONG.into(),
 			dev: None,
 			needrsp: Some(1),
 			token: 7,
@@ -219,7 +274,7 @@ async fn c2r_c_for_known_uid_emits_burst_and_replies() {
 	let c2r = encode_discovery(
 		0xabc,
 		UdpXml::C2rC(C2rC {
-			uid: "CAM1".into(),
+			uid: CAM.into(),
 			cli: IpPort {
 				ip: "127.0.0.1".into(),
 				port: 12345,
@@ -307,6 +362,7 @@ async fn c2r_c_for_unknown_uid_replies_with_rsp_neg1() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -320,7 +376,7 @@ async fn c2r_c_for_unknown_uid_replies_with_rsp_neg1() {
 	let c2r = encode_discovery(
 		0xabc,
 		UdpXml::C2rC(C2rC {
-			uid: "GHOST".into(),
+			uid: "9527000TESTGHOST".into(),
 			cli: IpPort {
 				ip: "127.0.0.1".into(),
 				port: 12345,
@@ -368,6 +424,7 @@ async fn d2r_disc_is_acked_with_matching_sid() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -406,6 +463,7 @@ async fn stale_uid_reads_as_unknown() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 1000,
 		stale_after_ms: 2000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -421,7 +479,7 @@ async fn stale_uid_reads_as_unknown() {
 	let hb = encode_discovery(
 		0x1,
 		UdpXml::D2rHb(D2rHb {
-			uid: "STALE".into(),
+			uid: CAM.into(),
 			dev: None,
 			needrsp: None,
 			token: 1,
@@ -443,7 +501,7 @@ async fn stale_uid_reads_as_unknown() {
 	let c2r = encode_discovery(
 		0x2,
 		UdpXml::C2rC(C2rC {
-			uid: "STALE".into(),
+			uid: CAM.into(),
 			cli: IpPort {
 				ip: "127.0.0.1".into(),
 				port: 1,
@@ -510,6 +568,7 @@ async fn loopback_self_call_succeeds() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -559,6 +618,7 @@ async fn bad_packets_do_not_crash_listener() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -614,6 +674,7 @@ async fn run_binds_configured_ports_and_cancels_cleanly() {
 		register_port: reg_port,
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let cancel = CancellationToken::new();
 	let handle = tokio::spawn(bairelay_wake_server::run(
@@ -650,6 +711,7 @@ async fn run_returns_bind_error_on_register_port_collision() {
 		register_port: reg_port,
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let cancel = CancellationToken::new();
 	let res = bairelay_wake_server::run(cfg, bairelay_wake_server::make_registry(), cancel).await;
@@ -677,6 +739,7 @@ async fn cancel_during_wake_burst_aborts_remaining_packets() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -691,7 +754,7 @@ async fn cancel_during_wake_burst_aborts_remaining_packets() {
 	let hb = encode_discovery(
 		0x1,
 		UdpXml::D2rHb(D2rHb {
-			uid: "BURSTCAM".into(),
+			uid: CAM.into(),
 			dev: None,
 			needrsp: Some(1),
 			token: 7,
@@ -705,7 +768,7 @@ async fn cancel_during_wake_burst_aborts_remaining_packets() {
 	let c2r = encode_discovery(
 		0xabc,
 		UdpXml::C2rC(C2rC {
-			uid: "BURSTCAM".into(),
+			uid: CAM.into(),
 			cli: IpPort {
 				ip: "127.0.0.1".into(),
 				port: 12345,
@@ -754,6 +817,7 @@ async fn run_returns_bind_error_on_port_collision() {
 		register_port: reg_port,
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let cancel = CancellationToken::new();
 	let res = bairelay_wake_server::run(cfg, bairelay_wake_server::make_registry(), cancel).await;
@@ -779,6 +843,7 @@ async fn register_logs_d2r_c_r_without_replying() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -821,6 +886,7 @@ async fn register_logs_c2r_cfm_without_replying() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -865,6 +931,7 @@ async fn register_drops_unhandled_xml_variant() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -899,6 +966,7 @@ async fn middleman_drops_non_c2m_q_xml() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -939,6 +1007,7 @@ async fn c2r_c_for_unknown_uid_does_not_leak_other_uids_address() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -948,60 +1017,36 @@ async fn c2r_c_for_unknown_uid_does_not_leak_other_uids_address() {
 		cancel.clone(),
 	));
 
-	// Camera registers UID "ALICE" via heartbeat from its own socket.
+	// The camera registers its long-form UID from its own socket.
 	let cam = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
-	let hb = encode_discovery(
-		0x1,
-		UdpXml::D2rHb(D2rHb {
-			uid: "ALICE".into(),
-			dev: None,
-			needrsp: Some(1),
-			token: 7,
-		}),
-	)
-	.unwrap();
-	cam.send_to(&hb, reg_addr).await.unwrap();
+	cam.send_to(&heartbeat(0x1, CAM_LONG), reg_addr)
+		.await
+		.unwrap();
 	let _ = recv_one(&cam).await; // drain R2D_HB_R
 
-	// Client (different socket, but same loopback IP) asks to wake UID
-	// "BOB" — never registered. The reply must be rsp=-1 with no
-	// surfaced sid/dev for ALICE.
+	// A client (different socket, same loopback IP) asks to wake a UID
+	// that was never registered, then an empty one: a prefix of every
+	// UID. Each reply must be rsp=-1 with no sid/dev of the camera.
 	let client = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
-	let c2r = encode_discovery(
-		0xbeef,
-		UdpXml::C2rC(C2rC {
-			uid: "BOB".into(),
-			cli: IpPort {
-				ip: "127.0.0.1".into(),
-				port: 12345,
-			},
-			relay: IpPort {
-				ip: "127.0.0.1".into(),
-				port: reg_addr.port(),
-			},
-			cid: 99,
-			debug: false,
-			family: 4,
-			os: "MAC".into(),
-			revision: None,
-		}),
-	)
-	.unwrap();
-	client.send_to(&c2r, reg_addr).await.unwrap();
-
-	let (r, _) = recv_one(&client).await;
-	let (_, p) = decode_discovery(&r).unwrap();
-	match p {
-		UdpXml::R2cCr(R2cCr {
-			rsp: -1,
-			sid: None,
-			dev: None,
-			..
-		}) => {}
-		other => panic!("expected rsp=-1 with no sid/dev, got {other:?}"),
+	for uid in ["9527000TESTCAMBB", ""] {
+		client
+			.send_to(&wake_request(0xbeef, uid, reg_addr.port()), reg_addr)
+			.await
+			.unwrap();
+		let (r, _) = recv_one(&client).await;
+		let (_, p) = decode_discovery(&r).unwrap();
+		match p {
+			UdpXml::R2cCr(R2cCr {
+				rsp: -1,
+				sid: None,
+				dev: None,
+				..
+			}) => {}
+			other => panic!("{uid:?}: expected rsp=-1 with no sid/dev, got {other:?}"),
+		}
 	}
 
-	// Camera must NOT have received a wake burst for BOB's request.
+	// The camera must NOT have received a wake burst for either request.
 	let mut buf = vec![0u8; 4096];
 	let res = tokio::time::timeout(Duration::from_millis(200), cam.recv_from(&mut buf)).await;
 	assert!(
@@ -1033,6 +1078,7 @@ async fn bad_crc_packet_does_not_crash_listener() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1098,6 +1144,7 @@ async fn oversized_uid_in_d2m_q_is_rejected() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1132,7 +1179,7 @@ async fn oversized_uid_in_d2m_q_is_rejected() {
 	let normal = encode_discovery(
 		0x9a,
 		UdpXml::D2mQ(D2mQ {
-			uid: "NORMAL".into(),
+			uid: CAM.into(),
 			revision: None,
 		}),
 	)
@@ -1165,6 +1212,7 @@ async fn d2r_r_with_no_anchor_is_dropped() {
 		register_port: reg_addr.port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1178,7 +1226,7 @@ async fn d2r_r_with_no_anchor_is_dropped() {
 	let pkt = encode_discovery(
 		0x55,
 		UdpXml::D2rR(D2rR {
-			uid: "GHOST".into(),
+			uid: "9527000TESTGHOST".into(),
 			token: 0x1111_2222_3333_4444,
 			revision: None,
 		}),
@@ -1208,6 +1256,7 @@ async fn cancel_returns_promptly() {
 		register_port: register.local_addr().unwrap().port(),
 		heartbeat_ms: 20000,
 		stale_after_ms: 80000,
+		allowed_uids: vec![CAM.into()],
 	};
 	let handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1221,4 +1270,135 @@ async fn cancel_returns_promptly() {
 	let join = res.expect("did not exit within 500 ms");
 	let inner = join.expect("task panicked");
 	inner.expect("inner Result should be Ok");
+}
+
+/// `D2M_Q` and `D2R_HB` for an unconfigured UID are dropped: no reply,
+/// no anchor, no registry entry. A configured one sent right after is
+/// answered, which also proves the first was processed.
+#[tokio::test]
+async fn unconfigured_uids_are_ignored() {
+	use bairelay_neolink_core::bcudp::xml::D2mQ;
+
+	let cancel = CancellationToken::new();
+	let middleman = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	let register = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	let (mid_addr, reg_addr) = (
+		middleman.local_addr().unwrap(),
+		register.local_addr().unwrap(),
+	);
+	let registry = bairelay_wake_server::make_registry();
+	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
+		runtime(mid_addr, reg_addr),
+		registry.clone(),
+		middleman,
+		register,
+		cancel.clone(),
+	));
+
+	let peer = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	for (tid, uid) in [(1, "9527000OTHERCAM00123"), (2, CAM_LONG)] {
+		let q = encode_discovery(
+			tid,
+			UdpXml::D2mQ(D2mQ {
+				uid: uid.into(),
+				revision: None,
+			}),
+		)
+		.unwrap();
+		peer.send_to(&q, mid_addr).await.unwrap();
+	}
+	let (r, _) = recv_one(&peer).await;
+	assert_eq!(
+		decode_discovery(&r).unwrap().0,
+		2,
+		"only the configured D2M_Q is answered"
+	);
+
+	peer.send_to(&heartbeat(3, "9527000OTHERCAM00123"), reg_addr)
+		.await
+		.unwrap();
+	peer.send_to(&heartbeat(4, CAM_LONG), reg_addr)
+		.await
+		.unwrap();
+	let (r, _) = recv_one(&peer).await;
+	assert_eq!(
+		decode_discovery(&r).unwrap().0,
+		4,
+		"only the configured D2R_HB is answered"
+	);
+	assert_eq!(registry.len(), 1);
+
+	cancel.cancel();
+	let _ = tokio::time::timeout(Duration::from_millis(500), server_handle).await;
+}
+
+/// Wake requests for a camera whose burst is still in flight join it:
+/// one 10-packet burst, and every client gets the same sid.
+#[tokio::test(start_paused = true)]
+async fn concurrent_wake_requests_share_one_burst() {
+	let cancel = CancellationToken::new();
+	let middleman = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	let register = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	let (mid_addr, reg_addr) = (
+		middleman.local_addr().unwrap(),
+		register.local_addr().unwrap(),
+	);
+	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
+		runtime(mid_addr, reg_addr),
+		bairelay_wake_server::make_registry(),
+		middleman,
+		register,
+		cancel.clone(),
+	));
+
+	// Under paused time `timeout` fires before real UDP I/O completes,
+	// so poll with yields instead of `recv_one`.
+	async fn try_recv_all(sock: &UdpSocket) -> Vec<UdpXml> {
+		let mut out = Vec::new();
+		let mut buf = vec![0u8; 4096];
+		for _ in 0..200 {
+			match sock.try_recv_from(&mut buf) {
+				Ok((n, _)) => out.push(decode_discovery(&buf[..n]).unwrap().1),
+				Err(_) => tokio::task::yield_now().await,
+			}
+		}
+		out
+	}
+
+	let cam = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	cam.send_to(&heartbeat(1, CAM_LONG), reg_addr)
+		.await
+		.unwrap();
+	assert!(matches!(try_recv_all(&cam).await[..], [UdpXml::R2dHbr(_)]));
+
+	let client = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+	for tid in [2, 3, 4] {
+		client
+			.send_to(&wake_request(tid, CAM, reg_addr.port()), reg_addr)
+			.await
+			.unwrap();
+	}
+	let sids: Vec<u32> = try_recv_all(&client)
+		.await
+		.into_iter()
+		.filter_map(|p| match p {
+			UdpXml::R2cCr(R2cCr { sid: Some(s), .. }) => Some(s),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(sids.len(), 3);
+	assert!(sids.iter().all(|&s| s == sids[0]), "one sid: {sids:?}");
+
+	// Let the burst run to completion, then count what reached the camera.
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	let wakes = try_recv_all(&cam).await;
+	assert_eq!(wakes.len(), 10);
+	assert!(
+		wakes
+			.iter()
+			.all(|p| matches!(p, UdpXml::R2dC(R2dC { sid, .. }) if *sid == sids[0]))
+	);
+
+	cancel.cancel();
+	let _ = tokio::time::timeout(Duration::from_millis(500), server_handle).await;
 }

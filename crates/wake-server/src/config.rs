@@ -1,7 +1,10 @@
 //! Operator-facing configuration for the wake server.
 
+use bairelay_neolink_core::redact::UidTail;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+
+use crate::registry::{MIN_UID_LEN, uid_matches};
 
 /// Operator-facing config block. Bind IP is inherited from the top-level
 /// `bind_addr`, not duplicated here.
@@ -57,7 +60,8 @@ fn default_stale_after_ms() -> u64 {
 }
 
 /// Validated runtime view consumed by `run()`. Constructed by the binary
-/// from a `WakeServerConfig` plus the top-level `bind_addr`.
+/// from a `WakeServerConfig`, the top-level `bind_addr` and the
+/// configured camera UIDs.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
 	pub bind: IpAddr,
@@ -65,13 +69,21 @@ pub struct RuntimeConfig {
 	pub register_port: u16,
 	pub heartbeat_ms: u32,
 	pub stale_after_ms: u64,
+	/// Configured (short, sticker) camera UIDs. `D2M_Q` and `D2R_HB` for
+	/// any other UID are dropped, so an unauthenticated LAN peer can't
+	/// fill the registry or anchor maps. See [`Self::allows_uid`].
+	pub allowed_uids: Vec<String>,
 }
 
 impl RuntimeConfig {
-	/// Build a runtime config from a parsed `[wake_server]` block plus a
-	/// resolved bind IP. Returns `Err(_)` with a human-readable message on
-	/// validation failure.
-	pub fn from_block(block: &WakeServerConfig, bind: IpAddr) -> Result<Self, String> {
+	/// Build a runtime config from a parsed `[wake_server]` block, a
+	/// resolved bind IP and the configured camera UIDs. Returns `Err(_)`
+	/// with a human-readable message on validation failure.
+	pub fn from_block(
+		block: &WakeServerConfig,
+		bind: IpAddr,
+		allowed_uids: impl IntoIterator<Item = String>,
+	) -> Result<Self, String> {
 		if block.middleman_port == 0 {
 			return Err("middleman_port must be > 0".into());
 		}
@@ -96,13 +108,30 @@ impl RuntimeConfig {
 				block.stale_after_ms, block.heartbeat_ms
 			));
 		}
+		let allowed_uids: Vec<String> = allowed_uids.into_iter().collect();
+		if allowed_uids.is_empty() {
+			tracing::warn!("wake server: no camera has a uid configured; every camera is ignored");
+		}
+		for uid in allowed_uids.iter().filter(|u| u.len() < MIN_UID_LEN) {
+			tracing::warn!(
+				uid = %UidTail(uid),
+				"wake server: uid shorter than {MIN_UID_LEN} characters; wake requests for it are refused",
+			);
+		}
 		Ok(Self {
 			bind,
 			middleman_port: block.middleman_port,
 			register_port: block.register_port,
 			heartbeat_ms: block.heartbeat_ms,
 			stale_after_ms: block.stale_after_ms,
+			allowed_uids,
 		})
+	}
+
+	/// True if `reported`, a UID from a camera's `D2M_Q` / `D2R_HB`,
+	/// belongs to a configured camera (see [`uid_matches`]).
+	pub fn allows_uid(&self, reported: &str) -> bool {
+		self.allowed_uids.iter().any(|c| uid_matches(reported, c))
 	}
 }
 
@@ -113,6 +142,10 @@ mod tests {
 
 	fn loopback() -> IpAddr {
 		Ipv4Addr::LOCALHOST.into()
+	}
+
+	fn uids() -> Vec<String> {
+		vec!["9527000TESTCAM01".into()]
 	}
 
 	#[test]
@@ -137,7 +170,7 @@ mod tests {
 			middleman_port: 0,
 			..WakeServerConfig::default()
 		};
-		assert!(RuntimeConfig::from_block(&block, loopback()).is_err());
+		assert!(RuntimeConfig::from_block(&block, loopback(), uids()).is_err());
 	}
 
 	#[test]
@@ -146,7 +179,7 @@ mod tests {
 			register_port: 0,
 			..WakeServerConfig::default()
 		};
-		let err = RuntimeConfig::from_block(&block, loopback())
+		let err = RuntimeConfig::from_block(&block, loopback(), uids())
 			.expect_err("zero register_port must error");
 		assert!(
 			err.contains("register_port"),
@@ -161,7 +194,7 @@ mod tests {
 			register_port: 5000,
 			..WakeServerConfig::default()
 		};
-		assert!(RuntimeConfig::from_block(&block, loopback()).is_err());
+		assert!(RuntimeConfig::from_block(&block, loopback(), uids()).is_err());
 	}
 
 	#[test]
@@ -170,7 +203,7 @@ mod tests {
 			heartbeat_ms: 500,
 			..WakeServerConfig::default()
 		};
-		assert!(RuntimeConfig::from_block(&block, loopback()).is_err());
+		assert!(RuntimeConfig::from_block(&block, loopback(), uids()).is_err());
 	}
 
 	#[test]
@@ -180,14 +213,26 @@ mod tests {
 			stale_after_ms: 1000,
 			..WakeServerConfig::default()
 		};
-		assert!(RuntimeConfig::from_block(&block, loopback()).is_err());
+		assert!(RuntimeConfig::from_block(&block, loopback(), uids()).is_err());
 	}
 
 	#[test]
 	fn runtime_accepts_defaults_with_loopback_bind() {
 		let block = WakeServerConfig::default();
-		let rt = RuntimeConfig::from_block(&block, loopback()).unwrap();
+		let rt = RuntimeConfig::from_block(&block, loopback(), uids()).unwrap();
 		assert_eq!(rt.middleman_port, 9999);
 		assert_eq!(rt.register_port, 58200);
+	}
+
+	#[test]
+	fn allows_configured_uid_short_or_with_firmware_suffix_only() {
+		let rt =
+			RuntimeConfig::from_block(&WakeServerConfig::default(), loopback(), uids()).unwrap();
+		assert!(rt.allows_uid("9527000TESTCAM01"));
+		assert!(rt.allows_uid("9527000TESTCAM010123"));
+		assert!(!rt.allows_uid("9527000TESTCAM01012"));
+		assert!(!rt.allows_uid("9527000TESTCAM02"));
+		assert!(!rt.allows_uid("9527000TESTCAM0"));
+		assert!(!rt.allows_uid(""));
 	}
 }

@@ -1,6 +1,7 @@
 //! HA discovery publisher — turns per-camera metadata into the
-//! retained `config` payloads HA expects, and removes them on
-//! graceful shutdown.
+//! retained `config` payloads HA expects, and removes them when a
+//! camera is really gone. Shutdown leaves them in place: availability
+//! (bridge LWT + per-camera status) marks the entities unavailable.
 //!
 //! Tests exercise `compute_payloads` directly (no broker), then a
 //! separate pair of async tests drive `publish` / `unpublish` to
@@ -81,10 +82,9 @@ pub struct DiscoveryPublisher {
 	/// otherwise HA keeps a ghost entity backed by stale retained
 	/// config on the broker.
 	last_published: Arc<Mutex<HashMap<String, Recorded>>>,
-	/// Set by [`Self::seal`] at shutdown, before it waits on `in_flight`.
-	/// `publish` does nothing once it is set, so no publish re-creates a
-	/// config after the shutdown unpublish, even if the seal's wait was
-	/// dropped.
+	/// Set by [`Self::seal`], before it waits on `in_flight`. `publish`
+	/// does nothing once it is set, so no publish re-creates a config
+	/// after a later `unpublish`, even if the seal's wait was dropped.
 	sealed: Arc<AtomicBool>,
 	/// Read-held by `publish` across its sends; `seal` takes it for
 	/// writing to wait for those publishes to finish.
@@ -362,17 +362,19 @@ impl DiscoveryPublisher {
 	/// Seal the publisher and every clone: later `publish` calls are
 	/// no-ops from the moment this is first polled, even if it is then
 	/// dropped. Returns once publishes already in flight have finished.
-	/// `unpublish` ignores the seal, so the shutdown fan-out seals first
-	/// and then clears.
+	/// `unpublish` ignores the seal, so a removal can seal first and
+	/// then clear without a racing publish re-creating the entities.
 	pub async fn seal(&self) {
 		self.sealed.store(true, Ordering::SeqCst);
 		drop(self.in_flight.write().await);
 	}
 
 	/// Unpublish the same topic set by writing an empty retained
-	/// payload to each. HA treats an empty retained discovery
-	/// config as a delete, so this cleanly removes the device's
-	/// entities on graceful shutdown. Also clears any topics that
+	/// payload to each. HA treats an empty retained discovery config
+	/// as a delete and drops the entity together with its registry
+	/// customisations (name, area, icon, disabled state), so call this
+	/// only when the camera is really gone, never on shutdown or
+	/// restart. Also clears any topics that
 	/// were published in a prior call but are no longer in the
 	/// current compute_payloads output (mirrors `publish`'s diff so
 	/// the broker is left clean even if capabilities or preset
@@ -941,7 +943,7 @@ mod tests {
 			rumqttc::AsyncClient::new(rumqttc::MqttOptions::new("stalled", "127.0.0.1", 1883), 0);
 		Box::leak(Box::new(event_loop));
 		let mut stalled = publisher.clone();
-		stalled.client = SharedMqttClient::for_test(stalled_client);
+		stalled.client = SharedMqttClient::for_test(stalled_client).assume_connected();
 		let stalled_publish = stalled.publish("cam1", None, None, caps, &flags, &[]);
 		let finished = tokio::select! {
 			biased;
@@ -1015,7 +1017,8 @@ mod tests {
 			let (client, event_loop) =
 				rumqttc::AsyncClient::new(rumqttc::MqttOptions::new("seal", "127.0.0.1", 1883), 1);
 			let sink = crate::client::CaptureSink::default();
-			let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&sink));
+			let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&sink))
+				.assume_connected();
 			let publisher = DiscoveryPublisher::new(
 				shared,
 				"bairelay".to_string(),

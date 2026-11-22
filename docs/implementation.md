@@ -178,7 +178,7 @@ Subscribe to ALL camera topics on `ConnAck` (broker connect/reconnect), **not** 
 
 Control dispatch is spawned as a separate `tokio::spawn` task from the event loop. Dispatching inline would let a 10-second PTZ command block all MQTT processing.
 
-ConnAck handling (subscribe, discovery republish, cached-status replay) runs on its own task too (`mqtt_loop::ConnAckTask`). Its publishes wait on slots in the 256-slot rumqttc request channel, and only the event loop's `poll()` drains that channel: run inline, a channel filled during a broker outage would wedge the loop, and a replay waiting on `StatusCache::lock_ai_publish` behind a motion listener blocked on that channel would deadlock. A newer ConnAck aborts the previous run; the event loop's exit aborts one still in flight. `run_event_loop` also takes a shutdown token (`connack_stop` in `main.rs`, a child of the global token that the shutdown handler cancels before its fan-out): once it fires, a run in flight ends and a new ConnAck starts none, so a reconnect can't re-create the HA entities the fan-out deletes, while the loop keeps polling until its own cancel.
+ConnAck handling (subscribe, discovery republish, cached-status replay) runs on its own task too (`mqtt_loop::ConnAckTask`). Its publishes wait (up to 10 s each, see below) on slots in the 256-slot rumqttc request channel, and only the event loop's `poll()` drains that channel: run inline, a channel filled during a broker outage would wedge the loop, and a replay waiting on `StatusCache::lock_ai_publish` behind a motion listener blocked on that channel would deadlock. A newer ConnAck aborts the previous run; the event loop's exit aborts one still in flight. `run_event_loop` also takes a shutdown token (`connack_stop` in `main.rs`, a child of the global token that the shutdown handler cancels before its fan-out): once it fires, a run in flight ends and a new ConnAck starts none, so a reconnect can't re-create the HA entities the fan-out deletes, while the loop keeps polling until its own cancel.
 
 ### `rumqttc` 10 KiB packet-size default
 
@@ -186,9 +186,13 @@ ConnAck handling (subscribe, discovery republish, cached-status replay) runs on 
 
 The error rumqttc emits when the cap is hit reads `broker's maximum packet size of '10240'` — misleading; the cap is client-side. Audit this on every rumqttc bump.
 
-### Last Will limitations
+### Publishes never wait on a dead broker
 
-MQTT supports only one Last Will per connection. The bridge sets a global LWT on `{topic_prefix}/status` with payload `"offline"`. Per-camera status is published as `"disconnected"` during graceful shutdown. On crash, only the global LWT fires — per-camera topics retain stale `"connected"` until the next restart.
+rumqttc drains its request channel only while connected, so `SharedMqttClient` bounds every publish (`crates/mqtt/src/client.rs`, `send_publish`). While disconnected (connection error until the next ConnAck), a retained publish is deferred, keeping the latest payload per topic, and is sent right after the next ConnAck. A non-retained publish takes a free channel slot or fails at once. While connected, a publish waits at most 10 s for a slot.
+
+### Last Will and HA availability
+
+MQTT supports only one Last Will per connection. The bridge sets a retained global LWT on `{topic_prefix}/status` with payload `"offline"`, and `MqttEventLoop::poll` publishes a retained `"online"` there on every ConnAck, ahead of anything else queued. bairelay never sends DISCONNECT, so the LWT also fires on a normal exit. Per-camera status is `"connected"` / `"disconnected"` on `{topic_prefix}/{cam}/status`; on a crash it keeps a stale `"connected"`. Every HA discovery payload therefore lists both topics under `availability` with `availability_mode: all`: an entity is available only while the bridge is `online` and its camera is `connected`.
 
 ### Topic prefix
 

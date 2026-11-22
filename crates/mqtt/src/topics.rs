@@ -10,6 +10,12 @@ use crate::ai::AiObject;
 
 // ── Status topics ──────────────────────────────────────────────────────
 
+/// Bridge availability: `{prefix}/status`. `online` (retained) on every
+/// broker ConnAck, the retained LWT `offline` once bairelay drops off.
+pub fn bridge_status(prefix: &str) -> String {
+	format!("{prefix}/status")
+}
+
 /// Camera online/offline status: `{prefix}/{cam}/status`
 pub fn status(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status")

@@ -86,10 +86,10 @@ pub async fn run_with_sockets(
 	let mid = {
 		let sock = Arc::clone(&middleman_sock);
 		let cancel = cancel.clone();
-		let bind = cfg.bind;
+		let cfg = cfg.clone();
 		let anchors = Arc::clone(&anchors);
 		tokio::spawn(
-			async move { middleman::run(sock, register_local, bind, anchors, cancel).await },
+			async move { middleman::run(sock, register_local, cfg, anchors, cancel).await },
 		)
 	};
 	let reg = {

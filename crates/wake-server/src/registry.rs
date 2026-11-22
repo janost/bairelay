@@ -24,6 +24,23 @@ use std::time::{Duration, Instant};
 /// (logged at `warn` once per overflow).
 pub const MAX_MAP_ENTRIES: usize = 1024;
 
+/// Length of a Reolink UID as printed on the sticker and configured in
+/// bairelay (`9527000XXXXXXXXX`). Wake requests for shorter UIDs are
+/// refused.
+pub const MIN_UID_LEN: usize = 16;
+
+/// Firmware-version suffix Argus firmware appends to the sticker UID in
+/// `D2M_Q` / `D2R_HB` / `D2R_R` (`docs/cloud-interception.md` § I.6.2).
+pub const UID_SUFFIX_LEN: usize = 4;
+
+/// True if `long`, a UID as a camera reports it, is `short` exactly or
+/// `short` plus the [`UID_SUFFIX_LEN`]-character firmware suffix. Any
+/// looser prefix match would let an empty or truncated UID select an
+/// arbitrary camera.
+pub fn uid_matches(long: &str, short: &str) -> bool {
+	long == short || (long.len() == short.len() + UID_SUFFIX_LEN && long.starts_with(short))
+}
+
 /// Token + ac pair issued during `M2D_Q_R` and echoed in `R2D_R_R`.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionAnchor {
@@ -190,26 +207,28 @@ impl CameraRegistry {
 	/// Lookup honouring `stale_after`. Entries older than `stale_after`
 	/// from `now` read as `None`.
 	///
-	/// **Prefix-match fallback:** Argus firmware reports UIDs in their
-	/// long form (config UID + 4-char firmware suffix) on `D2R_HB`, while
+	/// **Suffix fallback:** Argus firmware reports UIDs in their long
+	/// form (config UID + 4-char firmware suffix) on `D2R_HB`, while
 	/// `C2R_C` from bairelay-itself / neolink sends the short configured
-	/// UID. If exact match fails, fall back to scanning for any stored
-	/// UID that **starts with** the requested UID — that handles the
-	/// short→long mismatch without requiring operators to know about the
-	/// suffix.
+	/// UID. If exact match fails, look for the stored UID that is `uid`
+	/// plus a firmware suffix ([`uid_matches`]). `C2R_C` is
+	/// unauthenticated, so UIDs shorter than [`MIN_UID_LEN`] never match.
 	pub fn lookup_fresh(
 		&self,
 		uid: &str,
 		now: Instant,
 		stale_after: Duration,
 	) -> Option<CameraEntry> {
+		if uid.len() < MIN_UID_LEN {
+			return None;
+		}
 		let map = self.cameras.lock().expect("CameraRegistry mutex poisoned");
 		let fresh = |e: &CameraEntry| now.saturating_duration_since(e.last_seen) <= stale_after;
 		if let Some(e) = map.get(uid).filter(|e| fresh(e)) {
 			return Some(e.clone());
 		}
 		map.iter()
-			.find(|(stored, e)| stored.starts_with(uid) && fresh(e))
+			.find(|(stored, e)| uid_matches(stored, uid) && fresh(e))
 			.map(|(_, e)| e.clone())
 	}
 
@@ -263,9 +282,9 @@ mod tests {
 	fn upsert_then_lookup_returns_entry() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 42, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 42, t);
 		let e = reg
-			.lookup_fresh("UID1", t, Duration::from_secs(60))
+			.lookup_fresh("9527000TESTCAM01", t, Duration::from_secs(60))
 			.unwrap();
 		assert_eq!(e.addr, addr("10.0.0.1:5000"));
 		assert_eq!(e.token, 42);
@@ -280,15 +299,35 @@ mod tests {
 		);
 	}
 
+	/// The short configured UID finds the long form a camera registered
+	/// under; an empty or truncated UID finds nothing, whatever is
+	/// registered.
+	#[test]
+	fn lookup_short_uid_matches_only_its_suffixed_long_form() {
+		let reg = CameraRegistry::new();
+		let t = now();
+		let ttl = Duration::from_secs(60);
+		reg.upsert("9527000TESTCAM010123", addr("10.0.0.1:1"), 1, t);
+		assert!(reg.lookup_fresh("9527000TESTCAM01", t, ttl).is_some());
+		for probe in ["", "9", "9527000TESTCAM0", "9527000TESTCAM01012"] {
+			assert!(reg.lookup_fresh(probe, t, ttl).is_none(), "{probe:?}");
+		}
+		reg.upsert("9527000TESTCAM0", addr("10.0.0.2:1"), 1, t);
+		assert!(
+			reg.lookup_fresh("9527000TESTCAM0", t, ttl).is_none(),
+			"short UIDs are refused even on an exact match"
+		);
+	}
+
 	#[test]
 	fn upsert_overwrites_address_and_token() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 42, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 42, t);
 		let t2 = t + Duration::from_secs(1);
-		reg.upsert("UID1", addr("10.0.0.2:6000"), 99, t2);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.2:6000"), 99, t2);
 		let e = reg
-			.lookup_fresh("UID1", t2, Duration::from_secs(60))
+			.lookup_fresh("9527000TESTCAM01", t2, Duration::from_secs(60))
 			.unwrap();
 		assert_eq!(e.addr, addr("10.0.0.2:6000"));
 		assert_eq!(e.token, 99);
@@ -298,27 +337,30 @@ mod tests {
 	fn lookup_returns_none_past_ttl() {
 		let reg = CameraRegistry::new();
 		let inserted = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, inserted);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, inserted);
 		let later = inserted + Duration::from_secs(120);
 		let stale = Duration::from_secs(60);
-		assert!(reg.lookup_fresh("UID1", later, stale).is_none());
+		assert!(reg.lookup_fresh("9527000TESTCAM01", later, stale).is_none());
 	}
 
 	#[test]
 	fn lookup_at_ttl_boundary_returns_some() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, t);
 		let stale = Duration::from_secs(60);
 		let on_edge = t + stale;
-		assert!(reg.lookup_fresh("UID1", on_edge, stale).is_some());
+		assert!(
+			reg.lookup_fresh("9527000TESTCAM01", on_edge, stale)
+				.is_some()
+		);
 	}
 
 	#[test]
 	fn is_empty_returns_true_when_unpopulated_then_false_after_upsert() {
 		let reg = CameraRegistry::new();
 		assert!(reg.is_empty());
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, now());
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, now());
 		assert!(!reg.is_empty());
 	}
 
@@ -326,7 +368,7 @@ mod tests {
 	fn lookup_by_ip_finds_entry_when_ip_matches() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, t);
 		reg.upsert("UID2", addr("10.0.0.2:6000"), 2, t);
 		let (uid, entry) = reg
 			.lookup_by_ip("10.0.0.2".parse().unwrap(), t, Duration::from_secs(60))
@@ -338,7 +380,7 @@ mod tests {
 	#[test]
 	fn lookup_by_ip_returns_none_when_no_ip_matches() {
 		let reg = CameraRegistry::new();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, now());
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, now());
 		assert!(
 			reg.lookup_by_ip("10.0.0.9".parse().unwrap(), now(), Duration::from_secs(60))
 				.is_none()
@@ -349,7 +391,7 @@ mod tests {
 	fn lookup_by_ip_skips_stale_entries() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:5000"), 1, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:5000"), 1, t);
 		let later = t + Duration::from_secs(120);
 		assert!(
 			reg.lookup_by_ip("10.0.0.1".parse().unwrap(), later, Duration::from_secs(60))
@@ -371,8 +413,14 @@ mod tests {
 	fn upsert_returns_some_true_on_first_insert_some_false_on_refresh() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		assert_eq!(reg.upsert("UID1", addr("10.0.0.1:1"), 1, t), Some(true));
-		assert_eq!(reg.upsert("UID1", addr("10.0.0.1:1"), 2, t), Some(false));
+		assert_eq!(
+			reg.upsert("9527000TESTCAM01", addr("10.0.0.1:1"), 1, t),
+			Some(true)
+		);
+		assert_eq!(
+			reg.upsert("9527000TESTCAM01", addr("10.0.0.1:1"), 2, t),
+			Some(false)
+		);
 		assert_eq!(reg.upsert("UID2", addr("10.0.0.2:2"), 3, t), Some(true));
 	}
 
@@ -406,13 +454,18 @@ mod tests {
 		let reg = CameraRegistry::new();
 		let t = now();
 		reg.upsert("OLD", addr("10.0.0.1:1"), 1, t);
-		reg.upsert("FRESH", addr("10.0.0.2:2"), 2, t + Duration::from_secs(50));
+		reg.upsert(
+			"9527000TESTFRESH",
+			addr("10.0.0.2:2"),
+			2,
+			t + Duration::from_secs(50),
+		);
 		let later = t + Duration::from_secs(80);
 		let evicted = reg.purge_stale(later, Duration::from_secs(60));
 		assert_eq!(evicted, vec!["OLD".to_string()]);
 		assert_eq!(reg.len(), 1);
 		assert!(
-			reg.lookup_fresh("FRESH", later, Duration::from_secs(60))
+			reg.lookup_fresh("9527000TESTFRESH", later, Duration::from_secs(60))
 				.is_some()
 		);
 	}
@@ -421,7 +474,7 @@ mod tests {
 	fn purge_stale_is_noop_when_nothing_is_stale() {
 		let reg = CameraRegistry::new();
 		let t = now();
-		reg.upsert("UID1", addr("10.0.0.1:1"), 1, t);
+		reg.upsert("9527000TESTCAM01", addr("10.0.0.1:1"), 1, t);
 		assert!(reg.purge_stale(t, Duration::from_secs(60)).is_empty());
 		assert_eq!(reg.len(), 1);
 	}

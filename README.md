@@ -427,7 +427,8 @@ With that in place:
 
 - Cameras boot, query the (fake) cloud, get our register address.
 - Cameras send heartbeats to bairelay every ~20 s.
-- When bairelay (or another LAN client) wants to wake a camera, it asks our wake server, which fires a 10-packet UDP burst at the camera. The camera wakes within seconds.
+- When bairelay (or another LAN client) wants to wake a camera, it asks our wake server, which fires a 10-packet UDP burst at the camera. The camera wakes within seconds. Wake requests that arrive while a burst to that camera is running share it.
+- Only cameras with a `uid` in `[[cameras]]` are served. Queries and heartbeats carrying any other UID are dropped, so set `uid` on every camera the wake server should handle.
 - Operators see one INFO log line per camera registration / staleness eviction.
 
 ### Push listener (TCP/443)

@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, EventLoop, LastWill, MqttOptions, QoS};
+use rumqttc::{
+	AsyncClient, Event, EventLoop, LastWill, MqttOptions, Packet, Publish, QoS, Request,
+};
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -84,10 +88,36 @@ pub(crate) type CaptureRow = (String, Vec<u8>, bool);
 /// `test_support::MockHandle`.
 pub(crate) type CaptureSink = std::sync::Arc<std::sync::Mutex<Vec<CaptureRow>>>;
 
+/// How long a publish may wait for a request-channel slot while the
+/// broker session is up. The event loop drains the channel at network
+/// speed, so hitting this means the loop has stalled.
+const PUBLISH_SLOT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Payload published retained on the bridge status topic on every
+/// ConnAck. The LWT sets the same topic to [`BRIDGE_OFFLINE`].
+pub const BRIDGE_ONLINE: &str = "online";
+/// LWT payload on the bridge status topic.
+pub const BRIDGE_OFFLINE: &str = "offline";
+
+/// Broker-session state shared by every [`SharedMqttClient`] clone and
+/// the [`MqttEventLoop`] from one [`connect`].
+#[derive(Default)]
+struct Link {
+	/// True between a ConnAck and the next connection error, as seen by
+	/// [`MqttEventLoop::poll`]. rumqttc only drains its request channel
+	/// while connected.
+	connected: bool,
+	/// Latest retained payload per topic published while disconnected,
+	/// sent right after the next ConnAck. Keeping only the latest value
+	/// bounds this by the topic set and keeps state current.
+	deferred: HashMap<String, Vec<u8>>,
+}
+
 /// Cloneable MQTT client for sharing across camera tasks.
 #[derive(Clone)]
 pub struct SharedMqttClient {
 	client: AsyncClient,
+	link: Arc<Mutex<Link>>,
 	/// When populated (test-util feature), every publish is mirrored
 	/// into this sink so the binary's behaviour tests can assert on
 	/// topic + payload without a broker round-trip. `None` in all
@@ -113,10 +143,23 @@ impl SharedMqttClient {
 	/// public API — runtime code must go through [`connect`].
 	#[doc(hidden)]
 	pub fn for_test(client: AsyncClient) -> Self {
+		Self::new(client, None)
+	}
+
+	fn new(client: AsyncClient, capture: Option<CaptureSink>) -> Self {
 		Self {
 			client,
-			capture: None,
+			link: Arc::default(),
+			capture,
 		}
+	}
+
+	/// Treat the broker session as up, so publishes wait for a channel
+	/// slot. For tests that need a publish to stall.
+	#[cfg(test)]
+	pub(crate) fn assume_connected(self) -> Self {
+		lock_link(&self.link).connected = true;
+		self
 	}
 
 	/// Internal constructor used by [`crate::test_support::mock_client`]
@@ -124,10 +167,7 @@ impl SharedMqttClient {
 	/// API — the double-underscore prefix flags it as internal.
 	#[doc(hidden)]
 	pub fn __test_new_with_capture(client: AsyncClient, capture: CaptureSink) -> Self {
-		Self {
-			client,
-			capture: Some(capture),
-		}
+		Self::new(client, Some(capture))
 	}
 
 	/// Test helper that constructs a fully-stubbed `SharedMqttClient`
@@ -151,30 +191,72 @@ impl SharedMqttClient {
 		let (client, event_loop) =
 			AsyncClient::new(MqttOptions::new(client_id, "127.0.0.1", 1883), 1024);
 		Box::leak(Box::new(event_loop));
-		Self {
-			client,
-			capture: None,
-		}
+		Self::new(client, None)
 	}
 
 	/// Publish a retained message to the given topic.
 	pub async fn publish_retained(&self, topic: &str, payload: &[u8]) -> Result<(), MqttError> {
-		self.record_publish(topic, payload, true);
-		self.client
-			.publish(topic, QoS::AtLeastOnce, true, payload)
-			.await
-			.map_err(|e| MqttError::PublishError(e.to_string()))?;
-		Ok(())
+		self.send_publish(topic, payload, true).await
 	}
 
 	/// Publish a non-retained message to the given topic.
 	pub async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), MqttError> {
-		self.record_publish(topic, payload, false);
-		self.client
-			.publish(topic, QoS::AtLeastOnce, false, payload)
-			.await
-			.map_err(|e| MqttError::PublishError(e.to_string()))?;
-		Ok(())
+		self.send_publish(topic, payload, false).await
+	}
+
+	/// Queue a QoS 1 publish without blocking indefinitely. rumqttc
+	/// stops draining its request channel while it reconnects, so an
+	/// unbounded `publish().await` during a broker outage wedges the
+	/// caller until the broker returns.
+	///
+	/// While disconnected, a retained publish is deferred to the next
+	/// ConnAck (latest value per topic) and a non-retained one is queued
+	/// if a channel slot is free, else dropped with an error. While
+	/// connected it waits at most [`PUBLISH_SLOT_TIMEOUT`] for a slot.
+	async fn send_publish(
+		&self,
+		topic: &str,
+		payload: &[u8],
+		retain: bool,
+	) -> Result<(), MqttError> {
+		self.record_publish(topic, payload, retain);
+		{
+			// Checked and deferred under one lock, so a ConnAck can't
+			// flush `deferred` between the two and strand this entry.
+			let mut link = lock_link(&self.link);
+			if !link.connected {
+				if !retain {
+					return self
+						.client
+						.try_publish(topic, QoS::AtLeastOnce, false, payload)
+						.map_err(|e| {
+							MqttError::PublishError(format!(
+								"broker disconnected, publish dropped: {e}"
+							))
+						});
+				}
+				// The channel would reject an invalid topic; a deferred
+				// one goes straight to the wire, where the broker would
+				// drop the connection instead.
+				if !rumqttc::valid_topic(topic) {
+					return Err(MqttError::PublishError(format!("invalid topic {topic:?}")));
+				}
+				link.deferred.insert(topic.to_string(), payload.to_vec());
+				return Ok(());
+			}
+		}
+		match tokio::time::timeout(
+			PUBLISH_SLOT_TIMEOUT,
+			self.client
+				.publish(topic, QoS::AtLeastOnce, retain, payload),
+		)
+		.await
+		{
+			Ok(res) => res.map_err(|e| MqttError::PublishError(e.to_string())),
+			Err(_) => Err(MqttError::PublishError(format!(
+				"request queue full for {PUBLISH_SLOT_TIMEOUT:?}, publish dropped"
+			))),
+		}
 	}
 
 	fn record_publish(&self, topic: &str, payload: &[u8], retained: bool) {
@@ -219,6 +301,10 @@ impl SharedMqttClient {
 /// Owns the MQTT event loop. Must be polled to process messages.
 pub struct MqttEventLoop {
 	event_loop: EventLoop,
+	/// `{topic_prefix}/status`, the LWT topic.
+	bridge_status_topic: String,
+	/// Shared with the [`SharedMqttClient`] from the same [`connect`].
+	link: Arc<Mutex<Link>>,
 }
 
 impl MqttEventLoop {
@@ -226,38 +312,78 @@ impl MqttEventLoop {
 	/// as in [`MqttError::ConnectionFailure`]: at 144 bytes,
 	/// `ConnectionError` trips clippy's `result_large_err`.
 	///
+	/// On each ConnAck this queues `{topic_prefix}/status = online`
+	/// (retained) ahead of everything else, replacing the retained LWT
+	/// `offline` left by a crash or network loss, followed by the
+	/// retained publishes deferred while disconnected.
+	///
 	/// [`MqttError::ConnectionFailure`]: crate::MqttError::ConnectionFailure
-	pub async fn poll(&mut self) -> Result<rumqttc::Event, Box<rumqttc::ConnectionError>> {
-		self.event_loop.poll().await.map_err(Box::new)
+	pub async fn poll(&mut self) -> Result<Event, Box<rumqttc::ConnectionError>> {
+		let event = self.event_loop.poll().await.map_err(Box::new);
+		match &event {
+			Ok(Event::Incoming(Packet::ConnAck(_))) => {
+				let mut link = lock_link(&self.link);
+				link.connected = true;
+				// rumqttc sends `pending` before the request channel, so
+				// these go out first even when the channel is full.
+				let pending = &mut self.event_loop.pending;
+				for (topic, payload) in link.deferred.drain() {
+					pending.push_front(retained(&topic, payload));
+				}
+				pending.push_front(retained(&self.bridge_status_topic, BRIDGE_ONLINE));
+			}
+			Err(_) => lock_link(&self.link).connected = false,
+			Ok(_) => {}
+		}
+		event
 	}
 }
 
 /// Create an MQTT connection, returning the shared client and event loop.
 ///
-/// Sets a Last Will message on `{topic_prefix}/status` with payload
-/// `"offline"` so the broker publishes it if the bridge disconnects
-/// unexpectedly. `topic_prefix` is the `mqtt.topic_prefix` config value
-/// (default `"bairelay"`; `"neolink"` for legacy migration).
+/// Sets a retained Last Will of `"offline"` on `{topic_prefix}/status`.
+/// The broker publishes it when the bridge drops off without a
+/// DISCONNECT: crash, SIGKILL, network loss, or a normal exit (bairelay
+/// never sends DISCONNECT). [`MqttEventLoop::poll`] sets it back to
+/// `"online"` on every ConnAck. `topic_prefix` is the
+/// `mqtt.topic_prefix` config value (default `"bairelay"`; `"neolink"`
+/// for legacy migration).
 pub fn connect(
 	config: &MqttConfig,
 	client_id: &str,
 	topic_prefix: &str,
 ) -> Result<(SharedMqttClient, MqttEventLoop), MqttError> {
 	let mut opts = config.to_mqtt_options(client_id);
+	let bridge_status_topic = topics::bridge_status(topic_prefix);
 	opts.set_last_will(LastWill::new(
-		format!("{topic_prefix}/status"),
-		"offline",
+		&bridge_status_topic,
+		BRIDGE_OFFLINE,
 		QoS::AtLeastOnce,
 		true,
 	));
 	let (client, event_loop) = AsyncClient::new(opts, 256);
+	let client = SharedMqttClient::new(client, None);
+	let link = Arc::clone(&client.link);
 	Ok((
-		SharedMqttClient {
-			client,
-			capture: None,
+		client,
+		MqttEventLoop {
+			event_loop,
+			bridge_status_topic,
+			link,
 		},
-		MqttEventLoop { event_loop },
 	))
+}
+
+fn retained(topic: &str, payload: impl Into<Vec<u8>>) -> Request {
+	let mut publish = Publish::new(topic, QoS::AtLeastOnce, payload);
+	publish.retain = true;
+	Request::Publish(publish)
+}
+
+/// Recover from poison: each critical section on `Link` is a single
+/// field write or map operation, so it is never left half-updated.
+fn lock_link(link: &Mutex<Link>) -> MutexGuard<'_, Link> {
+	link.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[cfg(test)]
@@ -274,35 +400,110 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn last_will_topic_uses_configured_prefix() {
-		// Exercise the LWT topic interpolation in isolation — building
-		// options the same way `connect` does. Guards the 		// prefix-rename against silent drift (HA discovery availability
-		// keys off exactly this topic).
-		let mut opts = loopback_config().to_mqtt_options("bairelay-test");
-		opts.set_last_will(LastWill::new(
-			format!("{}/status", "bairelay"),
-			"offline",
-			QoS::AtLeastOnce,
-			true,
-		));
-		let lw = opts.last_will().expect("LWT must be set");
-		assert_eq!(lw.topic, "bairelay/status");
-		assert_eq!(&lw.message[..], b"offline");
-		assert!(lw.retain);
+	/// Read one MQTT packet: `(first header byte, body after the length)`.
+	async fn read_packet(sock: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+		use tokio::io::AsyncReadExt;
+		let header = sock.read_u8().await.unwrap();
+		let (mut len, mut shift) = (0usize, 0);
+		loop {
+			let b = sock.read_u8().await.unwrap();
+			len |= usize::from(b & 0x7f) << shift;
+			shift += 7;
+			if b & 0x80 == 0 {
+				break;
+			}
+		}
+		let mut body = vec![0; len];
+		sock.read_exact(&mut body).await.unwrap();
+		(header, body)
 	}
 
-	#[test]
-	fn last_will_topic_honours_legacy_neolink_prefix() {
-		let mut opts = loopback_config().to_mqtt_options("bairelay-test");
-		opts.set_last_will(LastWill::new(
-			format!("{}/status", "neolink"),
-			"offline",
-			QoS::AtLeastOnce,
-			true,
-		));
-		let lw = opts.last_will().expect("LWT must be set");
-		assert_eq!(lw.topic, "neolink/status");
+	/// Against a minimal fake broker: CONNECT carries the retained
+	/// `offline` LWT on the prefix's status topic; after CONNACK the
+	/// retained `online` goes first, then the latest retained value
+	/// published while disconnected (the superseded one never goes out).
+	#[tokio::test]
+	async fn connack_publishes_online_then_deferred_retained() {
+		use tokio::io::AsyncWriteExt;
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let cfg = MqttConfig {
+			port: listener.local_addr().unwrap().port(),
+			..loopback_config()
+		};
+		let (client, mut event_loop) = connect(&cfg, "lwt-test", "neolink").unwrap();
+		client
+			.publish_retained("neolink/cam/status", b"connected")
+			.await
+			.unwrap();
+		client
+			.publish_retained("neolink/cam/status", b"disconnected")
+			.await
+			.unwrap();
+		let poller = tokio::spawn(async move {
+			loop {
+				let _ = event_loop.poll().await;
+			}
+		});
+
+		let (mut sock, _) = listener.accept().await.unwrap();
+		let (header, connect) = read_packet(&mut sock).await;
+		assert_eq!(header, 0x10, "CONNECT");
+		// Variable header: "MQTT" (2 + 4 bytes), level, connect flags.
+		let flags = connect[7];
+		assert_ne!(flags & 0x04, 0, "will flag");
+		assert_ne!(flags & 0x20, 0, "will retain");
+		let will = b"\x00\x0eneolink/status\x00\x07offline";
+		assert!(connect.windows(will.len()).any(|w| w == will));
+
+		sock.write_all(&[0x20, 0x02, 0x00, 0x00]).await.unwrap();
+		// PUBLISH, QoS 1, retain: topic, 2-byte packet id, payload.
+		let (header, publish) = read_packet(&mut sock).await;
+		assert_eq!(header, 0x33);
+		assert_eq!(&publish[..16], b"\x00\x0eneolink/status");
+		assert_eq!(&publish[18..], BRIDGE_ONLINE.as_bytes());
+		let (header, publish) = read_packet(&mut sock).await;
+		assert_eq!(header, 0x33);
+		assert_eq!(&publish[..20], b"\x00\x12neolink/cam/status");
+		assert_eq!(&publish[22..], b"disconnected");
+		assert!(lock_link(&client.link).deferred.is_empty());
+		poller.abort();
+	}
+
+	/// While disconnected rumqttc never drains its channel: retained
+	/// publishes are deferred, and a non-retained one past the 256 slots
+	/// fails instead of waiting for the broker.
+	#[tokio::test]
+	async fn publish_while_disconnected_never_waits() {
+		let (client, _event_loop) = connect(&loopback_config(), "drop-test", "bairelay").unwrap();
+		for _ in 0..256 {
+			client.publish("bairelay/cam/reply", b"x").await.unwrap();
+		}
+		assert!(client.publish("bairelay/cam/reply", b"x").await.is_err());
+		client
+			.publish_retained("bairelay/cam/status", b"x")
+			.await
+			.unwrap();
+		assert!(
+			client
+				.publish_retained("bairelay/+/status", b"x")
+				.await
+				.is_err()
+		);
+		assert_eq!(lock_link(&client.link).deferred.len(), 1);
+	}
+
+	/// While connected a full queue is waited on, but only for
+	/// `PUBLISH_SLOT_TIMEOUT`.
+	#[tokio::test(start_paused = true)]
+	async fn publish_while_connected_times_out_on_full_queue() {
+		let (client, _event_loop) = connect(&loopback_config(), "stall-test", "bairelay").unwrap();
+		for _ in 0..256 {
+			client.publish("bairelay/cam/reply", b"x").await.unwrap();
+		}
+		let client = client.assume_connected();
+		let start = tokio::time::Instant::now();
+		assert!(client.publish("bairelay/cam/reply", b"x").await.is_err());
+		assert_eq!(start.elapsed(), PUBLISH_SLOT_TIMEOUT);
 	}
 
 	#[test]
